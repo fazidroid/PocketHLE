@@ -23,7 +23,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use indexmap::IndexMap;
 use thiserror::Error;
 
-use pocket_cpu::{regs::ArmReg, Cpu, CpuError, Prot, StopReason};
+use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Cpu, CpuError, Prot, StopReason};
 use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage};
 
 /// Default base address of the synthetic IAT thunk pool.
@@ -213,7 +213,19 @@ pub fn run_main_loop(
         process.stack_top
     );
     for _slice in 0..max_slices {
-        match cpu.run_until_hook(pc, instruction_budget_per_slice)? {
+        let stop = match cpu.run_until_hook(pc, instruction_budget_per_slice) {
+            Ok(s) => s,
+            Err(e) => {
+                let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(pc);
+                log::error!(
+                    "cpu crashed: {e}\n  last requested pc=0x{pc:08x}, current pc=0x{pc_now:08x}\n{regs}{mem}",
+                    regs = dump_regs(cpu),
+                    mem = dump_mem_around(cpu, pc_now, 16),
+                );
+                return Err(e.into());
+            }
+        };
+        match stop {
             StopReason::InstructionLimit => {
                 log::trace!("instruction slice exhausted; resuming");
                 pc = cpu.read_reg(ArmReg::Pc)?;

@@ -52,6 +52,11 @@ enum Command {
         max_slices: u64,
         #[arg(long, default_value_t = 1_000_000)]
         instructions_per_slice: u64,
+        /// Write a JSON-lines trace of every dispatched API call to
+        /// the given file. Useful for diffing runs and for offline
+        /// analysis (`jq`, etc.).
+        #[arg(long)]
+        trace_json: Option<PathBuf>,
     },
 }
 
@@ -82,12 +87,14 @@ fn main() -> Result<()> {
             halt_on_unimplemented,
             max_slices,
             instructions_per_slice,
+            trace_json,
         } => cmd_run(
             &path,
             cpu,
             halt_on_unimplemented,
             max_slices,
             instructions_per_slice,
+            trace_json.as_deref(),
         ),
     }
 }
@@ -195,6 +202,7 @@ fn cmd_run(
     halt_on_unimplemented: bool,
     max_slices: u64,
     instructions_per_slice: u64,
+    trace_json: Option<&std::path::Path>,
 ) -> Result<()> {
     let mut emu = match backend {
         CpuBackend::Stub => Emulator::with_stub_cpu(),
@@ -204,6 +212,12 @@ fn cmd_run(
     emu.set_halt_on_unimplemented(halt_on_unimplemented);
     emu.max_slices = max_slices;
     emu.instruction_budget_per_slice = instructions_per_slice;
+    if let Some(p) = trace_json {
+        let f = std::fs::File::create(p)
+            .with_context(|| format!("creating trace file {}", p.display()))?;
+        emu.set_trace_sink(Box::new(std::io::BufWriter::new(f)));
+        println!("Tracing API calls to {} (JSON lines)", p.display());
+    }
     let p = emu.load_pe(path)?;
     println!(
         "Loaded {} ({} machine), {} sections, {} imports",

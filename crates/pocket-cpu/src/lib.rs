@@ -116,6 +116,50 @@ pub trait Cpu {
     fn request_stop(&mut self);
 }
 
+/// Format a multi-line dump of every general purpose register.
+/// Implemented as a free function so it works with any [`Cpu`] backend.
+pub fn dump_regs(cpu: &mut dyn Cpu) -> String {
+    use regs::ArmReg::*;
+    let mut out = String::new();
+    let order = [
+        R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, Sp, Lr, Pc, Cpsr,
+    ];
+    for (i, r) in order.iter().enumerate() {
+        let v = cpu.read_reg(*r).unwrap_or(0);
+        let label = format!("{r:?}");
+        out.push_str(&format!("  {label:>4}=0x{v:08x}"));
+        if i % 4 == 3 {
+            out.push('\n');
+        }
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Read up to `len` bytes around `va` and format them as hex. Used in
+/// crash dumps to show what code the CPU was about to execute.
+pub fn dump_mem_around(cpu: &mut dyn Cpu, va: u32, span: u32) -> String {
+    let start = va.saturating_sub(span);
+    let total = span.saturating_mul(2);
+    match cpu.read_mem(start, total) {
+        Ok(bytes) => {
+            let mut out = String::new();
+            for chunk in bytes.chunks(16).enumerate() {
+                let (i, c) = chunk;
+                out.push_str(&format!("  0x{:08x}:", start + (i as u32) * 16));
+                for b in c {
+                    out.push_str(&format!(" {b:02x}"));
+                }
+                out.push('\n');
+            }
+            out
+        }
+        Err(_) => format!("  <unreadable around 0x{va:08x}>\n"),
+    }
+}
+
 pub fn round_up_to_page(size: u32) -> u32 {
     const PAGE: u32 = 0x1000;
     (size + PAGE - 1) & !(PAGE - 1)

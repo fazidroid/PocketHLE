@@ -66,6 +66,11 @@ impl Emulator {
         self.dispatcher.halt_on_unimplemented = halt;
     }
 
+    /// Forward every dispatched API call as JSON-lines to `sink`.
+    pub fn set_trace_sink(&mut self, sink: Box<dyn std::io::Write + Send>) {
+        self.dispatcher.set_trace_sink(sink);
+    }
+
     /// Load and map a PE file into the emulator. Existing process
     /// state is replaced.
     pub fn load_pe(&mut self, path: impl AsRef<Path>) -> Result<&Process> {
