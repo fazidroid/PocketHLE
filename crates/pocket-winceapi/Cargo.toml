@@ -1,0 +1,21 @@
+[package]
+name = "pocket-winceapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "High-level emulation of Windows CE / Windows Mobile system DLLs (coredll, aygshell, gx, hss)."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+indexmap.workspace = true
+once_cell.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+pocket-cpu = { path = "../pocket-cpu" }
+pocket-kernel = { path = "../pocket-kernel" }
+pocket-pe = { path = "../pocket-pe" }

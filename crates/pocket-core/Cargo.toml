@@ -1,0 +1,23 @@
+[package]
+name = "pocket-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "PocketHLE top-level Emulator: glues loader, CPU, kernel and API stubs."
+
+[features]
+default = []
+unicorn = ["pocket-cpu/unicorn"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+pocket-cab = { path = "../pocket-cab" }
+pocket-pe = { path = "../pocket-pe" }
+pocket-cpu = { path = "../pocket-cpu" }
+pocket-kernel = { path = "../pocket-kernel" }
+pocket-winceapi = { path = "../pocket-winceapi" }
