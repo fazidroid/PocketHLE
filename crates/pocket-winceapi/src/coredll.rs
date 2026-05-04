@@ -83,13 +83,13 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "swprintf", zero_returning);
     d.register_handler(dll, "wsprintfW", zero_returning);
 
-    // ---- File I/O (always fail for now; real VFS is a follow-up) ----
+    // ---- File I/O backed by the VFS ----
     d.register_handler(dll, "CreateFileW", create_file_w);
-    d.register_handler(dll, "ReadFile", zero_returning);
-    d.register_handler(dll, "WriteFile", one_returning);
-    d.register_handler(dll, "CloseHandle", one_returning);
-    d.register_handler(dll, "GetFileSize", zero_returning);
-    d.register_handler(dll, "SetFilePointer", zero_returning);
+    d.register_handler(dll, "ReadFile", read_file);
+    d.register_handler(dll, "WriteFile", write_file);
+    d.register_handler(dll, "CloseHandle", close_handle);
+    d.register_handler(dll, "GetFileSize", get_file_size);
+    d.register_handler(dll, "SetFilePointer", set_file_pointer);
     d.register_handler(dll, "FindFirstFileW", invalid_handle_returning);
     d.register_handler(dll, "FindNextFileW", zero_returning);
     d.register_handler(dll, "FindClose", one_returning);
@@ -97,6 +97,25 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetFileAttributesW", one_returning);
     d.register_handler(dll, "GetFileAttributesW", zero_returning);
     d.register_handler(dll, "CreateDirectoryW", one_returning);
+
+    // ---- Heap ----
+    d.register_handler(dll, "LocalAlloc", local_alloc);
+    d.register_handler(dll, "LocalFree", local_free);
+    d.register_handler(dll, "LocalReAlloc", local_realloc);
+    d.register_handler(dll, "HeapCreate", heap_create);
+    d.register_handler(dll, "HeapDestroy", one_returning);
+    d.register_handler(dll, "HeapAlloc", heap_alloc);
+    d.register_handler(dll, "HeapFree", heap_free);
+    d.register_handler(dll, "HeapReAlloc", heap_realloc);
+    d.register_handler(dll, "GetProcessHeap", get_process_heap);
+    d.register_handler(dll, "VirtualAlloc", virtual_alloc);
+    d.register_handler(dll, "VirtualFree", one_returning);
+    d.register_handler(dll, "malloc", malloc);
+    d.register_handler(dll, "calloc", calloc);
+    d.register_handler(dll, "free", free);
+    d.register_handler(dll, "realloc", realloc);
+    d.register_handler(dll, "_new", malloc);
+    d.register_handler(dll, "_delete", free);
 
     // ---- Resources ----
     d.register_handler(dll, "FindResourceW", null_returning);
@@ -608,15 +627,269 @@ fn to_lower_w(c: u16) -> u16 {
 
 // ---------- file I/O ----------
 
+/// `HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share, ...,
+///                     DWORD creation, DWORD flags, HANDLE template)`
+///
+/// We honour `access` (`GENERIC_READ` 0x80000000, `GENERIC_WRITE`
+/// 0x40000000) and `creation` (`CREATE_ALWAYS` 2, `CREATE_NEW` 1,
+/// `OPEN_ALWAYS` 4) loosely — enough to satisfy a game that just
+/// wants to load assets and persist a save file.
 fn create_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let p = ctx.arg_u32(0)?;
-    if p != 0 {
-        if let Ok(name) = read_wstr(ctx, p, 260) {
-            let path: String = String::from_utf16_lossy(&name);
+    use pocket_kernel::vfs::Access;
+    let name_p = ctx.arg_u32(0)?;
+    let access_flags = ctx.arg_u32(1)?;
+    let creation = ctx.arg_u32(4)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE));
+    }
+    let name_w = match read_wstr(ctx, name_p, 260) {
+        Ok(n) => n,
+        Err(_) => return Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE)),
+    };
+    let path = String::from_utf16_lossy(&name_w);
+    let access = match (
+        access_flags & 0x8000_0000 != 0,
+        access_flags & 0x4000_0000 != 0,
+    ) {
+        (true, true) => Access::ReadWrite,
+        (false, true) => Access::Write,
+        _ => Access::Read,
+    };
+    let create = matches!(creation, 1 | 2 | 4);
+    match ctx.kernel.vfs.open(&path, access, create) {
+        Some(h) => {
+            log::trace!("CreateFileW({path:?}, access={access:?}) -> 0x{h:08x}");
+            Ok(DispatchOutcome::ReturnedR0(h))
+        }
+        None => {
             log::trace!("CreateFileW({path:?}) -> INVALID_HANDLE_VALUE");
+            Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE))
         }
     }
-    Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE))
+}
+
+/// `BOOL ReadFile(HANDLE h, void* buf, DWORD count, DWORD* read,
+///                LPOVERLAPPED ov)`
+fn read_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let buf_p = ctx.arg_u32(1)?;
+    let count = ctx.arg_u32(2)?;
+    let out_read_p = ctx.arg_u32(3)?;
+    if !ctx.kernel.vfs.is_open(handle) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut buf = vec![0u8; count as usize];
+    let n = ctx.kernel.vfs.read(handle, &mut buf).unwrap_or(0);
+    if buf_p != 0 && n > 0 {
+        ctx.cpu.write_mem(buf_p, &buf[..n])?;
+    }
+    if out_read_p != 0 {
+        ctx.cpu.write_mem(out_read_p, &(n as u32).to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL WriteFile(HANDLE h, const void* buf, DWORD count, DWORD* written, ...)`
+fn write_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let buf_p = ctx.arg_u32(1)?;
+    let count = ctx.arg_u32(2)?;
+    let out_written_p = ctx.arg_u32(3)?;
+    if !ctx.kernel.vfs.is_open(handle) || count == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(if count == 0 { 1 } else { 0 }));
+    }
+    let bytes = ctx.cpu.read_mem(buf_p, count)?;
+    let n = ctx.kernel.vfs.write(handle, &bytes).unwrap_or(0);
+    if out_written_p != 0 {
+        ctx.cpu
+            .write_mem(out_written_p, &(n as u32).to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn close_handle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let _ = ctx.kernel.vfs.close(handle);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `DWORD GetFileSize(HANDLE h, DWORD* high)`
+fn get_file_size(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    let high_p = ctx.arg_u32(1)?;
+    let size = ctx.kernel.vfs.size(handle).unwrap_or(0);
+    if high_p != 0 {
+        ctx.cpu
+            .write_mem(high_p, &((size >> 32) as u32).to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(size as u32))
+}
+
+/// `DWORD SetFilePointer(HANDLE h, LONG distance, LONG* hi, DWORD whence)`
+fn set_file_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use pocket_kernel::vfs::SeekKind;
+    let handle = ctx.arg_u32(0)?;
+    let distance = ctx.arg_u32(1)? as i32 as i64;
+    let whence = ctx.arg_u32(3)?;
+    let kind = match whence {
+        0 => SeekKind::Begin,
+        1 => SeekKind::Current,
+        2 => SeekKind::End,
+        _ => SeekKind::Begin,
+    };
+    let pos = ctx.kernel.vfs.seek(handle, distance, kind).unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(pos as u32))
+}
+
+// ---------- heap ----------
+
+const FAKE_PROCESS_HEAP: u32 = 0x4242_4242;
+
+fn local_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // LMEM_ZEROINIT flag = 0x0040
+    let flags = ctx.arg_u32(0)?;
+    let size = ctx.arg_u32(1)?;
+    do_alloc(ctx, size, flags & 0x0040 != 0)
+}
+
+fn local_free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p != 0 {
+        do_free(ctx, p);
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn local_realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let size = ctx.arg_u32(1)?;
+    do_realloc(ctx, p, size)
+}
+
+fn heap_create(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_PROCESS_HEAP))
+}
+
+fn heap_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // HeapAlloc(HANDLE hHeap, DWORD flags, SIZE_T size); HEAP_ZERO_MEMORY = 0x8
+    let flags = ctx.arg_u32(1)?;
+    let size = ctx.arg_u32(2)?;
+    do_alloc(ctx, size, flags & 0x8 != 0)
+}
+
+fn heap_free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(2)?;
+    if p != 0 {
+        do_free(ctx, p);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn heap_realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(2)?;
+    let size = ctx.arg_u32(3)?;
+    do_realloc(ctx, p, size)
+}
+
+fn get_process_heap(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_PROCESS_HEAP))
+}
+
+fn virtual_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect)
+    let size = ctx.arg_u32(1)?;
+    do_alloc(ctx, size, true)
+}
+
+fn malloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let size = ctx.arg_u32(0)?;
+    do_alloc(ctx, size, false)
+}
+
+fn calloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let nmemb = ctx.arg_u32(0)?;
+    let size = ctx.arg_u32(1)?;
+    do_alloc(ctx, nmemb.saturating_mul(size), true)
+}
+
+fn free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p != 0 {
+        do_free(ctx, p);
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let size = ctx.arg_u32(1)?;
+    do_realloc(ctx, p, size)
+}
+
+/// Shared allocation path for every alloc-shaped API. Stores the
+/// requested size in the 4 bytes immediately preceding the user
+/// pointer so [`do_free`] can recover it.
+fn do_alloc(
+    ctx: &mut CallCtx<'_>,
+    size: u32,
+    zero_init: bool,
+) -> Result<DispatchOutcome, KernelError> {
+    let user_ptr = match ctx.kernel.heap.alloc(size) {
+        Some(p) => p,
+        None => {
+            log::warn!("heap exhausted; alloc({size}) failed");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    // Stash size at user_ptr - 4 (header is 8 bytes, but we only need
+    // 4 to record the requested size; the other 4 are reserved).
+    ctx.cpu.write_mem(user_ptr - 4, &size.to_le_bytes())?;
+    if zero_init {
+        let zeros = vec![0u8; size as usize];
+        ctx.cpu.write_mem(user_ptr, &zeros)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(user_ptr))
+}
+
+fn do_free(ctx: &mut CallCtx<'_>, user_ptr: u32) {
+    let header = ctx.cpu.read_mem(user_ptr - 4, 4).unwrap_or_default();
+    if header.len() < 4 {
+        return;
+    }
+    let size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    ctx.kernel.heap.free(user_ptr, size);
+}
+
+fn do_realloc(
+    ctx: &mut CallCtx<'_>,
+    p: u32,
+    new_size: u32,
+) -> Result<DispatchOutcome, KernelError> {
+    if p == 0 {
+        return do_alloc(ctx, new_size, false);
+    }
+    let header = ctx.cpu.read_mem(p - 4, 4).unwrap_or_default();
+    let old_size = if header.len() == 4 {
+        u32::from_le_bytes([header[0], header[1], header[2], header[3]])
+    } else {
+        0
+    };
+    if new_size == 0 {
+        do_free(ctx, p);
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let new_p = match ctx.kernel.heap.alloc(new_size) {
+        Some(np) => np,
+        None => return Ok(DispatchOutcome::ReturnedR0(0)),
+    };
+    ctx.cpu.write_mem(new_p - 4, &new_size.to_le_bytes())?;
+    let to_copy = old_size.min(new_size);
+    if to_copy > 0 {
+        let bytes = ctx.cpu.read_mem(p, to_copy)?;
+        ctx.cpu.write_mem(new_p, &bytes)?;
+    }
+    do_free(ctx, p);
+    Ok(DispatchOutcome::ReturnedR0(new_p))
 }
 
 // ---------- window / message ----------
@@ -670,13 +943,14 @@ fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
 mod tests {
     use super::*;
     use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu, Prot};
-    use pocket_kernel::Thunk;
+    use pocket_kernel::{vfs::Vfs, Heap, KernelState, Thunk};
     use pocket_pe::ImportBinding;
 
-    fn ctx_with_mem<'a>(cpu: &'a mut StubCpu, thunk: &'a Thunk) -> CallCtx<'a> {
-        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
-            .unwrap();
-        CallCtx { cpu, thunk }
+    fn fresh_kernel() -> KernelState {
+        KernelState {
+            heap: Heap::new(0x5000_0000, 0x10000),
+            vfs: Vfs::new(),
+        }
     }
 
     fn dummy_thunk() -> Thunk {
@@ -692,6 +966,7 @@ mod tests {
     #[test]
     fn strlen_walks_until_null() {
         let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
         cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
             .unwrap();
         cpu.write_mem(0x1000, b"hello\0").unwrap();
@@ -700,6 +975,7 @@ mod tests {
         let mut c = CallCtx {
             cpu: &mut cpu,
             thunk: &t,
+            kernel: &mut kernel,
         };
         let r = strlen(&mut c).unwrap();
         match r {
@@ -711,9 +987,15 @@ mod tests {
     #[test]
     fn setjmp_then_longjmp_restores_state() {
         let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
         let t = dummy_thunk();
-        let mut c = ctx_with_mem(&mut cpu, &t);
-        // Pre-populate a buffer pointer in r0 and some callee saves.
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
         c.cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
         c.cpu.write_reg(ArmReg::R4, 0xCAFE).unwrap();
         c.cpu.write_reg(ArmReg::Lr, 0xBADC0DE).unwrap();
@@ -735,6 +1017,7 @@ mod tests {
     #[test]
     fn wcslen_counts_until_null() {
         let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
         cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
             .unwrap();
         let s: Vec<u8> = "hi\0"
@@ -747,10 +1030,97 @@ mod tests {
         let mut c = CallCtx {
             cpu: &mut cpu,
             thunk: &t,
+            kernel: &mut kernel,
         };
         let r = wcslen(&mut c).unwrap();
         match r {
             DispatchOutcome::ReturnedR0(v) => assert_eq!(v, 2),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn malloc_then_free_round_trips() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x5000_0000, 0x10000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let initial_free = kernel.heap.free_bytes();
+        cpu.write_reg(ArmReg::R0, 64).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let p = match malloc(&mut c).unwrap() {
+            DispatchOutcome::ReturnedR0(p) => p,
+            _ => panic!(),
+        };
+        assert!(p >= 0x5000_0000);
+        c.cpu.write_reg(ArmReg::R0, p).unwrap();
+        let _ = free(&mut c).unwrap();
+        assert_eq!(c.kernel.heap.free_bytes(), initial_free);
+    }
+
+    #[test]
+    fn create_file_w_with_no_mount_is_invalid() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(0x2000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        // Write a wide-string "\X\foo.txt" at 0x1000.
+        let s: Vec<u8> = "\\X\\foo.txt\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x8000_0000).unwrap(); // GENERIC_READ
+        cpu.write_reg(ArmReg::Sp, 0x2800).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = create_file_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE));
+    }
+
+    #[test]
+    fn create_file_w_with_mount_returns_real_handle() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(0x2000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let s: Vec<u8> = "\\App\\hello.txt\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x8000_0000).unwrap(); // GENERIC_READ
+        cpu.write_reg(ArmReg::Sp, 0x2800).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = create_file_w(&mut c).unwrap();
+        match r {
+            DispatchOutcome::ReturnedR0(h) => {
+                assert_ne!(h, INVALID_HANDLE_VALUE);
+                assert!(c.kernel.vfs.is_open(h));
+            }
             _ => panic!(),
         }
     }

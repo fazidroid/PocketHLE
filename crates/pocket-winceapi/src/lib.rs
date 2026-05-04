@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use pocket_cpu::{regs::ArmReg, Cpu};
-use pocket_kernel::{DispatchOutcome, Dispatcher, KernelError, Thunk};
+use pocket_kernel::{DispatchOutcome, Dispatcher, KernelError, KernelState, Thunk};
 use pocket_pe::ImportBinding;
 
 /// Convert an ordinal-only import to a friendly name where possible.
@@ -36,6 +36,7 @@ pub fn resolve_ordinal(dll: &str, ordinal: u16) -> Option<String> {
 pub struct CallCtx<'a> {
     pub cpu: &'a mut dyn Cpu,
     pub thunk: &'a Thunk,
+    pub kernel: &'a mut KernelState,
 }
 
 impl<'a> CallCtx<'a> {
@@ -122,6 +123,7 @@ impl Dispatcher for WinCeDispatcher {
         &mut self,
         cpu: &mut dyn Cpu,
         thunk: &Thunk,
+        kernel: &mut KernelState,
     ) -> Result<DispatchOutcome, KernelError> {
         *self.call_counts.entry(thunk.thunk_va).or_default() += 1;
         let dll_key = thunk.dll.to_ascii_lowercase();
@@ -146,7 +148,7 @@ impl Dispatcher for WinCeDispatcher {
         let key = (dll_key.clone(), name.clone());
         let outcome = if let Some(handler) = self.by_name.get(&key) {
             log::trace!("call {}", thunk.label());
-            let mut ctx = CallCtx { cpu, thunk };
+            let mut ctx = CallCtx { cpu, thunk, kernel };
             match handler(&mut ctx) {
                 Ok(o) => Ok(o),
                 Err(e) => {

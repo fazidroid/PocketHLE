@@ -26,6 +26,8 @@ use thiserror::Error;
 use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Cpu, CpuError, Prot, StopReason};
 use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage};
 
+pub mod vfs;
+
 /// Default base address of the synthetic IAT thunk pool.
 pub const THUNK_REGION_BASE: u32 = 0x7000_0000;
 /// Each thunk is exactly one 32-bit instruction. We never execute it
@@ -37,6 +39,22 @@ pub const DEFAULT_STACK_SIZE: u32 = 0x40000;
 /// Default top of stack — chosen so that ARM-style descending stacks
 /// stay below the thunk region.
 pub const DEFAULT_STACK_TOP: u32 = 0x6000_0000;
+
+/// Base of the WinCE kernel callback / trap region. Real Pocket PC
+/// kernels publish a sea of small syscall trampolines starting at
+/// `0xF000_0000`; coredll routes things like exception delivery and
+/// `KernelIoControl` through fixed offsets into this page. Under HLE
+/// we don't run the kernel at all, but several library routines still
+/// load function pointers out of this range and `bx` to them, so we
+/// have to make the address space at least valid. We map a 64 KiB
+/// page filled with `bx lr` so any such jump returns harmlessly.
+pub const KERNEL_TRAP_BASE: u32 = 0xF000_0000;
+pub const KERNEL_TRAP_SIZE: u32 = 0x0001_0000;
+
+/// Base of the guest-side heap region. 16 MiB is plenty for the
+/// little games we target and still leaves headroom for the stack.
+pub const HEAP_BASE: u32 = 0x5000_0000;
+pub const HEAP_SIZE: u32 = 0x0100_0000;
 
 /// "bx lr" in ARM mode (little endian).
 pub const ARM_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
@@ -72,7 +90,17 @@ pub trait Dispatcher {
         &mut self,
         cpu: &mut dyn Cpu,
         thunk: &Thunk,
+        kernel: &mut KernelState,
     ) -> Result<DispatchOutcome, KernelError>;
+}
+
+/// Mutable kernel state that persists across calls and that handlers
+/// need to read or modify. Bundled into one struct so we can hand it
+/// out by `&mut` without conflicting with the immutable parts of
+/// [`Process`] (image bytes, thunk table) that the run loop uses.
+pub struct KernelState {
+    pub heap: Heap,
+    pub vfs: vfs::Vfs,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -97,6 +125,100 @@ impl Thunk {
     }
 }
 
+/// Very small chunk-based heap allocator that hands out chunks from a
+/// fixed guest VA range. Implemented as a free list of free blocks
+/// keyed by start VA, with coalescing on free.
+///
+/// The expected use case is *games* that do a couple thousand small
+/// allocations — fragmentation behaviour is fine for that. We do not
+/// try to compete with `dlmalloc`. Each allocated block is preceded
+/// by an 8-byte header so `free()` can recover the size and link the
+/// block back into the free list.
+#[derive(Debug)]
+pub struct Heap {
+    base: u32,
+    size: u32,
+    /// Sorted by start VA. Each entry is `(start, size)` of free space.
+    free: Vec<(u32, u32)>,
+}
+
+const HEAP_HEADER_BYTES: u32 = 8;
+const HEAP_ALIGN: u32 = 8;
+
+impl Heap {
+    pub fn new(base: u32, size: u32) -> Self {
+        Self {
+            base,
+            size,
+            free: vec![(base, size)],
+        }
+    }
+
+    pub fn base(&self) -> u32 {
+        self.base
+    }
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn align_up(n: u32) -> u32 {
+        (n + (HEAP_ALIGN - 1)) & !(HEAP_ALIGN - 1)
+    }
+
+    /// Return the user pointer (after the 8-byte header), or `None`
+    /// if the heap has no large-enough free block.
+    pub fn alloc(&mut self, requested: u32) -> Option<u32> {
+        let need = Self::align_up(requested.max(1)) + HEAP_HEADER_BYTES;
+        for i in 0..self.free.len() {
+            let (start, sz) = self.free[i];
+            if sz >= need {
+                if sz == need {
+                    self.free.remove(i);
+                } else {
+                    self.free[i] = (start + need, sz - need);
+                }
+                return Some(start + HEAP_HEADER_BYTES);
+            }
+        }
+        None
+    }
+
+    /// Free a previously allocated chunk. The header at `user_ptr - 8`
+    /// stores `(block_start, block_size)`. We trust the caller (the
+    /// guest) — bad frees are logged and ignored.
+    pub fn free(&mut self, user_ptr: u32, recorded_size: u32) {
+        if user_ptr < self.base + HEAP_HEADER_BYTES {
+            log::warn!("heap.free: ignoring out-of-range pointer 0x{user_ptr:08x}");
+            return;
+        }
+        let block_start = user_ptr - HEAP_HEADER_BYTES;
+        let block_size = recorded_size + HEAP_HEADER_BYTES;
+        if block_start + block_size > self.base + self.size {
+            log::warn!("heap.free: chunk overflows heap; ignoring");
+            return;
+        }
+        // insert and coalesce
+        let pos = self.free.partition_point(|(s, _)| *s < block_start);
+        self.free.insert(pos, (block_start, block_size));
+        // coalesce with neighbours
+        let mut merged = Vec::with_capacity(self.free.len());
+        for (s, sz) in self.free.drain(..) {
+            if let Some((ps, psz)) = merged.last_mut() {
+                if *ps + *psz == s {
+                    *psz += sz;
+                    continue;
+                }
+            }
+            merged.push((s, sz));
+        }
+        self.free = merged;
+    }
+
+    pub fn free_bytes(&self) -> u32 {
+        self.free.iter().map(|(_, s)| *s).sum()
+    }
+}
+
 /// The whole emulated process state owned by the kernel.
 pub struct Process {
     pub image: LoadedImage,
@@ -104,6 +226,7 @@ pub struct Process {
     pub thunk_by_va: HashMap<u32, usize>,
     pub stack_top: u32,
     pub stack_size: u32,
+    pub state: KernelState,
 }
 
 impl Process {
@@ -169,12 +292,32 @@ impl Process {
         cpu.map_region(stack_base, stack_size, Prot::READ | Prot::WRITE)?;
         cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
 
+        // 4. Map a heap.
+        cpu.map_region(HEAP_BASE, HEAP_SIZE, Prot::READ | Prot::WRITE)?;
+        let heap = Heap::new(HEAP_BASE, HEAP_SIZE);
+
+        // 5. Map the WinCE kernel trap region. Real WinCE kernels
+        //    publish syscall entry points at fixed offsets inside
+        //    `0xF000_0000+`. We don't know the exact callsites
+        //    coredll routes through this range, so we fill the page
+        //    with `bx lr` — any guest jump there returns harmlessly.
+        cpu.map_region(KERNEL_TRAP_BASE, KERNEL_TRAP_SIZE, Prot::READ | Prot::EXEC)?;
+        let mut trap_page = Vec::with_capacity(KERNEL_TRAP_SIZE as usize);
+        while trap_page.len() < KERNEL_TRAP_SIZE as usize {
+            trap_page.extend_from_slice(&ARM_BX_LR);
+        }
+        cpu.write_mem(KERNEL_TRAP_BASE, &trap_page)?;
+
         Ok(Process {
             image,
             thunks,
             thunk_by_va,
             stack_top,
             stack_size,
+            state: KernelState {
+                heap,
+                vfs: vfs::Vfs::new(),
+            },
         })
     }
 
@@ -201,7 +344,7 @@ impl Process {
 /// or the configured instruction budget is exhausted.
 pub fn run_main_loop(
     cpu: &mut dyn Cpu,
-    process: &Process,
+    process: &mut Process,
     dispatcher: &mut dyn Dispatcher,
     instruction_budget_per_slice: u64,
     max_slices: u64,
@@ -232,10 +375,13 @@ pub fn run_main_loop(
                 continue;
             }
             StopReason::Hook(addr) => {
-                let thunk = process.find_thunk(addr).cloned().ok_or_else(|| {
-                    KernelError::Dispatch(format!("hook fired at unmapped 0x{addr:08x}"))
-                })?;
-                let outcome = dispatcher.dispatch(cpu, &thunk)?;
+                let thunk = {
+                    let t = process.find_thunk(addr).ok_or_else(|| {
+                        KernelError::Dispatch(format!("hook fired at unmapped 0x{addr:08x}"))
+                    })?;
+                    t.clone()
+                };
+                let outcome = dispatcher.dispatch(cpu, &thunk, &mut process.state)?;
                 let r0_default = match outcome {
                     DispatchOutcome::Halt => {
                         log::info!("dispatcher requested halt at {}", thunk.label());
@@ -266,6 +412,37 @@ mod tests {
     use super::*;
     use pocket_cpu::stub::StubCpu;
     use pocket_pe::{LoadedImage, LoadedSection};
+
+    #[test]
+    fn heap_alloc_then_free_round_trips() {
+        let mut h = Heap::new(0x1000_0000, 0x1_0000);
+        let initial_free = h.free_bytes();
+        let a = h.alloc(64).unwrap();
+        let b = h.alloc(128).unwrap();
+        assert!(b > a);
+        assert!(h.free_bytes() < initial_free);
+        h.free(a, 64);
+        h.free(b, 128);
+        // After freeing both, the heap should be fully coalesced.
+        assert_eq!(h.free_bytes(), initial_free);
+    }
+
+    #[test]
+    fn heap_returns_aligned_pointers() {
+        let mut h = Heap::new(0x1000_0000, 0x1_0000);
+        let a = h.alloc(1).unwrap();
+        let b = h.alloc(7).unwrap();
+        assert_eq!(a % 8, 0);
+        assert_eq!(b % 8, 0);
+    }
+
+    #[test]
+    fn heap_exhaustion_returns_none() {
+        let mut h = Heap::new(0x1000_0000, 0x80);
+        let _ = h.alloc(60).unwrap();
+        // Header overhead leaves only ~52 bytes free; 60 should fail.
+        assert!(h.alloc(60).is_none());
+    }
 
     #[test]
     fn map_simple_image() {
