@@ -19,3 +19,6 @@ serde_json.workspace = true
 pocket-cpu = { path = "../pocket-cpu" }
 pocket-kernel = { path = "../pocket-kernel" }
 pocket-pe = { path = "../pocket-pe" }
+
+[dev-dependencies]
+tempfile = "3"

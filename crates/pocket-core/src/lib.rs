@@ -66,6 +66,11 @@ impl Emulator {
         self.dispatcher.halt_on_unimplemented = halt;
     }
 
+    /// Forward every dispatched API call as JSON-lines to `sink`.
+    pub fn set_trace_sink(&mut self, sink: Box<dyn std::io::Write + Send>) {
+        self.dispatcher.set_trace_sink(sink);
+    }
+
     /// Load and map a PE file into the emulator. Existing process
     /// state is replaced.
     pub fn load_pe(&mut self, path: impl AsRef<Path>) -> Result<&Process> {
@@ -83,7 +88,7 @@ impl Emulator {
     pub fn run(&mut self) -> Result<()> {
         let process = self
             .process
-            .as_ref()
+            .as_mut()
             .context("no PE loaded — call load_pe() first")?;
         run_main_loop(
             self.cpu.as_mut(),
@@ -99,8 +104,22 @@ impl Emulator {
         self.process.as_ref()
     }
 
+    pub fn process_mut(&mut self) -> Option<&mut Process> {
+        self.process.as_mut()
+    }
+
     pub fn dispatcher(&self) -> &WinCeDispatcher {
         &self.dispatcher
+    }
+
+    /// Mount a host directory at a guest WinCE path. Useful for
+    /// satisfying `CreateFileW` requests once the PE is loaded.
+    pub fn mount_dir(&mut self, guest_prefix: &str, host_dir: impl Into<std::path::PathBuf>) {
+        if let Some(p) = self.process.as_mut() {
+            p.state.vfs.mount(guest_prefix, host_dir);
+        } else {
+            log::warn!("mount_dir called before load_pe; ignored");
+        }
     }
 }
 

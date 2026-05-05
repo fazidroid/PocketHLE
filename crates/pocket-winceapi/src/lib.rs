@@ -21,9 +21,10 @@ pub mod hss;
 pub mod ordinals;
 
 use std::collections::HashMap;
+use std::io::Write;
 
-use pocket_cpu::Cpu;
-use pocket_kernel::{DispatchOutcome, Dispatcher, KernelError, Thunk};
+use pocket_cpu::{regs::ArmReg, Cpu};
+use pocket_kernel::{DispatchOutcome, Dispatcher, KernelError, KernelState, Thunk};
 use pocket_pe::ImportBinding;
 
 /// Convert an ordinal-only import to a friendly name where possible.
@@ -35,6 +36,7 @@ pub fn resolve_ordinal(dll: &str, ordinal: u16) -> Option<String> {
 pub struct CallCtx<'a> {
     pub cpu: &'a mut dyn Cpu,
     pub thunk: &'a Thunk,
+    pub kernel: &'a mut KernelState,
 }
 
 impl<'a> CallCtx<'a> {
@@ -69,6 +71,8 @@ pub struct WinCeDispatcher {
     /// If `true`, an unimplemented call halts the emulator instead of
     /// returning 0. Useful for the Linux CLI tracing run.
     pub halt_on_unimplemented: bool,
+    /// Optional JSON-lines sink. One record per dispatched call.
+    trace_sink: Option<Box<dyn Write + Send>>,
 }
 
 impl Default for WinCeDispatcher {
@@ -83,6 +87,7 @@ impl WinCeDispatcher {
             by_name: HashMap::new(),
             call_counts: HashMap::new(),
             halt_on_unimplemented: false,
+            trace_sink: None,
         };
         coredll::register(&mut d);
         aygshell::register(&mut d);
@@ -104,6 +109,13 @@ impl WinCeDispatcher {
     pub fn registered_iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.by_name.keys().map(|(d, n)| (d.as_str(), n.as_str()))
     }
+
+    /// Enable JSON-lines tracing. Each dispatched call writes one
+    /// record with the form
+    /// `{"dll": "...", "name": "...", "args": [r0, r1, r2, r3], "ret": <u32>, "status": "ok"|"unimplemented"|"halt"}`.
+    pub fn set_trace_sink(&mut self, sink: Box<dyn Write + Send>) {
+        self.trace_sink = Some(sink);
+    }
 }
 
 impl Dispatcher for WinCeDispatcher {
@@ -111,6 +123,7 @@ impl Dispatcher for WinCeDispatcher {
         &mut self,
         cpu: &mut dyn Cpu,
         thunk: &Thunk,
+        kernel: &mut KernelState,
     ) -> Result<DispatchOutcome, KernelError> {
         *self.call_counts.entry(thunk.thunk_va).or_default() += 1;
         let dll_key = thunk.dll.to_ascii_lowercase();
@@ -119,11 +132,35 @@ impl Dispatcher for WinCeDispatcher {
             (ImportBinding::Name(n), _) => n.clone(),
             (ImportBinding::Ordinal(o), _) => format!("ord:{o}"),
         };
-        let key = (dll_key, name.clone());
-        if let Some(handler) = self.by_name.get(&key) {
+
+        // Capture args before the handler may mutate them.
+        let args = if self.trace_sink.is_some() {
+            [
+                cpu.read_reg(ArmReg::R0).unwrap_or(0),
+                cpu.read_reg(ArmReg::R1).unwrap_or(0),
+                cpu.read_reg(ArmReg::R2).unwrap_or(0),
+                cpu.read_reg(ArmReg::R3).unwrap_or(0),
+            ]
+        } else {
+            [0; 4]
+        };
+
+        let key = (dll_key.clone(), name.clone());
+        let outcome = if let Some(handler) = self.by_name.get(&key) {
             log::trace!("call {}", thunk.label());
-            let mut ctx = CallCtx { cpu, thunk };
-            handler(&mut ctx)
+            let mut ctx = CallCtx { cpu, thunk, kernel };
+            match handler(&mut ctx) {
+                Ok(o) => Ok(o),
+                Err(e) => {
+                    // A handler that hit bad guest memory shouldn't
+                    // bring the whole emulator down — the game itself
+                    // is the one that passed garbage. Log loudly and
+                    // synthesise a 0 return so the trace still
+                    // captures every call after this one.
+                    log::warn!("handler {} failed: {}; returning 0", thunk.label(), e);
+                    Ok(DispatchOutcome::ReturnedR0(0))
+                }
+            }
         } else {
             log::warn!("unimplemented call -> {}", thunk.label());
             if self.halt_on_unimplemented {
@@ -131,7 +168,31 @@ impl Dispatcher for WinCeDispatcher {
             } else {
                 Ok(DispatchOutcome::Unimplemented)
             }
+        };
+
+        if let Some(sink) = self.trace_sink.as_mut() {
+            let (ret, status) = match &outcome {
+                Ok(DispatchOutcome::ReturnedR0(v)) => (*v, "ok"),
+                Ok(DispatchOutcome::ReturnedR0R1(v, _)) => (*v, "ok"),
+                Ok(DispatchOutcome::Halt) => (0, "halt"),
+                Ok(DispatchOutcome::Unimplemented) => (0, "unimplemented"),
+                Err(_) => (0, "error"),
+            };
+            let line = format!(
+                "{{\"dll\":\"{dll}\",\"name\":\"{n}\",\"args\":[{a0},{a1},{a2},{a3}],\"ret\":{ret},\"status\":\"{st}\"}}\n",
+                dll = dll_key,
+                n = name,
+                a0 = args[0],
+                a1 = args[1],
+                a2 = args[2],
+                a3 = args[3],
+                ret = ret,
+                st = status,
+            );
+            let _ = sink.write_all(line.as_bytes());
         }
+
+        outcome
     }
 }
 
