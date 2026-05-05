@@ -130,6 +130,23 @@ impl Emulator {
         &self.dispatcher
     }
 
+    /// Write raw bytes into emulated guest memory. Useful for patching
+    /// the loaded image (e.g. NOP'ing out a hostile static-init call)
+    /// before [`Self::run`] is invoked.
+    pub fn write_guest_memory(&mut self, addr: u32, bytes: &[u8]) -> Result<()> {
+        self.cpu
+            .write_mem(addr, bytes)
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Install an instruction-level code hook at the given guest VA.
+    /// Used by `--watch` for diagnostic breakpoints. When the CPU
+    /// reaches the address, the kernel run loop will dump registers
+    /// and halt cleanly.
+    pub fn add_code_hook(&mut self, va: u32) -> Result<()> {
+        self.cpu.add_code_hook(va).map_err(|e| anyhow::anyhow!(e))
+    }
+
     /// Mount a host directory at a guest WinCE path. Useful for
     /// satisfying `CreateFileW` requests once the PE is loaded.
     pub fn mount_dir(&mut self, guest_prefix: &str, host_dir: impl Into<std::path::PathBuf>) {

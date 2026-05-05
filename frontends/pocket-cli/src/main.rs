@@ -36,6 +36,15 @@ enum Command {
         #[arg(short, long)]
         out_dir: Option<PathBuf>,
     },
+    /// Render a deterministic test pattern through the framebuffer
+    /// and GDI subsystems and write the result as a PPM. This proves
+    /// the rendering substrate is wired without needing a full game
+    /// to actually reach `WinMain`.
+    RenderDemo {
+        /// Path to write the generated PPM (defaults to `./demo.ppm`).
+        #[arg(short, long, default_value = "demo.ppm")]
+        out: PathBuf,
+    },
     /// Run a PE file in the emulator. Without `--cpu unicorn` this
     /// uses the trace-only stub CPU and only logs API requests.
     Run {
@@ -80,6 +89,20 @@ enum Command {
         /// way to capture proof-of-rendering screenshots.
         #[arg(long, default_value_t = 0)]
         max_frames: u64,
+        /// Patch raw bytes into the guest image before execution.
+        /// Format: `<hex_addr>=<hex_bytes>`, e.g.
+        /// `--patch 0x000247dc=00000ae0` will overwrite four bytes at
+        /// VA 0x247dc with `0x00 0x00 0x0a 0xe0`. May be passed
+        /// multiple times. Used to bypass hostile static initializers
+        /// in legacy CRTs.
+        #[arg(long, value_name = "ADDR=HEX")]
+        patch: Vec<String>,
+        /// Add an instruction-level breakpoint at the given guest VA.
+        /// When the CPU reaches it, PocketHLE dumps the full register
+        /// state and halts. Used to diagnose where unexpected control
+        /// flow comes from. May be passed multiple times.
+        #[arg(long, value_name = "VA")]
+        watch: Vec<String>,
     },
 }
 
@@ -104,6 +127,7 @@ fn main() -> Result<()> {
         Command::PeInfo { path } => cmd_pe_info(&path),
         Command::UnpackCab { cab, out_dir } => cmd_unpack_cab(&cab, &out_dir),
         Command::InspectCab { cab, out_dir } => cmd_inspect_cab(&cab, out_dir.as_deref()),
+        Command::RenderDemo { out } => cmd_render_demo(&out),
         Command::Run {
             path,
             cpu,
@@ -116,6 +140,8 @@ fn main() -> Result<()> {
             display,
             dump_frames_to,
             max_frames,
+            patch,
+            watch,
         } => cmd_run(
             &path,
             cpu,
@@ -128,6 +154,8 @@ fn main() -> Result<()> {
             display,
             dump_frames_to.as_deref(),
             max_frames,
+            &patch,
+            &watch,
         ),
     }
 }
@@ -229,6 +257,85 @@ fn cmd_inspect_cab(cab: &std::path::Path, out_dir: Option<&std::path::Path>) -> 
     Ok(())
 }
 
+fn cmd_render_demo(out_path: &std::path::Path) -> Result<()> {
+    use pocket_core::kernel::framebuffer::{pack_rgb565, FB_HEIGHT, FB_WIDTH};
+    use pocket_core::kernel::gdi::{Bitmap, Surface};
+    use pocket_core::kernel::Framebuffer;
+
+    let mut fb = Framebuffer::default();
+
+    // Sky gradient (top half) directly via the framebuffer primitive.
+    for y in 0..(FB_HEIGHT as i32 / 2) {
+        let t = y as u32;
+        let r = 0x40 + t / 2;
+        let g = 0x80 + t / 3;
+        let b = 0xff_u32.saturating_sub(t);
+        let pixel = pack_rgb565(r as u8, g as u8, b as u8);
+        for x in 0..FB_WIDTH as i32 {
+            fb.put_pixel(x, y, pixel);
+        }
+    }
+    // Ground via fill_rect — same path GDI `FillRect` exercises.
+    Surface::Screen(&mut fb).fill_rect(
+        0,
+        FB_HEIGHT as i32 / 2,
+        FB_WIDTH as i32,
+        FB_HEIGHT as i32 / 2,
+        pack_rgb565(0x4a, 0x35, 0x1f),
+    );
+
+    // Off-screen 32×32 ball drawn in a memory bitmap, then blitted —
+    // the same code path GDI `BitBlt` exercises.
+    let ball_w = 32u32;
+    let ball_h = 32u32;
+    let mut ball = Bitmap::new(ball_w, ball_h);
+    for y in 0..ball_h as i32 {
+        for x in 0..ball_w as i32 {
+            let dx = x - 16;
+            let dy = y - 16;
+            let d2 = dx * dx + dy * dy;
+            let pixel = if d2 <= 15 * 15 {
+                pack_rgb565(0xff, 0xd0, 0x20)
+            } else {
+                pack_rgb565(0, 0, 0)
+            };
+            let off = (y as u32 * ball_w + x as u32) as usize * 2;
+            ball.pixels[off..off + 2].copy_from_slice(&pixel.to_le_bytes());
+        }
+    }
+    let ball_pixels = ball.pixels.clone();
+    Surface::Screen(&mut fb).blit_from_bytes(
+        100,
+        140,
+        0,
+        0,
+        ball_w as i32,
+        ball_h as i32,
+        &ball_pixels,
+        ball_w,
+        ball_h,
+    );
+
+    // Red border via stroke_rect.
+    Surface::Screen(&mut fb).stroke_rect(
+        0,
+        0,
+        FB_WIDTH as i32,
+        FB_HEIGHT as i32,
+        pack_rgb565(0xff, 0, 0),
+    );
+
+    let ppm = fb.snapshot_ppm();
+    std::fs::write(out_path, &ppm).context("writing PPM")?;
+    println!(
+        "Wrote {}×{} demo PPM to {}",
+        FB_WIDTH,
+        FB_HEIGHT,
+        out_path.display()
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_run(
     path: &std::path::Path,
@@ -242,6 +349,8 @@ fn cmd_run(
     display: bool,
     dump_frames_to: Option<&std::path::Path>,
     max_frames: u64,
+    patches: &[String],
+    watches: &[String],
 ) -> Result<()> {
     let mut emu = match backend {
         CpuBackend::Stub => Emulator::with_stub_cpu(),
@@ -276,6 +385,37 @@ fn cmd_run(
             rom_prefix
         );
     }
+    for spec in patches {
+        let (addr_str, hex_str) = spec
+            .split_once('=')
+            .with_context(|| format!("invalid --patch spec {spec:?}; expected ADDR=HEX"))?;
+        let addr_str = addr_str.trim_start_matches("0x");
+        let addr = u32::from_str_radix(addr_str, 16)
+            .with_context(|| format!("invalid hex address in --patch {spec:?}"))?;
+        let hex_str = hex_str.trim_start_matches("0x");
+        if hex_str.len() % 2 != 0 {
+            anyhow::bail!("invalid --patch hex bytes (odd length) in {spec:?}");
+        }
+        let mut bytes = Vec::with_capacity(hex_str.len() / 2);
+        for chunk in hex_str.as_bytes().chunks(2) {
+            let s = std::str::from_utf8(chunk).unwrap();
+            bytes.push(
+                u8::from_str_radix(s, 16)
+                    .with_context(|| format!("invalid hex byte {s:?} in --patch {spec:?}"))?,
+            );
+        }
+        emu.write_guest_memory(addr, &bytes)
+            .with_context(|| format!("applying --patch {spec:?}"))?;
+        println!("Patched {} bytes at guest VA 0x{:08x}", bytes.len(), addr);
+    }
+    for spec in watches {
+        let s = spec.trim_start_matches("0x");
+        let va = u32::from_str_radix(s, 16)
+            .with_context(|| format!("invalid hex VA in --watch {spec:?}"))?;
+        emu.add_code_hook(va)
+            .with_context(|| format!("installing --watch breakpoint at 0x{va:08x}"))?;
+        println!("Installed watch breakpoint at guest VA 0x{:08x}", va);
+    }
     println!(
         "Registered API stubs: {}",
         emu.dispatcher().registered_count()
@@ -306,12 +446,29 @@ fn cmd_run(
         }
     }
 
-    if hooks.is_empty() {
-        emu.run()?;
+    let run_result = if hooks.is_empty() {
+        emu.run()
     } else {
         let mut combined = MultiHook { hooks };
-        emu.run_with_hook(&mut combined)?;
+        emu.run_with_hook(&mut combined)
+    };
+
+    if let Some(p) = emu.process() {
+        let ppm = p.state.framebuffer.snapshot_ppm();
+        let final_path = std::path::PathBuf::from("/tmp/pockethle-final.ppm");
+        if let Err(e) = std::fs::write(&final_path, &ppm) {
+            eprintln!("warn: could not write {} ({e})", final_path.display());
+        } else {
+            println!(
+                "Final framebuffer snapshot written to {} ({} bytes, frame_counter={})",
+                final_path.display(),
+                ppm.len(),
+                p.state.framebuffer.frame_counter,
+            );
+        }
     }
+
+    run_result?;
     println!("Emulator exited cleanly.");
     Ok(())
 }

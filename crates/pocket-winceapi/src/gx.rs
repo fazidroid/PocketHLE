@@ -159,6 +159,9 @@ mod tests {
             resources: vec![],
             image_base: 0,
             fb_mapped: false,
+            synthetic_message_count: 0,
+            synthetic_message_budget: 240,
+            wnd_proc: 0,
         }
     }
 

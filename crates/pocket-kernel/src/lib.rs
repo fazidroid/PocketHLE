@@ -86,6 +86,11 @@ pub enum DispatchOutcome {
     /// The host has not implemented this API. PocketHLE will log a
     /// loud warning and synthesize a `0` return.
     Unimplemented,
+    /// Reroute control flow into the guest at `pc`, leaving LR/SP and
+    /// argument registers exactly as the handler set them up. Used to
+    /// trampoline into guest WndProc / atexit / signal handlers from
+    /// inside an HLE call (e.g. `DispatchMessageW`).
+    JumpTo(u32),
 }
 
 /// Trait an API layer registers with the kernel. Called every time
@@ -119,6 +124,18 @@ pub struct KernelState {
     /// requires `&mut dyn Cpu`, which isn't available outside a call,
     /// so we let the GAPI handlers do it.
     pub fb_mapped: bool,
+    /// Number of synthetic `WM_PAINT` / `WM_TIMER` messages already
+    /// fed to the guest. Used by `GetMessageW` / `PeekMessageW` to
+    /// terminate the message loop after a configurable number of
+    /// frames, so headless runs don't loop forever.
+    pub synthetic_message_count: u64,
+    /// Maximum synthetic frame messages to inject. `0` means
+    /// unlimited.
+    pub synthetic_message_budget: u64,
+    /// Address of the guest's last-registered window procedure. Set
+    /// by `RegisterClassW`, used by `DispatchMessageW` to trampoline
+    /// into guest-side WM_PAINT / WM_KEYDOWN handlers.
+    pub wnd_proc: u32,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -325,6 +342,13 @@ impl Process {
             trap_page.extend_from_slice(&ARM_BX_LR);
         }
         cpu.write_mem(KERNEL_TRAP_BASE, &trap_page)?;
+        // Install a halt-on-hit watch on the well-known terminate
+        // syscalls reached via the MS CRT __doexit path. Without
+        // this, the guest's ExitProcess returns through `bx lr`
+        // back into a poisoned LR / popped 0 → bogus null deref.
+        for &exit_va in &[0xF000_F7F8u32, 0xF000_F7FCu32, 0xF000_FFFCu32] {
+            cpu.add_code_hook(exit_va)?;
+        }
 
         let resources = image.resources.clone();
         let img_base = image.image_base;
@@ -342,6 +366,9 @@ impl Process {
                 resources,
                 image_base: img_base,
                 fb_mapped: false,
+                synthetic_message_count: 0,
+                synthetic_message_budget: 240,
+                wnd_proc: 0,
             },
         })
     }
@@ -418,13 +445,40 @@ pub fn run_main_loop_with_hook(
     max_slices: u64,
     mut frame_hook: Option<&mut dyn FrameHook>,
 ) -> Result<(), KernelError> {
-    let mut pc = process.image.entry_va();
+    let mut pc = match std::env::var("POCKETHLE_OVERRIDE_ENTRY") {
+        Ok(v) => {
+            let parsed = if let Some(stripped) = v.strip_prefix("0x") {
+                u32::from_str_radix(stripped, 16)
+            } else {
+                v.parse::<u32>()
+            }
+            .map_err(|_| KernelError::Loader("invalid POCKETHLE_OVERRIDE_ENTRY".into()))?;
+            log::info!("POCKETHLE_OVERRIDE_ENTRY=0x{parsed:08x}");
+            parsed
+        }
+        Err(_) => process.image.entry_va(),
+    };
     log::info!(
         "entering emulated main: entry=0x{:08x}, stack_top=0x{:08x}",
         pc,
         process.stack_top
     );
     for _slice in 0..max_slices {
+        // PC=0 (or any address in the unmapped null page) means
+        // the guest jumped through a null function pointer or popped
+        // a poisoned LR off the stack. Without an explicit halt,
+        // unicorn's `emu_start` typically returns `Ok(0 instructions)`
+        // and we'd spin forever. Surface it as a real crash with the
+        // CPU dump.
+        if pc < 0x1000 {
+            log::error!(
+                "guest jumped to NULL/low address pc=0x{pc:08x}\n{regs}",
+                regs = dump_regs(cpu),
+            );
+            return Err(KernelError::Loader(format!(
+                "guest jumped to unmapped address 0x{pc:08x}"
+            )));
+        }
         let stop = match cpu.run_until_hook(pc, instruction_budget_per_slice) {
             Ok(s) => s,
             Err(e) => {
@@ -444,30 +498,47 @@ pub fn run_main_loop_with_hook(
                 continue;
             }
             StopReason::Hook(addr) => {
-                let thunk = {
-                    let t = process.find_thunk(addr).ok_or_else(|| {
-                        KernelError::Dispatch(format!("hook fired at unmapped 0x{addr:08x}"))
-                    })?;
-                    t.clone()
+                let thunk = match process.find_thunk(addr) {
+                    Some(t) => t.clone(),
+                    None => {
+                        // A `--watch` breakpoint or other non-thunk
+                        // code hook was hit. Dump CPU state for the
+                        // diagnostic and HALT — otherwise unicorn
+                        // would re-fire the hook on resume and we'd
+                        // spin forever.
+                        log::warn!("watch hit at 0x{addr:08x}\n{regs}", regs = dump_regs(cpu),);
+                        return Ok(());
+                    }
                 };
                 let outcome = dispatcher.dispatch(cpu, &thunk, &mut process.state)?;
-                let r0_default = match outcome {
+                match outcome {
                     DispatchOutcome::Halt => {
                         log::info!("dispatcher requested halt at {}", thunk.label());
                         return Ok(());
                     }
-                    DispatchOutcome::ReturnedR0(v) => Some((v, None)),
-                    DispatchOutcome::ReturnedR0R1(a, b) => Some((a, Some(b))),
-                    DispatchOutcome::Unimplemented => Some((0, None)),
-                };
-                if let Some((v, maybe_hi)) = r0_default {
-                    cpu.write_reg(ArmReg::R0, v)?;
-                    if let Some(hi) = maybe_hi {
-                        cpu.write_reg(ArmReg::R1, hi)?;
+                    DispatchOutcome::ReturnedR0(v) => {
+                        cpu.write_reg(ArmReg::R0, v)?;
+                        let lr = cpu.read_reg(ArmReg::Lr)?;
+                        pc = lr & !1;
+                    }
+                    DispatchOutcome::ReturnedR0R1(a, b) => {
+                        cpu.write_reg(ArmReg::R0, a)?;
+                        cpu.write_reg(ArmReg::R1, b)?;
+                        let lr = cpu.read_reg(ArmReg::Lr)?;
+                        pc = lr & !1;
+                    }
+                    DispatchOutcome::Unimplemented => {
+                        cpu.write_reg(ArmReg::R0, 0)?;
+                        let lr = cpu.read_reg(ArmReg::Lr)?;
+                        pc = lr & !1;
+                    }
+                    DispatchOutcome::JumpTo(target) => {
+                        // Trampoline into a guest function — `target` is
+                        // the new PC, the handler is responsible for
+                        // setting LR / R0..R3 / SP appropriately.
+                        pc = target & !1;
                     }
                 }
-                let lr = cpu.read_reg(ArmReg::Lr)?;
-                pc = lr & !1; // strip Thumb bit
             }
             StopReason::Requested | StopReason::OutOfBounds => return Ok(()),
         }
@@ -478,7 +549,12 @@ pub fn run_main_loop_with_hook(
             }
         }
     }
-    log::warn!("main loop hit max_slices={max_slices}; exiting");
+    let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(0);
+    log::warn!(
+        "main loop hit max_slices={max_slices}; exiting at pc=0x{pc_now:08x}\n{regs}{mem}",
+        regs = dump_regs(cpu),
+        mem = dump_mem_around(cpu, pc_now, 16),
+    );
     Ok(())
 }
 

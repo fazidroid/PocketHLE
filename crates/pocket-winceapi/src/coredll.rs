@@ -135,9 +135,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "ShowWindow", one_returning);
     d.register_handler(dll, "UpdateWindow", one_returning);
     d.register_handler(dll, "DefWindowProcW", zero_returning);
-    d.register_handler(dll, "DispatchMessageW", zero_returning);
+    d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
-    d.register_handler(dll, "PeekMessageW", zero_returning);
+    d.register_handler(dll, "PeekMessageW", peek_message_w);
     d.register_handler(dll, "TranslateMessage", one_returning);
     d.register_handler(dll, "PostQuitMessage", post_quit_message);
     d.register_handler(dll, "PostMessageW", one_returning);
@@ -283,7 +283,21 @@ fn longjmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         ArmReg::Sp,
         ArmReg::Lr,
     ];
-    let blob = ctx.cpu.read_mem(buf, regs_to_restore.len() as u32 * 4)?;
+    // A NULL or otherwise unmapped jmp_buf typically means the C++
+    // SEH unwinder is asking for cleanup without a matching setjmp.
+    // Treat it as a no-op (`R0=value`, resume from LR) and let the
+    // caller continue. If that path turns out to be a fatal abort
+    // signal in some game we can revisit.
+    let blob = match ctx.cpu.read_mem(buf, regs_to_restore.len() as u32 * 4) {
+        Ok(b) => b,
+        Err(_) => {
+            log::debug!(
+                "longjmp(buf=0x{buf:08x}, val={val}) with unmapped jmp_buf; treating as no-op"
+            );
+            let ret = if val == 0 { 1 } else { val };
+            return Ok(DispatchOutcome::ReturnedR0(ret));
+        }
+    };
     for (i, r) in regs_to_restore.iter().enumerate() {
         let off = i * 4;
         let v = u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]);
@@ -887,7 +901,31 @@ fn do_realloc(
 
 // ---------- window / message ----------
 
-fn register_class_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn register_class_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // The first argument is `const WNDCLASS *`. On 32-bit Windows
+    // the layout is:
+    //   UINT      style;          (off 0)
+    //   WNDPROC   lpfnWndProc;    (off 4)
+    //   int       cbClsExtra;     (off 8)
+    //   int       cbWndExtra;     (off 12)
+    //   HINSTANCE hInstance;      (off 16)
+    //   ...
+    // We only care about lpfnWndProc — capture it so DispatchMessageW
+    // can trampoline into the guest WndProc.
+    let lpwc = ctx.arg_u32(0)?;
+    if lpwc != 0 {
+        if let Ok(buf) = ctx.cpu.read_mem(lpwc + 4, 4) {
+            let proc_va = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if proc_va != 0 {
+                ctx.kernel.wnd_proc = proc_va;
+                log::info!(
+                    "RegisterClassW captured WndProc=0x{:08x} from WNDCLASS at 0x{:08x}",
+                    proc_va,
+                    lpwc
+                );
+            }
+        }
+    }
     // ATOMs are 16-bit; return a non-zero one.
     Ok(DispatchOutcome::ReturnedR0(0xC001))
 }
@@ -896,23 +934,93 @@ fn create_window_ex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
 }
 
+fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // DispatchMessageW(const MSG *lpMsg) — pass the message into the
+    // captured WndProc and trampoline guest execution into it. The
+    // WndProc's epilogue will return to our LR (the message-loop
+    // call site), so the loop continues normally.
+    let lp_msg = ctx.arg_u32(0)?;
+    let wnd_proc = ctx.kernel.wnd_proc;
+    if wnd_proc == 0 || lp_msg == 0 {
+        // No registered WndProc / no message → behave like the old
+        // stub: return 0, control resumes from LR.
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let buf = match ctx.cpu.read_mem(lp_msg, 16) {
+        Ok(b) => b,
+        Err(_) => return Ok(DispatchOutcome::ReturnedR0(0)),
+    };
+    let hwnd = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let message = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let wparam = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let lparam = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    log::debug!(
+        "DispatchMessageW trampoline -> WndProc(hwnd=0x{:x}, msg=0x{:x}, wp=0x{:x}, lp=0x{:x}) at 0x{:08x}",
+        hwnd, message, wparam, lparam, wnd_proc
+    );
+    use pocket_cpu::regs::ArmReg;
+    ctx.cpu.write_reg(ArmReg::R0, hwnd)?;
+    ctx.cpu.write_reg(ArmReg::R1, message)?;
+    ctx.cpu.write_reg(ArmReg::R2, wparam)?;
+    ctx.cpu.write_reg(ArmReg::R3, lparam)?;
+    // LR is already the message-loop's return address — leave it.
+    Ok(DispatchOutcome::JumpTo(wnd_proc))
+}
+
+/// Build a synthetic `MSG` blob (28 bytes on 32-bit Windows) and write
+/// it into the guest pointer. `message` selects which window message
+/// (e.g. `WM_PAINT = 0x000F` or `WM_QUIT = 0x0012`).
+fn write_synthetic_msg(
+    cpu: &mut dyn pocket_cpu::Cpu,
+    lp_msg: u32,
+    message: u32,
+) -> Result<(), KernelError> {
+    if lp_msg == 0 {
+        return Ok(());
+    }
+    // MSG: HWND hwnd; UINT message; WPARAM wParam; LPARAM lParam;
+    //      DWORD time; POINT pt; — 28 bytes total.
+    let mut msg = [0u8; 28];
+    msg[0..4].copy_from_slice(&FAKE_HWND.to_le_bytes());
+    msg[4..8].copy_from_slice(&message.to_le_bytes());
+    cpu.write_mem(lp_msg, &msg)?;
+    Ok(())
+}
+
 /// `BOOL GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)`
 ///
-/// We have no real message queue. We answer with a single `WM_QUIT`
-/// after the first call — that gracefully tears down the message loop
-/// in any well-written WinCE app and gives us a clean exit.
+/// We have no real OS message queue. To drive an HLE'd Pocket PC game
+/// to actually paint, we fabricate a series of `WM_PAINT` messages
+/// (up to `synthetic_message_budget`), then signal `WM_QUIT` with a
+/// `0` return so the loop tears down cleanly.
 fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let lp_msg = ctx.arg_u32(0)?;
-    if lp_msg != 0 {
-        // MSG layout: HWND hwnd; UINT message; WPARAM wParam; LPARAM lParam;
-        // DWORD time; POINT pt; -- 28 bytes total on 32-bit.
-        let mut msg = [0u8; 28];
-        // message field at offset 4 = WM_QUIT (0x12)
-        msg[4..8].copy_from_slice(&0x0012u32.to_le_bytes());
-        ctx.cpu.write_mem(lp_msg, &msg)?;
+    let count = ctx.kernel.synthetic_message_count;
+    let budget = ctx.kernel.synthetic_message_budget;
+    let exhausted = budget > 0 && count >= budget;
+    if exhausted {
+        write_synthetic_msg(ctx.cpu, lp_msg, 0x0012)?; // WM_QUIT
+        return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    // Returning 0 tells the loop to terminate, which is what WM_QUIT does.
-    Ok(DispatchOutcome::ReturnedR0(0))
+    write_synthetic_msg(ctx.cpu, lp_msg, 0x000F)?; // WM_PAINT
+    ctx.kernel.synthetic_message_count = count + 1;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL PeekMessageW(LPMSG, HWND, UINT, UINT, UINT removeMode)` —
+/// returns 1 with a synthetic `WM_PAINT` until our message budget is
+/// exhausted, then 0. This is what most GAPI-based games actually
+/// poll on.
+fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let lp_msg = ctx.arg_u32(0)?;
+    let count = ctx.kernel.synthetic_message_count;
+    let budget = ctx.kernel.synthetic_message_budget;
+    if budget > 0 && count >= budget {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    write_synthetic_msg(ctx.cpu, lp_msg, 0x000F)?; // WM_PAINT
+    ctx.kernel.synthetic_message_count = count + 1;
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn post_quit_message(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -1244,6 +1352,9 @@ mod tests {
             resources: vec![],
             image_base: 0,
             fb_mapped: false,
+            synthetic_message_count: 0,
+            synthetic_message_budget: 240,
+            wnd_proc: 0,
         }
     }
 
