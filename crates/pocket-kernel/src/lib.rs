@@ -24,9 +24,14 @@ use indexmap::IndexMap;
 use thiserror::Error;
 
 use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Cpu, CpuError, Prot, StopReason};
-use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage};
+use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
+pub mod framebuffer;
+pub mod gdi;
 pub mod vfs;
+
+pub use framebuffer::{Framebuffer, FB_BYTES, FB_HEIGHT, FB_WIDTH};
+pub use gdi::{GdiState, Surface};
 
 /// Default base address of the synthetic IAT thunk pool.
 pub const THUNK_REGION_BASE: u32 = 0x7000_0000;
@@ -101,6 +106,19 @@ pub trait Dispatcher {
 pub struct KernelState {
     pub heap: Heap,
     pub vfs: vfs::Vfs,
+    /// Software-rendered display the GDI/GAPI handlers paint into.
+    pub framebuffer: Framebuffer,
+    /// Tracked GDI objects (DCs, bitmaps, brushes, pens, fonts).
+    pub gdi: GdiState,
+    /// Flat resource table for `FindResourceW` / `LoadResource`.
+    pub resources: Vec<ResourceEntry>,
+    /// Image base for resource RVA → VA conversion.
+    pub image_base: u32,
+    /// Set the first time `GXBeginDraw` runs. The dispatcher maps the
+    /// framebuffer region into the guest VA space lazily — but that
+    /// requires `&mut dyn Cpu`, which isn't available outside a call,
+    /// so we let the GAPI handlers do it.
+    pub fb_mapped: bool,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -308,6 +326,8 @@ impl Process {
         }
         cpu.write_mem(KERNEL_TRAP_BASE, &trap_page)?;
 
+        let resources = image.resources.clone();
+        let img_base = image.image_base;
         Ok(Process {
             image,
             thunks,
@@ -317,6 +337,11 @@ impl Process {
             state: KernelState {
                 heap,
                 vfs: vfs::Vfs::new(),
+                framebuffer: Framebuffer::default(),
+                gdi: GdiState::new(),
+                resources,
+                image_base: img_base,
+                fb_mapped: false,
             },
         })
     }
@@ -339,6 +364,30 @@ impl Process {
     }
 }
 
+/// Returned from a [`FrameHook`] to indicate whether emulation
+/// should continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameAction {
+    Continue,
+    Stop,
+}
+
+/// Callback that observes the framebuffer between dispatch slices.
+/// Used by the host-side frontend to display the rendered frame and
+/// pump window events.
+pub trait FrameHook {
+    /// Called between dispatcher slices. The hook receives the
+    /// kernel state — typically the framebuffer — and returns
+    /// whether emulation should keep running.
+    fn on_frame(&mut self, state: &KernelState) -> FrameAction;
+}
+
+impl<F: FnMut(&KernelState) -> FrameAction> FrameHook for F {
+    fn on_frame(&mut self, state: &KernelState) -> FrameAction {
+        self(state)
+    }
+}
+
 /// Drive emulated execution in a loop, dispatching each thunk hit
 /// through `dispatcher` until a [`DispatchOutcome::Halt`] is returned
 /// or the configured instruction budget is exhausted.
@@ -348,6 +397,26 @@ pub fn run_main_loop(
     dispatcher: &mut dyn Dispatcher,
     instruction_budget_per_slice: u64,
     max_slices: u64,
+) -> Result<(), KernelError> {
+    run_main_loop_with_hook(
+        cpu,
+        process,
+        dispatcher,
+        instruction_budget_per_slice,
+        max_slices,
+        None,
+    )
+}
+
+/// Same as [`run_main_loop`], but also calls `frame_hook` between
+/// each slice so the host-side window can repaint and pump events.
+pub fn run_main_loop_with_hook(
+    cpu: &mut dyn Cpu,
+    process: &mut Process,
+    dispatcher: &mut dyn Dispatcher,
+    instruction_budget_per_slice: u64,
+    max_slices: u64,
+    mut frame_hook: Option<&mut dyn FrameHook>,
 ) -> Result<(), KernelError> {
     let mut pc = process.image.entry_va();
     log::info!(
@@ -401,6 +470,12 @@ pub fn run_main_loop(
                 pc = lr & !1; // strip Thumb bit
             }
             StopReason::Requested | StopReason::OutOfBounds => return Ok(()),
+        }
+        if let Some(hook) = frame_hook.as_deref_mut() {
+            if hook.on_frame(&process.state) == FrameAction::Stop {
+                log::info!("frame hook requested stop");
+                return Ok(());
+            }
         }
     }
     log::warn!("main loop hit max_slices={max_slices}; exiting");
@@ -462,6 +537,7 @@ mod tests {
             }],
             imports: vec![],
             exports: IndexMap::new(),
+            resources: vec![],
         };
         let mut cpu = StubCpu::new();
         let p = Process::map_into(img, &mut cpu, &|_, _| None).unwrap();

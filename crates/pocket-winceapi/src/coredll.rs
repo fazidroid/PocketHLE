@@ -22,14 +22,20 @@
 //! reaches `WinMain`.
 
 use pocket_cpu::regs::ArmReg;
+use pocket_kernel::framebuffer::{colorref_to_rgb565, FB_HEIGHT, FB_WIDTH};
+use pocket_kernel::gdi::{
+    Surface, GDI_SCREEN_DC, STOCK_BLACK_BRUSH, STOCK_BLACK_PEN, STOCK_NULL_BRUSH, STOCK_NULL_PEN,
+    STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
+};
 use pocket_kernel::{DispatchOutcome, KernelError};
+use pocket_pe::ResourceKey;
 
 use crate::{CallCtx, WinCeDispatcher};
 
 const FAKE_MODULE_HANDLE: u32 = 0x1000_0000;
 const FAKE_HWND: u32 = 0xDEAD_0001;
-const FAKE_GDI_BASE: u32 = 0xDEAD_1000;
 const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
+const PAINTSTRUCT_BYTES: u32 = 32;
 
 pub fn register(d: &mut WinCeDispatcher) {
     let dll = "coredll.dll";
@@ -118,9 +124,10 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_delete", free);
 
     // ---- Resources ----
-    d.register_handler(dll, "FindResourceW", null_returning);
-    d.register_handler(dll, "LoadResource", null_returning);
-    d.register_handler(dll, "LockResource", null_returning);
+    d.register_handler(dll, "FindResourceW", find_resource_w);
+    d.register_handler(dll, "LoadResource", load_resource);
+    d.register_handler(dll, "LockResource", lock_resource);
+    d.register_handler(dll, "SizeofResource", sizeof_resource);
 
     // ---- Window / message stubs ----
     d.register_handler(dll, "RegisterClassW", register_class_w);
@@ -138,30 +145,26 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "InvalidateRect", one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
 
-    // ---- GDI ----
-    for f in [
-        "BeginPaint",
-        "EndPaint",
-        "GetDC",
-        "ReleaseDC",
-        "CreateCompatibleDC",
-        "CreateCompatibleBitmap",
-        "CreateSolidBrush",
-        "CreatePen",
-        "CreateFontIndirectW",
-        "GetStockObject",
-        "SelectObject",
-    ] {
-        d.register_handler(dll, f, fake_gdi_handle);
-    }
-    d.register_handler(dll, "DeleteObject", one_returning);
-    d.register_handler(dll, "DeleteDC", one_returning);
-    d.register_handler(dll, "BitBlt", one_returning);
-    d.register_handler(dll, "Rectangle", one_returning);
-    d.register_handler(dll, "FillRect", one_returning);
-    d.register_handler(dll, "SetBkMode", zero_returning);
-    d.register_handler(dll, "SetBkColor", zero_returning);
-    d.register_handler(dll, "SetTextColor", zero_returning);
+    // ---- GDI (real, framebuffer-backed) ----
+    d.register_handler(dll, "GetDC", get_dc);
+    d.register_handler(dll, "ReleaseDC", one_returning);
+    d.register_handler(dll, "BeginPaint", begin_paint);
+    d.register_handler(dll, "EndPaint", end_paint);
+    d.register_handler(dll, "CreateCompatibleDC", create_compatible_dc);
+    d.register_handler(dll, "CreateCompatibleBitmap", create_compatible_bitmap);
+    d.register_handler(dll, "CreateSolidBrush", create_solid_brush);
+    d.register_handler(dll, "CreatePen", create_pen);
+    d.register_handler(dll, "CreateFontIndirectW", create_font_indirect);
+    d.register_handler(dll, "GetStockObject", get_stock_object);
+    d.register_handler(dll, "SelectObject", select_object);
+    d.register_handler(dll, "DeleteObject", delete_object);
+    d.register_handler(dll, "DeleteDC", delete_object);
+    d.register_handler(dll, "BitBlt", bit_blt);
+    d.register_handler(dll, "Rectangle", rectangle);
+    d.register_handler(dll, "FillRect", fill_rect);
+    d.register_handler(dll, "SetBkMode", set_bk_mode);
+    d.register_handler(dll, "SetBkColor", set_bk_color);
+    d.register_handler(dll, "SetTextColor", set_text_color);
     d.register_handler(dll, "TextOutW", one_returning);
     d.register_handler(dll, "ExtTextOutW", one_returning);
 }
@@ -182,16 +185,6 @@ fn null_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 
 fn invalid_handle_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE))
-}
-
-/// Returns a synthetic non-null GDI handle. We allocate sequential
-/// values from `FAKE_GDI_BASE` so that the trace log makes it obvious
-/// when the game hands the same handle back to us.
-fn fake_gdi_handle(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static NEXT: AtomicU32 = AtomicU32::new(FAKE_GDI_BASE);
-    let h = NEXT.fetch_add(1, Ordering::Relaxed);
-    Ok(DispatchOutcome::ReturnedR0(h))
 }
 
 // ---------- process / time ----------
@@ -939,6 +932,301 @@ fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     Ok(DispatchOutcome::ReturnedR0(v))
 }
 
+// ---------- GDI ----------
+
+fn get_dc(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(GDI_SCREEN_DC))
+}
+
+fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // BeginPaint(hwnd, lpPaint) -> HDC. Fill the PAINTSTRUCT enough
+    // for the caller (most games only read .hdc / .rcPaint).
+    let _hwnd = ctx.arg_u32(0)?;
+    let lp_paint = ctx.arg_u32(1)?;
+    if lp_paint != 0 {
+        let mut buf = [0u8; PAINTSTRUCT_BYTES as usize];
+        // hdc
+        buf[0..4].copy_from_slice(&GDI_SCREEN_DC.to_le_bytes());
+        // fErase = 1
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        // rcPaint = (0,0, FB_WIDTH, FB_HEIGHT)
+        buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&FB_WIDTH.to_le_bytes());
+        buf[20..24].copy_from_slice(&FB_HEIGHT.to_le_bytes());
+        ctx.cpu.write_mem(lp_paint, &buf)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(GDI_SCREEN_DC))
+}
+
+fn end_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ctx.kernel.framebuffer.mark_dirty();
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn create_compatible_dc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.kernel.gdi.create_memory_dc();
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn create_compatible_bitmap(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hdc = ctx.arg_u32(0)?;
+    let w = ctx.arg_u32(1)?;
+    let h = ctx.arg_u32(2)?;
+    let handle = ctx.kernel.gdi.create_compatible_bitmap(w, h);
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+fn create_solid_brush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let color = ctx.arg_u32(0)?;
+    let h = ctx.kernel.gdi.create_solid_brush(color);
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn create_pen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _style = ctx.arg_u32(0)?;
+    let width = ctx.arg_u32(1)?;
+    let color = ctx.arg_u32(2)?;
+    let h = ctx.kernel.gdi.create_pen(color, width);
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn create_font_indirect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // We ignore the LOGFONT contents; just allocate a font handle so
+    // the caller can SelectObject it. Default height 0 is fine.
+    let h = ctx.kernel.gdi.create_font(0);
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn get_stock_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Map stock indices to our pre-registered handles.
+    let idx = ctx.arg_u32(0)?;
+    let h = match idx {
+        0 => STOCK_WHITE_BRUSH, // WHITE_BRUSH
+        1 => 0xDEAD_5702,       // LTGRAY_BRUSH (synthetic)
+        2 => 0xDEAD_5703,       // GRAY_BRUSH
+        4 => STOCK_BLACK_BRUSH, // BLACK_BRUSH
+        5 => STOCK_NULL_BRUSH,  // NULL_BRUSH / HOLLOW_BRUSH
+        6 => STOCK_WHITE_PEN,   // WHITE_PEN
+        7 => STOCK_BLACK_PEN,   // BLACK_PEN
+        8 => STOCK_NULL_PEN,    // NULL_PEN
+        17 => 0xDEAD_5710,      // DEFAULT_GUI_FONT
+        _ => STOCK_WHITE_BRUSH,
+    };
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn select_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let obj = ctx.arg_u32(1)?;
+    let prev = ctx.kernel.gdi.select_into(dc, obj);
+    Ok(DispatchOutcome::ReturnedR0(prev))
+}
+
+fn delete_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let _ = ctx.kernel.gdi.delete(h);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn set_bk_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let mode = ctx.arg_u32(1)?;
+    if let Some(d) = ctx.kernel.gdi.dc_mut(dc) {
+        d.bk_transparent = mode == 1; // TRANSPARENT
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn set_bk_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let color = ctx.arg_u32(1)?;
+    if let Some(d) = ctx.kernel.gdi.dc_mut(dc) {
+        d.bk_color = color;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn set_text_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let color = ctx.arg_u32(1)?;
+    if let Some(d) = ctx.kernel.gdi.dc_mut(dc) {
+        d.text_color = color;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// Borrow either the framebuffer or a memory bitmap as a writable
+/// surface, given a DC handle.
+fn surface_for_dc<'a>(state: &'a mut pocket_kernel::KernelState, dc: u32) -> Option<Surface<'a>> {
+    let dc_meta = state.gdi.dc(dc)?.clone();
+    match dc_meta.surface {
+        pocket_kernel::gdi::DcSurface::Screen => Some(Surface::Screen(&mut state.framebuffer)),
+        pocket_kernel::gdi::DcSurface::Memory => {
+            let bm = dc_meta.selected_bitmap?;
+            state.gdi.bitmap_mut(bm).map(Surface::Bitmap)
+        }
+    }
+}
+
+fn fill_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // FillRect(hdc, lprc, hbr): fill rectangle with brush colour.
+    let hdc = ctx.arg_u32(0)?;
+    let rc_ptr = ctx.arg_u32(1)?;
+    let hbr = ctx.arg_u32(2)?;
+    let rc = ctx.cpu.read_mem(rc_ptr, 16)?;
+    let l = i32::from_le_bytes([rc[0], rc[1], rc[2], rc[3]]);
+    let t = i32::from_le_bytes([rc[4], rc[5], rc[6], rc[7]]);
+    let r = i32::from_le_bytes([rc[8], rc[9], rc[10], rc[11]]);
+    let b = i32::from_le_bytes([rc[12], rc[13], rc[14], rc[15]]);
+    let color = ctx
+        .kernel
+        .gdi
+        .brush(hbr)
+        .map(|b| b.color)
+        .unwrap_or(0x00ff_ffff);
+    let rgb = colorref_to_rgb565(color);
+    if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
+        surf.fill_rect(l, t, r - l, b - t, rgb);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn rectangle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Rectangle(hdc, l, t, r, b)
+    let hdc = ctx.arg_u32(0)?;
+    let l = ctx.arg_u32(1)? as i32;
+    let t = ctx.arg_u32(2)? as i32;
+    let r = ctx.arg_u32(3)? as i32;
+    let b = ctx.arg_u32(4)? as i32;
+    let dc_meta = ctx
+        .kernel
+        .gdi
+        .dc(hdc)
+        .cloned()
+        .ok_or_else(|| KernelError::Dispatch(format!("Rectangle: bad HDC 0x{hdc:08x}")))?;
+    let fill_rgb = colorref_to_rgb565(dc_meta.brush_color);
+    let stroke_rgb = colorref_to_rgb565(dc_meta.pen_color);
+    if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
+        surf.fill_rect(l, t, r - l, b - t, fill_rgb);
+        surf.stroke_rect(l, t, r - l, b - t, stroke_rgb);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn bit_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // BitBlt(hdcDest, x, y, cx, cy, hdcSrc, x1, y1, rop) → BOOL.
+    let hdc_dst = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    let cx = ctx.arg_u32(3)? as i32;
+    let cy = ctx.arg_u32(4)? as i32;
+    let hdc_src = ctx.arg_u32(5)?;
+    let x1 = ctx.arg_u32(6)? as i32;
+    let y1 = ctx.arg_u32(7)? as i32;
+    let _rop = ctx.arg_u32(8)?;
+
+    // Read the source: either selected bitmap of a memory DC, or a
+    // snapshot of the framebuffer if BitBlt-ing from the screen.
+    let (src_pixels, src_w, src_h) = match ctx.kernel.gdi.dc(hdc_src).cloned() {
+        Some(dc) => match dc.surface {
+            pocket_kernel::gdi::DcSurface::Screen => (
+                ctx.kernel.framebuffer.pixels.clone(),
+                ctx.kernel.framebuffer.width,
+                ctx.kernel.framebuffer.height,
+            ),
+            pocket_kernel::gdi::DcSurface::Memory => match dc.selected_bitmap {
+                Some(bh) => match ctx.kernel.gdi.bitmap(bh) {
+                    Some(b) => (b.pixels.clone(), b.width, b.height),
+                    None => (Vec::new(), 0, 0),
+                },
+                None => (Vec::new(), 0, 0),
+            },
+        },
+        None => (Vec::new(), 0, 0),
+    };
+
+    if src_w == 0 || src_h == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc_dst) {
+        dst.blit_from_bytes(x, y, x1, y1, cx, cy, &src_pixels, src_w, src_h);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+// ---------- Resources ----------
+
+fn read_wide_resource_key(ctx: &mut CallCtx<'_>, raw: u32) -> Result<ResourceKey, KernelError> {
+    if raw < 0x1_0000 {
+        // MAKEINTRESOURCE encoding — low 16 bits are an integer ID.
+        Ok(ResourceKey::Id(raw))
+    } else {
+        let mut name = String::new();
+        let mut va = raw;
+        for _ in 0..256 {
+            let b = ctx.cpu.read_mem(va, 2)?;
+            let cu = u16::from_le_bytes([b[0], b[1]]);
+            if cu == 0 {
+                break;
+            }
+            if let Some(c) = char::from_u32(cu as u32) {
+                name.push(c);
+            }
+            va = va.wrapping_add(2);
+        }
+        Ok(ResourceKey::Name(name))
+    }
+}
+
+fn find_resource_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // FindResourceW(hModule, lpName, lpType)
+    let _hmod = ctx.arg_u32(0)?;
+    let name_raw = ctx.arg_u32(1)?;
+    let type_raw = ctx.arg_u32(2)?;
+    let want_name = read_wide_resource_key(ctx, name_raw)?;
+    let want_type = read_wide_resource_key(ctx, type_raw)?;
+    if let Some(entry) = ctx
+        .kernel
+        .resources
+        .iter()
+        .find(|e| e.ty == want_type && e.name == want_name)
+    {
+        let va = ctx.kernel.image_base.wrapping_add(entry.data_rva);
+        log::trace!(
+            "FindResourceW(name={want_name:?}, type={want_type:?}) -> 0x{va:08x} ({} bytes)",
+            entry.size
+        );
+        return Ok(DispatchOutcome::ReturnedR0(va));
+    }
+    log::trace!("FindResourceW(name={want_name:?}, type={want_type:?}) -> NULL");
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn load_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // LoadResource just returns the same handle on Windows when the
+    // resource is in-image. We've already encoded the data VA in the
+    // FindResource result.
+    let h = ctx.arg_u32(1)?;
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn lock_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn sizeof_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // SizeofResource(hModule, hResInfo) — hResInfo is the VA we
+    // returned from FindResourceW. We look up by data_rva.
+    let h = ctx.arg_u32(1)?;
+    let rva = h.wrapping_sub(ctx.kernel.image_base);
+    if let Some(e) = ctx.kernel.resources.iter().find(|e| e.data_rva == rva) {
+        return Ok(DispatchOutcome::ReturnedR0(e.size));
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,9 +1235,15 @@ mod tests {
     use pocket_pe::ImportBinding;
 
     fn fresh_kernel() -> KernelState {
+        use pocket_kernel::{Framebuffer, GdiState};
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
+            framebuffer: Framebuffer::default(),
+            gdi: GdiState::new(),
+            resources: vec![],
+            image_base: 0,
+            fb_mapped: false,
         }
     }
 
@@ -1123,5 +1417,54 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    // ---- GDI handler tests ----
+
+    #[test]
+    fn fill_rect_paints_into_framebuffer() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        // RECT { 5, 7, 25, 27 }
+        let mut rect = Vec::new();
+        rect.extend_from_slice(&5i32.to_le_bytes());
+        rect.extend_from_slice(&7i32.to_le_bytes());
+        rect.extend_from_slice(&25i32.to_le_bytes());
+        rect.extend_from_slice(&27i32.to_le_bytes());
+        cpu.write_mem(0x1000, &rect).unwrap();
+
+        // Allocate a brush.
+        cpu.write_reg(ArmReg::R0, 0x00ff0000).unwrap(); // COLORREF: red
+        let t = dummy_thunk();
+        let hbr = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            match create_solid_brush(&mut c).unwrap() {
+                DispatchOutcome::ReturnedR0(h) => h,
+                _ => panic!(),
+            }
+        };
+        // FillRect(GDI_SCREEN_DC, 0x1000, hbr).
+        cpu.write_reg(ArmReg::R0, GDI_SCREEN_DC).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x1000).unwrap();
+        cpu.write_reg(ArmReg::R2, hbr).unwrap();
+        let pre = kernel.framebuffer.frame_counter;
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = fill_rect(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(1));
+        assert!(kernel.framebuffer.frame_counter > pre);
+        // Pixel at (5,7) must now be non-zero (red 0xF800 in RGB565,
+        // little-endian on the wire).
+        let off = (7 * pocket_kernel::framebuffer::FB_WIDTH as usize + 5) * 2;
+        assert_ne!(kernel.framebuffer.pixels[off], 0);
     }
 }

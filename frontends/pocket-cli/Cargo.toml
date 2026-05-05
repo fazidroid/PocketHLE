@@ -14,11 +14,13 @@ path = "src/main.rs"
 [features]
 default = []
 unicorn = ["pocket-core/unicorn"]
+display = ["minifb"]
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 log.workspace = true
 env_logger.workspace = true
+minifb = { version = "0.27", optional = true }
 
 pocket-core = { path = "../../crates/pocket-core" }

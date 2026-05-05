@@ -66,6 +66,20 @@ enum Command {
         /// of `\Application\` (e.g. `--rom-prefix \\Storage\\`).
         #[arg(long, default_value = "\\Application\\")]
         rom_prefix: String,
+        /// Open a host window and render the framebuffer live.
+        /// Requires the `display` cargo feature.
+        #[arg(long, default_value_t = false)]
+        display: bool,
+        /// Periodically write the framebuffer as PPM files into the
+        /// given directory (one file per emit). Works in any
+        /// environment, no extra dependencies.
+        #[arg(long)]
+        dump_frames_to: Option<PathBuf>,
+        /// Stop emulation after this many distinct rendered frames.
+        /// Combined with `--dump-frames-to`, gives a deterministic
+        /// way to capture proof-of-rendering screenshots.
+        #[arg(long, default_value_t = 0)]
+        max_frames: u64,
     },
 }
 
@@ -99,6 +113,9 @@ fn main() -> Result<()> {
             trace_json,
             rom_dir,
             rom_prefix,
+            display,
+            dump_frames_to,
+            max_frames,
         } => cmd_run(
             &path,
             cpu,
@@ -108,6 +125,9 @@ fn main() -> Result<()> {
             trace_json.as_deref(),
             rom_dir.as_deref(),
             &rom_prefix,
+            display,
+            dump_frames_to.as_deref(),
+            max_frames,
         ),
     }
 }
@@ -219,6 +239,9 @@ fn cmd_run(
     trace_json: Option<&std::path::Path>,
     rom_dir: Option<&std::path::Path>,
     rom_prefix: &str,
+    display: bool,
+    dump_frames_to: Option<&std::path::Path>,
+    max_frames: u64,
 ) -> Result<()> {
     let mut emu = match backend {
         CpuBackend::Stub => Emulator::with_stub_cpu(),
@@ -257,7 +280,163 @@ fn cmd_run(
         "Registered API stubs: {}",
         emu.dispatcher().registered_count()
     );
-    emu.run()?;
+
+    let mut hooks: Vec<Box<dyn pocket_core::kernel::FrameHook>> = Vec::new();
+    if let Some(dir) = dump_frames_to {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating frame dump dir {}", dir.display()))?;
+        let dir = dir.to_path_buf();
+        hooks.push(Box::new(DumpFrameHook::new(dir, max_frames)));
+        println!(
+            "Dumping framebuffer snapshots to {}",
+            dump_frames_to.unwrap().display()
+        );
+    }
+    if display {
+        #[cfg(feature = "display")]
+        {
+            hooks.push(Box::new(display_window::DisplayHook::new()?));
+            println!("Display window opened (close it to exit emulator).");
+        }
+        #[cfg(not(feature = "display"))]
+        {
+            anyhow::bail!(
+                "--display requires building pockethle with `--features display` (minifb)."
+            );
+        }
+    }
+
+    if hooks.is_empty() {
+        emu.run()?;
+    } else {
+        let mut combined = MultiHook { hooks };
+        emu.run_with_hook(&mut combined)?;
+    }
     println!("Emulator exited cleanly.");
     Ok(())
+}
+
+// ----- frame hooks -----
+
+struct MultiHook {
+    hooks: Vec<Box<dyn pocket_core::kernel::FrameHook>>,
+}
+
+impl pocket_core::kernel::FrameHook for MultiHook {
+    fn on_frame(
+        &mut self,
+        state: &pocket_core::kernel::KernelState,
+    ) -> pocket_core::kernel::FrameAction {
+        let mut action = pocket_core::kernel::FrameAction::Continue;
+        for h in self.hooks.iter_mut() {
+            if h.on_frame(state) == pocket_core::kernel::FrameAction::Stop {
+                action = pocket_core::kernel::FrameAction::Stop;
+            }
+        }
+        action
+    }
+}
+
+struct DumpFrameHook {
+    dir: PathBuf,
+    last_dumped_frame: u64,
+    written: u64,
+    max_frames: u64,
+}
+
+impl DumpFrameHook {
+    fn new(dir: PathBuf, max_frames: u64) -> Self {
+        Self {
+            dir,
+            last_dumped_frame: 0,
+            written: 0,
+            max_frames,
+        }
+    }
+}
+
+impl pocket_core::kernel::FrameHook for DumpFrameHook {
+    fn on_frame(
+        &mut self,
+        state: &pocket_core::kernel::KernelState,
+    ) -> pocket_core::kernel::FrameAction {
+        let counter = state.framebuffer.frame_counter;
+        if counter == self.last_dumped_frame {
+            return pocket_core::kernel::FrameAction::Continue;
+        }
+        self.last_dumped_frame = counter;
+        let path = self.dir.join(format!("frame_{:06}.ppm", self.written));
+        let ppm = state.framebuffer.snapshot_ppm();
+        if let Err(e) = std::fs::write(&path, ppm) {
+            log::warn!("failed to write {}: {e}", path.display());
+            return pocket_core::kernel::FrameAction::Continue;
+        }
+        log::info!("wrote {}", path.display());
+        self.written += 1;
+        if self.max_frames > 0 && self.written >= self.max_frames {
+            return pocket_core::kernel::FrameAction::Stop;
+        }
+        pocket_core::kernel::FrameAction::Continue
+    }
+}
+
+#[cfg(feature = "display")]
+mod display_window {
+    use anyhow::{Context, Result};
+    use minifb::{Window, WindowOptions};
+    use pocket_core::kernel::{FrameAction, FrameHook, KernelState};
+
+    pub struct DisplayHook {
+        window: Window,
+        buffer: Vec<u32>,
+        last_frame: u64,
+    }
+
+    impl DisplayHook {
+        pub fn new() -> Result<Self> {
+            let w = pocket_core::kernel::FB_WIDTH as usize;
+            let h = pocket_core::kernel::FB_HEIGHT as usize;
+            let mut window = Window::new(
+                "PocketHLE",
+                w,
+                h,
+                WindowOptions {
+                    resize: true,
+                    scale: minifb::Scale::X2,
+                    ..WindowOptions::default()
+                },
+            )
+            .context("opening minifb window")?;
+            window.set_target_fps(60);
+            Ok(Self {
+                window,
+                buffer: vec![0; w * h],
+                last_frame: 0,
+            })
+        }
+    }
+
+    impl FrameHook for DisplayHook {
+        fn on_frame(&mut self, state: &KernelState) -> FrameAction {
+            if state.framebuffer.frame_counter != self.last_frame {
+                self.last_frame = state.framebuffer.frame_counter;
+                let rgba = state.framebuffer.snapshot_rgba8888();
+                for (i, px) in self.buffer.iter_mut().enumerate() {
+                    let off = i * 4;
+                    let r = rgba[off] as u32;
+                    let g = rgba[off + 1] as u32;
+                    let b = rgba[off + 2] as u32;
+                    *px = (r << 16) | (g << 8) | b;
+                }
+            }
+            let w = pocket_core::kernel::FB_WIDTH as usize;
+            let h = pocket_core::kernel::FB_HEIGHT as usize;
+            if self.window.is_open() {
+                let _ = self.window.update_with_buffer(&self.buffer, w, h);
+                FrameAction::Continue
+            } else {
+                FrameAction::Stop
+            }
+        }
+    }
 }

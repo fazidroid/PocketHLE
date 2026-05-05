@@ -17,7 +17,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use pocket_cpu::{stub::StubCpu, Cpu};
-use pocket_kernel::{run_main_loop, Process};
+use pocket_kernel::{run_main_loop, run_main_loop_with_hook, FrameHook, Process};
 use pocket_winceapi::{resolve_ordinal, WinCeDispatcher};
 
 pub use pocket_cab as cab;
@@ -96,6 +96,24 @@ impl Emulator {
             &mut self.dispatcher,
             self.instruction_budget_per_slice,
             self.max_slices,
+        )
+        .context("main emulator loop")
+    }
+
+    /// Like [`Self::run`], but routes the framebuffer through
+    /// `frame_hook` once per dispatch slice.
+    pub fn run_with_hook(&mut self, frame_hook: &mut dyn FrameHook) -> Result<()> {
+        let process = self
+            .process
+            .as_mut()
+            .context("no PE loaded — call load_pe() first")?;
+        run_main_loop_with_hook(
+            self.cpu.as_mut(),
+            process,
+            &mut self.dispatcher,
+            self.instruction_budget_per_slice,
+            self.max_slices,
+            Some(frame_hook),
         )
         .context("main emulator loop")
     }
