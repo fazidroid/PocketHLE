@@ -1573,6 +1573,117 @@ mod tests {
         }
     }
 
+    #[test]
+    fn get_file_attributes_w_null_pointer_is_invalid() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = get_file_attributes_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn get_file_attributes_w_unmounted_prefix_is_invalid() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let s: Vec<u8> = "\\Nope\\foo.txt\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = get_file_attributes_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn get_file_attributes_w_returns_normal_for_real_file() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let s: Vec<u8> = "\\App\\hello.txt\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = get_file_attributes_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(0x0000_0080));
+    }
+
+    #[test]
+    fn get_file_attributes_w_returns_directory_for_real_dir() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sounds")).unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let s: Vec<u8> = "\\App\\sounds\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = get_file_attributes_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(0x0000_0010));
+    }
+
+    #[test]
+    fn get_file_attributes_w_missing_file_is_invalid() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let s: Vec<u8> = "\\App\\does-not-exist.txt\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = get_file_attributes_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(0xFFFF_FFFF));
+    }
+
     // ---- GDI handler tests ----
 
     #[test]
