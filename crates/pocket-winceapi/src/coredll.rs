@@ -60,6 +60,44 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "longjmp", longjmp);
     d.register_handler(dll, "_except_handler3", except_handler3);
 
+    // ---- ARMv4 soft-float helpers (no VFP). Names follow the EVC4
+    // convention: `s` = single-precision, `d` = double-precision,
+    // `i` = i32, `u` = u32, `i64` = i64, `u64` = u64.
+    d.register_handler(dll, "__adds", soft_adds);
+    d.register_handler(dll, "__subs", soft_subs);
+    d.register_handler(dll, "__muls", soft_muls);
+    d.register_handler(dll, "__divs", soft_divs);
+    d.register_handler(dll, "__negs", soft_negs);
+    d.register_handler(dll, "__cmps", soft_cmps);
+    d.register_handler(dll, "__eqs", soft_eqs);
+    d.register_handler(dll, "__nes", soft_nes);
+    d.register_handler(dll, "__lts", soft_lts);
+    d.register_handler(dll, "__les", soft_les);
+    d.register_handler(dll, "__gts", soft_gts);
+    d.register_handler(dll, "__ges", soft_ges);
+    d.register_handler(dll, "__itos", soft_itos);
+    d.register_handler(dll, "__utos", soft_utos);
+    d.register_handler(dll, "__stoi", soft_stoi);
+    d.register_handler(dll, "__stou", soft_stou);
+    d.register_handler(dll, "__stod", soft_stod);
+    d.register_handler(dll, "__addd", soft_addd);
+    d.register_handler(dll, "__subd", soft_subd);
+    d.register_handler(dll, "__muld", soft_muld);
+    d.register_handler(dll, "__divd", soft_divd);
+    d.register_handler(dll, "__negd", soft_negd);
+    d.register_handler(dll, "__cmpd", soft_cmpd);
+    d.register_handler(dll, "__eqd", soft_eqd);
+    d.register_handler(dll, "__ned", soft_ned);
+    d.register_handler(dll, "__ltd", soft_ltd);
+    d.register_handler(dll, "__led", soft_led);
+    d.register_handler(dll, "__gtd", soft_gtd);
+    d.register_handler(dll, "__ged", soft_ged);
+    d.register_handler(dll, "__itod", soft_itod);
+    d.register_handler(dll, "__utod", soft_utod);
+    d.register_handler(dll, "__dtoi", soft_dtoi);
+    d.register_handler(dll, "__dtou", soft_dtou);
+    d.register_handler(dll, "__dtos", soft_dtos);
+
     // ---- Memory / string CRT ----
     d.register_handler(dll, "memset", memset);
     d.register_handler(dll, "memcpy", memcpy);
@@ -124,12 +162,24 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "realloc", realloc);
     d.register_handler(dll, "_new", malloc);
     d.register_handler(dll, "_delete", free);
+    // MSVC-mangled C++ scalar new/delete:
+    //   ??2@YAPAXI@Z  = void* operator new(unsigned int)
+    //   ??3@YAXPAX@Z  = void  operator delete(void*)
+    //   ??_U@YAPAXI@Z = void* operator new[](unsigned int)
+    //   ??_V@YAXPAX@Z = void  operator delete[](void*)
+    d.register_handler(dll, "??2@YAPAXI@Z", malloc);
+    d.register_handler(dll, "??3@YAXPAX@Z", free);
+    d.register_handler(dll, "??_U@YAPAXI@Z", malloc);
+    d.register_handler(dll, "??_V@YAXPAX@Z", free);
 
     // ---- Resources ----
     d.register_handler(dll, "FindResourceW", find_resource_w);
     d.register_handler(dll, "LoadResource", load_resource);
     d.register_handler(dll, "LockResource", lock_resource);
     d.register_handler(dll, "SizeofResource", sizeof_resource);
+    d.register_handler(dll, "LoadBitmapW", load_bitmap_w);
+    d.register_handler(dll, "GetObjectW", get_object_w);
+    d.register_handler(dll, "LoadStringW", load_string_w);
 
     // ---- Window / message stubs ----
     d.register_handler(dll, "RegisterClassW", register_class_w);
@@ -319,6 +369,194 @@ fn longjmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// exception — `ExceptionContinueSearch == 1`.
 fn except_handler3(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+// ---------- ARMv4 soft-float helpers ----------
+//
+// AAPCS calling convention without VFP:
+//   - single-precision floats are bit-cast to u32 and passed/returned in
+//     integer registers (r0 for first arg, r1 for second, ...).
+//   - double-precision floats are bit-cast to u64 and passed in
+//     consecutive register pairs r0:r1 (low:high) and r2:r3.
+//   - 64-bit returns go in r0:r1.
+//
+// The actual symbol names come from the EVC4 / Microsoft Visual C
+// runtime for ARM Pocket PC. `s` suffix = single-precision, `d` = double.
+
+fn read_f32(ctx: &mut CallCtx<'_>, idx: u8) -> Result<f32, KernelError> {
+    Ok(f32::from_bits(ctx.arg_u32(idx)?))
+}
+
+fn read_f64(ctx: &mut CallCtx<'_>, idx_lo: u8) -> Result<f64, KernelError> {
+    let lo = ctx.arg_u32(idx_lo)? as u64;
+    let hi = ctx.arg_u32(idx_lo + 1)? as u64;
+    Ok(f64::from_bits((hi << 32) | lo))
+}
+
+fn ret_f32(v: f32) -> DispatchOutcome {
+    DispatchOutcome::ReturnedR0(v.to_bits())
+}
+
+fn ret_f64(v: f64) -> DispatchOutcome {
+    let bits = v.to_bits();
+    DispatchOutcome::ReturnedR0R1(bits as u32, (bits >> 32) as u32)
+}
+
+fn soft_adds(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f32(ctx, 0)? + read_f32(ctx, 1)?))
+}
+fn soft_subs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f32(ctx, 0)? - read_f32(ctx, 1)?))
+}
+fn soft_muls(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f32(ctx, 0)? * read_f32(ctx, 1)?))
+}
+fn soft_divs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f32(ctx, 0)? / read_f32(ctx, 1)?))
+}
+fn soft_negs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(-read_f32(ctx, 0)?))
+}
+fn soft_cmps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let a = read_f32(ctx, 0)?;
+    let b = read_f32(ctx, 1)?;
+    let r: i32 = if a < b {
+        -1
+    } else if a > b {
+        1
+    } else {
+        0
+    };
+    Ok(DispatchOutcome::ReturnedR0(r as u32))
+}
+fn soft_eqs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? == read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_nes(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? != read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_lts(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? < read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_les(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? <= read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_gts(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? > read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_ges(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? >= read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_itos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(ctx.arg_u32(0)? as i32 as f32))
+}
+fn soft_utos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(ctx.arg_u32(0)? as f32))
+}
+fn soft_stoi(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(read_f32(ctx, 0)? as i32 as u32))
+}
+fn soft_stou(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let v = read_f32(ctx, 0)?;
+    let r = if v < 0.0 || !v.is_finite() {
+        0
+    } else {
+        v as u32
+    };
+    Ok(DispatchOutcome::ReturnedR0(r))
+}
+fn soft_stod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_f32(ctx, 0)? as f64))
+}
+fn soft_addd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_f64(ctx, 0)? + read_f64(ctx, 2)?))
+}
+fn soft_subd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_f64(ctx, 0)? - read_f64(ctx, 2)?))
+}
+fn soft_muld(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_f64(ctx, 0)? * read_f64(ctx, 2)?))
+}
+fn soft_divd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_f64(ctx, 0)? / read_f64(ctx, 2)?))
+}
+fn soft_negd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(-read_f64(ctx, 0)?))
+}
+fn soft_cmpd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let a = read_f64(ctx, 0)?;
+    let b = read_f64(ctx, 2)?;
+    let r: i32 = if a < b {
+        -1
+    } else if a > b {
+        1
+    } else {
+        0
+    };
+    Ok(DispatchOutcome::ReturnedR0(r as u32))
+}
+fn soft_eqd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? == read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_ned(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? != read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_ltd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? < read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_led(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? <= read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_gtd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? > read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_ged(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? >= read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_itod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(ctx.arg_u32(0)? as i32 as f64))
+}
+fn soft_utod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(ctx.arg_u32(0)? as f64))
+}
+fn soft_dtoi(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(read_f64(ctx, 0)? as i32 as u32))
+}
+fn soft_dtou(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let v = read_f64(ctx, 0)?;
+    let r = if v < 0.0 || !v.is_finite() {
+        0
+    } else {
+        v as u32
+    };
+    Ok(DispatchOutcome::ReturnedR0(r))
+}
+fn soft_dtos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f64(ctx, 0)? as f32))
 }
 
 // ---------- mem / string CRT ----------
@@ -1376,6 +1614,292 @@ fn sizeof_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
         return Ok(DispatchOutcome::ReturnedR0(e.size));
     }
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `HBITMAP LoadBitmapW(HINSTANCE hInstance, LPCWSTR lpBitmapName)` —
+/// look the bitmap up in the PE's embedded resources, decode the
+/// BITMAPINFO header + palette + pixel data into our internal RGB565
+/// `Bitmap`, register it with the GDI state, and return the handle.
+///
+/// Pocket PC games typically ship 8-bpp paletted DIBs to save space;
+/// we also handle 24-bpp BGR and 16-bpp RGB565/RGB555.
+fn load_bitmap_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const RT_BITMAP: ResourceKey = ResourceKey::Id(2);
+    let _hinst = ctx.arg_u32(0)?;
+    let name_raw = ctx.arg_u32(1)?;
+    let want_name = read_wide_resource_key(ctx, name_raw)?;
+    let entry = match ctx
+        .kernel
+        .resources
+        .iter()
+        .find(|e| e.ty == RT_BITMAP && e.name == want_name)
+        .cloned()
+    {
+        Some(e) => e,
+        None => {
+            log::trace!("LoadBitmapW(name={want_name:?}) -> NULL (resource not found)");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    // Read the bitmap data straight out of the guest's mapped image.
+    let va = ctx.kernel.image_base.wrapping_add(entry.data_rva);
+    let raw = match ctx.cpu.read_mem(va, entry.size) {
+        Ok(b) => b,
+        Err(_) => {
+            log::trace!("LoadBitmapW({want_name:?}) -> NULL (image not mapped at 0x{va:08x})");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    let pixels_565 = match decode_dib_to_rgb565(&raw) {
+        Some(p) => p,
+        None => {
+            log::trace!("LoadBitmapW({want_name:?}) -> NULL (unsupported DIB)");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    let (w, h) = pixels_565.dims;
+    let handle = ctx.kernel.gdi.create_compatible_bitmap(w, h);
+    if let Some(b) = ctx.kernel.gdi.bitmap_mut(handle) {
+        // Bitmap::new pre-allocates `w*h*2` bytes; just blit our
+        // already-RGB565-converted image on top.
+        debug_assert_eq!(b.pixels.len(), pixels_565.bytes.len());
+        b.pixels.copy_from_slice(&pixels_565.bytes);
+    }
+    log::trace!(
+        "LoadBitmapW(name={want_name:?}) -> handle 0x{handle:08x} ({}x{} from {} bytes)",
+        w,
+        h,
+        entry.size
+    );
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+struct DecodedDib {
+    bytes: Vec<u8>,
+    dims: (u32, u32),
+}
+
+/// Decode a Windows DIB (`BITMAPINFOHEADER` + palette + pixels) into
+/// a top-down RGB565 little-endian buffer of size `w*h*2`. Returns
+/// `None` if the format is not yet implemented.
+fn decode_dib_to_rgb565(raw: &[u8]) -> Option<DecodedDib> {
+    if raw.len() < 40 {
+        return None;
+    }
+    let header_size = u32::from_le_bytes(raw[0..4].try_into().ok()?);
+    if header_size < 40 {
+        return None;
+    }
+    let width = i32::from_le_bytes(raw[4..8].try_into().ok()?);
+    let height_raw = i32::from_le_bytes(raw[8..12].try_into().ok()?);
+    let _planes = u16::from_le_bytes(raw[12..14].try_into().ok()?);
+    let bpp = u16::from_le_bytes(raw[14..16].try_into().ok()?);
+    let compression = u32::from_le_bytes(raw[16..20].try_into().ok()?);
+    let used_colors = u32::from_le_bytes(raw[32..36].try_into().ok()?);
+    if width <= 0 || height_raw == 0 || compression != 0 {
+        return None;
+    }
+    let bottom_up = height_raw > 0;
+    let height = height_raw.unsigned_abs();
+    let width = width as u32;
+
+    // Palette table sits right after the header. For paletted
+    // formats the table size is `used_colors` (or 2^bpp if zero).
+    let palette_entries = match bpp {
+        1 | 4 | 8 => {
+            if used_colors == 0 {
+                1u32 << bpp
+            } else {
+                used_colors
+            }
+        }
+        _ => 0,
+    };
+    let palette_off = header_size as usize;
+    let pixels_off = palette_off + (palette_entries as usize) * 4;
+    if pixels_off > raw.len() {
+        return None;
+    }
+    // Palette is BGRX in DIB order.
+    let mut palette = vec![0u16; palette_entries as usize];
+    for (i, slot) in palette.iter_mut().enumerate() {
+        let p = palette_off + i * 4;
+        *slot = bgrx_to_rgb565(raw[p], raw[p + 1], raw[p + 2]);
+    }
+
+    // Each row is padded to a 4-byte boundary.
+    let row_bytes = match bpp {
+        1 => width.div_ceil(8),
+        4 => width.div_ceil(2),
+        8 => width,
+        16 => width * 2,
+        24 => width * 3,
+        32 => width * 4,
+        _ => return None,
+    };
+    let row_stride = (row_bytes + 3) & !3;
+
+    let mut out = vec![0u8; (width as usize) * (height as usize) * 2];
+    for src_y in 0..height {
+        // BMP rows are bottom-up unless the height field is negative.
+        let dst_y = if bottom_up { height - 1 - src_y } else { src_y };
+        let row_off = pixels_off + (src_y as usize) * (row_stride as usize);
+        if row_off + row_bytes as usize > raw.len() {
+            return None;
+        }
+        let dst_row_start = (dst_y as usize) * (width as usize) * 2;
+        for x in 0..width {
+            let rgb565 = match bpp {
+                8 => {
+                    let idx = raw[row_off + x as usize] as usize;
+                    *palette.get(idx).unwrap_or(&0)
+                }
+                4 => {
+                    let b = raw[row_off + (x as usize) / 2];
+                    let nib = if x & 1 == 0 { b >> 4 } else { b & 0x0F };
+                    *palette.get(nib as usize).unwrap_or(&0)
+                }
+                1 => {
+                    let b = raw[row_off + (x as usize) / 8];
+                    let bit = 7 - (x & 7);
+                    let v = ((b >> bit) & 1) as usize;
+                    *palette.get(v).unwrap_or(&0)
+                }
+                16 => u16::from_le_bytes([
+                    raw[row_off + x as usize * 2],
+                    raw[row_off + x as usize * 2 + 1],
+                ]),
+                24 => bgrx_to_rgb565(
+                    raw[row_off + x as usize * 3],
+                    raw[row_off + x as usize * 3 + 1],
+                    raw[row_off + x as usize * 3 + 2],
+                ),
+                32 => bgrx_to_rgb565(
+                    raw[row_off + x as usize * 4],
+                    raw[row_off + x as usize * 4 + 1],
+                    raw[row_off + x as usize * 4 + 2],
+                ),
+                _ => 0,
+            };
+            let off = dst_row_start + (x as usize) * 2;
+            out[off] = rgb565 as u8;
+            out[off + 1] = (rgb565 >> 8) as u8;
+        }
+    }
+    Some(DecodedDib {
+        bytes: out,
+        dims: (width, height),
+    })
+}
+
+/// 24-bit BGR → 16-bit RGB565.
+fn bgrx_to_rgb565(b: u8, g: u8, r: u8) -> u16 {
+    let r5 = (r as u16 >> 3) & 0x1F;
+    let g6 = (g as u16 >> 2) & 0x3F;
+    let b5 = (b as u16 >> 3) & 0x1F;
+    (r5 << 11) | (g6 << 5) | b5
+}
+
+/// `int LoadStringW(HINSTANCE hInst, UINT uID, LPWSTR lpBuf, int cch)` —
+/// look up the string in the PE's `RT_STRING` (type 6) resource.
+/// Resource strings are bundled in blocks of 16; block id is
+/// `(uID >> 4) + 1`, sub-index is `uID & 0xF`. Each block is a
+/// stream of `(WORD len, wchar_t[len])` records, optionally padded.
+///
+/// Returns the number of wide chars copied (excluding the trailing
+/// NUL); writes a NUL into `lpBuf[0]` and returns 0 if not found.
+fn load_string_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const RT_STRING: ResourceKey = ResourceKey::Id(6);
+    let _hinst = ctx.arg_u32(0)?;
+    let id = ctx.arg_u32(1)? & 0xFFFF;
+    let buf = ctx.arg_u32(2)?;
+    let cch = ctx.arg_u32(3)? as usize;
+
+    let block_id = (id >> 4) + 1;
+    let sub = (id & 0xF) as usize;
+    let mut wide: Vec<u16> = Vec::new();
+    if let Some(entry) = ctx
+        .kernel
+        .resources
+        .iter()
+        .find(|e| e.ty == RT_STRING && e.name == ResourceKey::Id(block_id))
+        .cloned()
+    {
+        let va = ctx.kernel.image_base.wrapping_add(entry.data_rva);
+        if let Ok(bytes) = ctx.cpu.read_mem(va, entry.size) {
+            // Walk the 16 length-prefixed records.
+            let mut pos = 0usize;
+            for i in 0..=sub {
+                if pos + 2 > bytes.len() {
+                    break;
+                }
+                let len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                pos += 2;
+                if i == sub {
+                    let end = (pos + len * 2).min(bytes.len());
+                    for w in (pos..end).step_by(2) {
+                        wide.push(u16::from_le_bytes([bytes[w], bytes[w + 1]]));
+                    }
+                    break;
+                }
+                pos += len * 2;
+            }
+        }
+    }
+
+    if buf != 0 && cch > 0 {
+        // Always at least NUL-terminate so the caller's buffer is
+        // safe even when the string is missing or truncated.
+        let copy = wide.len().min(cch.saturating_sub(1));
+        let mut out = Vec::with_capacity((copy + 1) * 2);
+        for &w in &wide[..copy] {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out.extend_from_slice(&0u16.to_le_bytes());
+        ctx.cpu.write_mem(buf, &out)?;
+        log::trace!(
+            "LoadStringW(id={id}) -> {} chars from block {}",
+            copy,
+            block_id
+        );
+        return Ok(DispatchOutcome::ReturnedR0(copy as u32));
+    }
+    Ok(DispatchOutcome::ReturnedR0(wide.len() as u32))
+}
+
+/// `int GetObjectW(HGDIOBJ h, int cb, LPVOID p)` — write a `BITMAP`
+/// struct (24 bytes on Windows CE) describing the selected bitmap so
+/// that the game can compute the right dimensions before issuing a
+/// matching `BitBlt` / `CreateDIBSection`. We only support the bitmap
+/// flavour for now; everything else is no-op.
+fn get_object_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let cb = ctx.arg_u32(1)?;
+    let p = ctx.arg_u32(2)?;
+    let (w, ht) = match ctx.kernel.gdi.bitmap(h) {
+        Some(b) => (b.width, b.height),
+        None => return Ok(DispatchOutcome::ReturnedR0(0)),
+    };
+    if p == 0 {
+        // Caller is asking for the size only.
+        return Ok(DispatchOutcome::ReturnedR0(24));
+    }
+    if cb < 24 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // BITMAP layout: bmType(LONG), bmWidth(LONG), bmHeight(LONG),
+    //                bmWidthBytes(LONG), bmPlanes(WORD), bmBitsPixel(WORD),
+    //                bmBits(LPVOID).
+    let mut buf = [0u8; 24];
+    buf[0..4].copy_from_slice(&0u32.to_le_bytes()); // bmType always 0
+    buf[4..8].copy_from_slice(&w.to_le_bytes());
+    buf[8..12].copy_from_slice(&ht.to_le_bytes());
+    buf[12..16].copy_from_slice(&(w * 2).to_le_bytes());
+    buf[16..18].copy_from_slice(&1u16.to_le_bytes()); // planes
+    buf[18..20].copy_from_slice(&16u16.to_le_bytes()); // RGB565
+    buf[20..24].copy_from_slice(&0u32.to_le_bytes()); // bmBits = NULL (managed host-side)
+    ctx.cpu.write_mem(p, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(24))
 }
 
 #[cfg(test)]
