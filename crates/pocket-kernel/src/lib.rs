@@ -175,6 +175,12 @@ pub struct Heap {
     size: u32,
     /// Sorted by start VA. Each entry is `(start, size)` of free space.
     free: Vec<(u32, u32)>,
+    /// Out-of-band tracker of `(user_ptr -> requested_size)` for every
+    /// outstanding allocation. We keep it host-side so the guest can
+    /// not accidentally corrupt the bookkeeping by writing past its
+    /// own buffer (Pocket PC games do this all the time). It also lets
+    /// `Heap::msize(p)` answer in O(1).
+    live: HashMap<u32, u32>,
 }
 
 const HEAP_HEADER_BYTES: u32 = 8;
@@ -186,6 +192,7 @@ impl Heap {
             base,
             size,
             free: vec![(base, size)],
+            live: HashMap::new(),
         }
     }
 
@@ -212,22 +219,37 @@ impl Heap {
                 } else {
                     self.free[i] = (start + need, sz - need);
                 }
-                return Some(start + HEAP_HEADER_BYTES);
+                let user_ptr = start + HEAP_HEADER_BYTES;
+                self.live.insert(user_ptr, requested);
+                return Some(user_ptr);
             }
         }
         None
     }
 
-    /// Free a previously allocated chunk. The header at `user_ptr - 8`
-    /// stores `(block_start, block_size)`. We trust the caller (the
-    /// guest) — bad frees are logged and ignored.
-    pub fn free(&mut self, user_ptr: u32, recorded_size: u32) {
+    /// Look up the user-requested size of `user_ptr`, or `None` if the
+    /// pointer is not the result of a still-live `Heap::alloc`.
+    pub fn msize(&self, user_ptr: u32) -> Option<u32> {
+        self.live.get(&user_ptr).copied()
+    }
+
+    /// Free a previously allocated chunk. The size is recovered from
+    /// our live-block table; if the caller passes a bogus pointer we
+    /// log and ignore.
+    pub fn free(&mut self, user_ptr: u32) {
+        if user_ptr == 0 {
+            return;
+        }
+        let Some(user_size) = self.live.remove(&user_ptr) else {
+            log::warn!("heap.free: unknown pointer 0x{user_ptr:08x} (double free?)");
+            return;
+        };
         if user_ptr < self.base + HEAP_HEADER_BYTES {
             log::warn!("heap.free: ignoring out-of-range pointer 0x{user_ptr:08x}");
             return;
         }
         let block_start = user_ptr - HEAP_HEADER_BYTES;
-        let block_size = recorded_size + HEAP_HEADER_BYTES;
+        let block_size = Self::align_up(user_size.max(1)) + HEAP_HEADER_BYTES;
         if block_start + block_size > self.base + self.size {
             log::warn!("heap.free: chunk overflows heap; ignoring");
             return;
@@ -572,8 +594,10 @@ mod tests {
         let b = h.alloc(128).unwrap();
         assert!(b > a);
         assert!(h.free_bytes() < initial_free);
-        h.free(a, 64);
-        h.free(b, 128);
+        assert_eq!(h.msize(a), Some(64));
+        assert_eq!(h.msize(b), Some(128));
+        h.free(a);
+        h.free(b);
         // After freeing both, the heap should be fully coalesced.
         assert_eq!(h.free_bytes(), initial_free);
     }

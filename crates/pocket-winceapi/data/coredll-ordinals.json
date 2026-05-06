@@ -1,11 +1,11 @@
 {
   "dll": "coredll.dll",
-  "_comment": "Partial ordinal map for Windows CE 5.x / Windows Mobile 5/6 coredll.dll. Sourced from publicly published `dumpbin /exports coredll.dll` outputs (e.g. https://www.cnblogs.com/lucienbao/archive/2010/10/29/wince_coredll.html, hpcfactor forum). Different ROMs renumber ordinals — when running a binary built for a different SDK, pass `--ordinal-map=<path>` to PocketHLE to override.",
+  "_comment": "Partial ordinal map for Pocket PC 2002/2003 (Windows CE 4.x) coredll.dll. Sourced from publicly published `dumpbin /exports coredll.dll` outputs (e.g. https://www.cnblogs.com/lucienbao/archive/2010/10/29/wince_coredll.html, hpcfactor forum). Different ROMs renumber ordinals — when running a binary built for a different SDK, pass `--ordinal-map=<path>` to PocketHLE to override. Note: ords 33-36 are LocalAlloc/LocalReAlloc/LocalSize/LocalFree on PPC2003 but __chkstk/_setjmp/longjmp/_except_handler3 on WM5/6.",
   "ordinals": {
-    "33":   "__chkstk",
-    "34":   "_setjmp",
-    "35":   "longjmp",
-    "36":   "_except_handler3",
+    "33":   "LocalAlloc",
+    "34":   "LocalReAlloc",
+    "35":   "LocalSize",
+    "36":   "LocalFree",
     "58":   "GetProcAddress",
     "63":   "GetModuleHandleW",
     "69":   "LoadLibraryW",

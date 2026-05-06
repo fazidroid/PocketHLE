@@ -101,13 +101,15 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "FindClose", one_returning);
     d.register_handler(dll, "DeleteFileW", one_returning);
     d.register_handler(dll, "SetFileAttributesW", one_returning);
-    d.register_handler(dll, "GetFileAttributesW", zero_returning);
+    d.register_handler(dll, "GetFileAttributesW", get_file_attributes_w);
     d.register_handler(dll, "CreateDirectoryW", one_returning);
 
     // ---- Heap ----
     d.register_handler(dll, "LocalAlloc", local_alloc);
     d.register_handler(dll, "LocalFree", local_free);
     d.register_handler(dll, "LocalReAlloc", local_realloc);
+    d.register_handler(dll, "LocalSize", local_size);
+    d.register_handler(dll, "_msize", local_size);
     d.register_handler(dll, "HeapCreate", heap_create);
     d.register_handler(dll, "HeapDestroy", one_returning);
     d.register_handler(dll, "HeapAlloc", heap_alloc);
@@ -732,6 +734,48 @@ fn get_file_size(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(size as u32))
 }
 
+/// `DWORD GetFileAttributesW(LPCWSTR path)` — query the VFS so that
+/// games which probe asset paths before opening them get sensible
+/// answers. Returns `FILE_ATTRIBUTE_NORMAL` (0x80) for regular files
+/// and `FILE_ATTRIBUTE_DIRECTORY` (0x10) for directories. Missing
+/// files / NULL pointers / unmounted prefixes return
+/// `INVALID_FILE_ATTRIBUTES` (0xFFFF_FFFF) just like Windows does.
+fn get_file_attributes_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    let name_p = ctx.arg_u32(0)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(INVALID_FILE_ATTRIBUTES));
+    }
+    let name_w = match read_wstr(ctx, name_p, 260) {
+        Ok(n) => n,
+        Err(_) => return Ok(DispatchOutcome::ReturnedR0(INVALID_FILE_ATTRIBUTES)),
+    };
+    let path = String::from_utf16_lossy(&name_w);
+    let host = match ctx.kernel.vfs.resolve(&path) {
+        Some(p) => p,
+        None => {
+            log::trace!("GetFileAttributesW({path:?}) -> INVALID (no mount)");
+            return Ok(DispatchOutcome::ReturnedR0(INVALID_FILE_ATTRIBUTES));
+        }
+    };
+    let meta = match std::fs::metadata(&host) {
+        Ok(m) => m,
+        Err(_) => {
+            log::trace!("GetFileAttributesW({path:?}) -> INVALID (host miss {host:?})");
+            return Ok(DispatchOutcome::ReturnedR0(INVALID_FILE_ATTRIBUTES));
+        }
+    };
+    let attrs = if meta.is_dir() {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    log::trace!("GetFileAttributesW({path:?}) -> 0x{attrs:08x}");
+    Ok(DispatchOutcome::ReturnedR0(attrs))
+}
+
 /// `DWORD SetFilePointer(HANDLE h, LONG distance, LONG* hi, DWORD whence)`
 fn set_file_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     use pocket_kernel::vfs::SeekKind;
@@ -771,6 +815,18 @@ fn local_realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let p = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
     do_realloc(ctx, p, size)
+}
+
+/// `LocalSize(HLOCAL hMem)` — return the size of the block, or 0 for
+/// an unknown pointer. Doubles as the C runtime `_msize`.
+fn local_size(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let sz = if p == 0 {
+        0
+    } else {
+        ctx.kernel.heap.msize(p).unwrap_or(0)
+    };
+    Ok(DispatchOutcome::ReturnedR0(sz))
 }
 
 fn heap_create(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -833,9 +889,10 @@ fn realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     do_realloc(ctx, p, size)
 }
 
-/// Shared allocation path for every alloc-shaped API. Stores the
-/// requested size in the 4 bytes immediately preceding the user
-/// pointer so [`do_free`] can recover it.
+/// Shared allocation path for every alloc-shaped API. The host-side
+/// [`pocket_kernel::Heap`] tracks the requested size out of band, so
+/// `LocalSize` / `_msize` / `do_free` / `do_realloc` can recover it
+/// later without trusting guest memory.
 fn do_alloc(
     ctx: &mut CallCtx<'_>,
     size: u32,
@@ -848,10 +905,7 @@ fn do_alloc(
             return Ok(DispatchOutcome::ReturnedR0(0));
         }
     };
-    // Stash size at user_ptr - 4 (header is 8 bytes, but we only need
-    // 4 to record the requested size; the other 4 are reserved).
-    ctx.cpu.write_mem(user_ptr - 4, &size.to_le_bytes())?;
-    if zero_init {
+    if zero_init && size > 0 {
         let zeros = vec![0u8; size as usize];
         ctx.cpu.write_mem(user_ptr, &zeros)?;
     }
@@ -859,12 +913,7 @@ fn do_alloc(
 }
 
 fn do_free(ctx: &mut CallCtx<'_>, user_ptr: u32) {
-    let header = ctx.cpu.read_mem(user_ptr - 4, 4).unwrap_or_default();
-    if header.len() < 4 {
-        return;
-    }
-    let size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-    ctx.kernel.heap.free(user_ptr, size);
+    ctx.kernel.heap.free(user_ptr);
 }
 
 fn do_realloc(
@@ -875,12 +924,7 @@ fn do_realloc(
     if p == 0 {
         return do_alloc(ctx, new_size, false);
     }
-    let header = ctx.cpu.read_mem(p - 4, 4).unwrap_or_default();
-    let old_size = if header.len() == 4 {
-        u32::from_le_bytes([header[0], header[1], header[2], header[3]])
-    } else {
-        0
-    };
+    let old_size = ctx.kernel.heap.msize(p).unwrap_or(0);
     if new_size == 0 {
         do_free(ctx, p);
         return Ok(DispatchOutcome::ReturnedR0(0));
@@ -889,7 +933,6 @@ fn do_realloc(
         Some(np) => np,
         None => return Ok(DispatchOutcome::ReturnedR0(0)),
     };
-    ctx.cpu.write_mem(new_p - 4, &new_size.to_le_bytes())?;
     let to_copy = old_size.min(new_size);
     if to_copy > 0 {
         let bytes = ctx.cpu.read_mem(p, to_copy)?;
