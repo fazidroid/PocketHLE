@@ -51,8 +51,30 @@ pub enum DcSurface {
 pub struct Bitmap {
     pub width: u32,
     pub height: u32,
+    /// Bits per pixel of the *original* DIB. Internally we always
+    /// keep an RGB565 copy in [`Bitmap::pixels`], but DIB-backed
+    /// bitmaps remember their original depth so callers like
+    /// `GetObjectW` can report the correct value.
+    pub bpp: u16,
     /// 16 bpp RGB565 little-endian. `width * 2` is the row stride.
+    /// For DIB-backed bitmaps this is a synced copy of the guest's
+    /// pixel buffer at [`Bitmap::dib_bits_va`] — `BitBlt` re-reads
+    /// the guest VA on demand to stay current.
     pub pixels: Vec<u8>,
+    /// If `Some`, this bitmap was created via `CreateDIBSection` and
+    /// the guest can write its pixels directly into the mapped guest
+    /// VA at `dib_bits_va`. Source-side `BitBlt`s and `GetObjectW`
+    /// pull from this address. `dib_bpp` records the original bit
+    /// depth so we can decode 8-bpp palette formats etc.
+    pub dib_bits_va: Option<u32>,
+    /// DIB palette table, in RGB565. Empty for non-paletted DIBs.
+    pub dib_palette: Vec<u16>,
+    /// Whether the original DIB is bottom-up (Windows default) or
+    /// top-down. Bottom-up DIBs need to be flipped on read.
+    pub dib_bottom_up: bool,
+    /// Stride in bytes of one row of the **DIB** layout (already
+    /// padded to a 4-byte boundary). 0 for non-DIB bitmaps.
+    pub dib_row_stride: u32,
 }
 
 impl Bitmap {
@@ -60,7 +82,37 @@ impl Bitmap {
         Self {
             width: width.max(1),
             height: height.max(1),
+            bpp: 16,
             pixels: vec![0u8; (width.max(1) * height.max(1) * 2) as usize],
+            dib_bits_va: None,
+            dib_palette: Vec::new(),
+            dib_bottom_up: false,
+            dib_row_stride: 0,
+        }
+    }
+
+    /// Construct a DIB-backed bitmap. The host-side [`Bitmap::pixels`]
+    /// buffer is allocated empty; callers (i.e. `BitBlt` source path)
+    /// are expected to refresh it from the guest pixel store via
+    /// [`Bitmap::sync_from_dib`] before reading.
+    pub fn new_dib(
+        width: u32,
+        height: u32,
+        bpp: u16,
+        bits_va: u32,
+        row_stride: u32,
+        bottom_up: bool,
+        palette: Vec<u16>,
+    ) -> Self {
+        Self {
+            width: width.max(1),
+            height: height.max(1),
+            bpp,
+            pixels: vec![0u8; (width.max(1) * height.max(1) * 2) as usize],
+            dib_bits_va: Some(bits_va),
+            dib_palette: palette,
+            dib_bottom_up: bottom_up,
+            dib_row_stride: row_stride,
         }
     }
 }
@@ -197,6 +249,15 @@ impl GdiState {
         let h = self.alloc_handle();
         self.objects
             .insert(h, GdiObject::Bitmap(Bitmap::new(width, height)));
+        h
+    }
+
+    /// Register a DIB-backed bitmap. The pixel storage lives in guest
+    /// memory at `bits_va`; we keep [`Bitmap`] metadata (palette,
+    /// width, etc.) host-side so `BitBlt` can render through it.
+    pub fn register_dib(&mut self, bitmap: Bitmap) -> u32 {
+        let h = self.alloc_handle();
+        self.objects.insert(h, GdiObject::Bitmap(bitmap));
         h
     }
 
@@ -366,6 +427,18 @@ impl<'a> Surface<'a> {
         if let Surface::Screen(fb) = self {
             fb.mark_dirty();
         }
+    }
+
+    pub fn put_pixel(&mut self, x: i32, y: i32, color: u16) {
+        let (sw, sh) = self.dimensions();
+        if x < 0 || y < 0 || (x as u32) >= sw || (y as u32) >= sh {
+            return;
+        }
+        let off = (y as u32 * sw + x as u32) as usize * 2;
+        let bytes = color.to_le_bytes();
+        let pix = self.pixels_mut();
+        pix[off] = bytes[0];
+        pix[off + 1] = bytes[1];
     }
 
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u16) {

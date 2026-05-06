@@ -134,6 +134,11 @@ impl Vfs {
                 }
             }
         }
+        if create {
+            if let Some(parent) = host_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
         let file = match opts.open(&host_path) {
             Ok(f) => f,
             Err(e) => {

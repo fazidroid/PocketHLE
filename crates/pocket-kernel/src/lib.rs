@@ -26,6 +26,7 @@ use thiserror::Error;
 use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Cpu, CpuError, Prot, StopReason};
 use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
+pub mod font;
 pub mod framebuffer;
 pub mod gdi;
 pub mod vfs;

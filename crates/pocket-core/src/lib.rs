@@ -156,6 +156,16 @@ impl Emulator {
             log::warn!("mount_dir called before load_pe; ignored");
         }
     }
+
+    /// Override how many synthetic `WM_PAINT` messages the dispatcher
+    /// will hand out before posting `WM_QUIT`. Pass `0` for unlimited
+    /// (the message loop will keep running until another path halts
+    /// the emulator).
+    pub fn set_synthetic_message_budget(&mut self, budget: u64) {
+        if let Some(p) = self.process.as_mut() {
+            p.state.synthetic_message_budget = budget;
+        }
+    }
 }
 
 #[cfg(test)]

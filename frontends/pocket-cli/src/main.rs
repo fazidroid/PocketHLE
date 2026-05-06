@@ -103,6 +103,12 @@ enum Command {
         /// flow comes from. May be passed multiple times.
         #[arg(long, value_name = "VA")]
         watch: Vec<String>,
+        /// Override the synthetic `WM_PAINT` message budget. After this
+        /// many `GetMessage` / `PeekMessage` calls the dispatcher posts
+        /// `WM_QUIT` and the game shuts down. `0` means unlimited.
+        /// Default: 240.
+        #[arg(long, default_value_t = 240)]
+        message_budget: u64,
     },
 }
 
@@ -142,6 +148,7 @@ fn main() -> Result<()> {
             max_frames,
             patch,
             watch,
+            message_budget,
         } => cmd_run(
             &path,
             cpu,
@@ -156,6 +163,7 @@ fn main() -> Result<()> {
             max_frames,
             &patch,
             &watch,
+            message_budget,
         ),
     }
 }
@@ -351,6 +359,7 @@ fn cmd_run(
     max_frames: u64,
     patches: &[String],
     watches: &[String],
+    message_budget: u64,
 ) -> Result<()> {
     let mut emu = match backend {
         CpuBackend::Stub => Emulator::with_stub_cpu(),
@@ -385,6 +394,7 @@ fn cmd_run(
             rom_prefix
         );
     }
+    emu.set_synthetic_message_budget(message_budget);
     for spec in patches {
         let (addr_str, hex_str) = spec
             .split_once('=')
