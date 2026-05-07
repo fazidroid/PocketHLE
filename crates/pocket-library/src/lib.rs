@@ -128,7 +128,16 @@ impl Default for GameSettings {
 }
 
 fn default_max_slices() -> u64 {
-    1024
+    // Real PPC2003 games typically need a few hundred thousand
+    // slices to finish their CRT init / soft-float lookup tables /
+    // bitmap loading before the first WM_PAINT is delivered, and
+    // millions more to clear the splash and reach gameplay.
+    // 1024 was effectively a smoke test, not a game launcher: a
+    // freshly imported game timed out long before the title
+    // screen and looked frozen in the GUI. 50 million is enough
+    // to land on the JumpyBall main menu in roughly ten seconds
+    // on a modern x86 machine.
+    50_000_000
 }
 
 fn default_instructions_per_slice() -> u64 {
