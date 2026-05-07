@@ -2,6 +2,7 @@
   "dll": "aygshell.dll",
   "_comment": "Partial ordinal map for Pocket PC 2003 / Windows Mobile 5+ aygshell.dll. Subset covering SHFullScreen, SHHandleWMSettingChange and the menu bar APIs.",
   "ordinals": {
+    "34":  "SHRecognizeGesture",
     "56":  "SHFullScreen",
     "65":  "SHCreateMenuBar",
     "83":  "SHHandleWMActivate",

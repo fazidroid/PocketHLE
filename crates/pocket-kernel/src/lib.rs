@@ -60,7 +60,12 @@ pub const KERNEL_TRAP_SIZE: u32 = 0x0001_0000;
 /// Base of the guest-side heap region. 16 MiB is plenty for the
 /// little games we target and still leaves headroom for the stack.
 pub const HEAP_BASE: u32 = 0x5000_0000;
-pub const HEAP_SIZE: u32 = 0x0100_0000;
+/// 64 MiB. Real Pocket PC processes only get ~32 MiB of total VA,
+/// but games almost never come close to that — and our handle table
+/// for `CreateDIBSection` etc. lives inside the same heap region,
+/// so we keep it generous so back-to-back DIB allocations don't run
+/// the game into an unmapped page.
+pub const HEAP_SIZE: u32 = 0x0400_0000;
 
 /// "bx lr" in ARM mode (little endian).
 pub const ARM_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
@@ -137,6 +142,17 @@ pub struct KernelState {
     /// by `RegisterClassW`, used by `DispatchMessageW` to trampoline
     /// into guest-side WM_PAINT / WM_KEYDOWN handlers.
     pub wnd_proc: u32,
+    /// `nIDEvent` of the timer the guest most recently registered via
+    /// `SetTimer`, or `0` if none. The synthetic message pump uses
+    /// this to inject `WM_TIMER` messages with a wParam the guest
+    /// will recognise.
+    pub synthetic_timer_id: u32,
+    /// `true` once the synthetic message pump has delivered
+    /// `WM_CREATE`. Real Windows fires `WM_CREATE` synchronously
+    /// from `CreateWindowExW`; we instead fire it on the very first
+    /// `GetMessageW` so the guest's `WndProc` runs its window-init
+    /// code (which typically calls `SetTimer`).
+    pub synthetic_create_sent: bool,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -392,6 +408,8 @@ impl Process {
                 synthetic_message_count: 0,
                 synthetic_message_budget: 240,
                 wnd_proc: 0,
+                synthetic_timer_id: 0,
+                synthetic_create_sent: false,
             },
         })
     }

@@ -124,8 +124,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "wcschr", wcschr);
     d.register_handler(dll, "wcsrchr", wcsrchr);
     d.register_handler(dll, "wcsstr", wcsstr);
-    d.register_handler(dll, "swprintf", zero_returning);
-    d.register_handler(dll, "wsprintfW", zero_returning);
+    d.register_handler(dll, "swprintf", swprintf);
+    d.register_handler(dll, "wsprintfW", swprintf);
+    d.register_handler(dll, "sprintf", sprintf);
+    d.register_handler(dll, "wsprintfA", sprintf);
+    d.register_handler(dll, "wcstombs", wcstombs);
+    d.register_handler(dll, "mbstowcs", mbstowcs);
 
     // ---- File I/O backed by the VFS ----
     d.register_handler(dll, "CreateFileW", create_file_w);
@@ -159,8 +163,10 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "rewind", crt_rewind);
 
     // ---- ARM signed/unsigned division helpers (MS compiler).
-    // Calling convention: r0=dividend, r1=divisor; result in r0,
-    // remainder in r1.
+    // Microsoft's `__rt_*div` family has `r0=divisor, r1=dividend`
+    // (flipped from the AEABI helpers). Result is in r0, remainder
+    // in r1. (See LLVM commit `rL283383` for the canonical
+    // documentation of this quirk.)
     d.register_handler(dll, "__rt_sdiv", rt_sdiv);
     d.register_handler(dll, "__rt_udiv", rt_udiv);
     d.register_handler(dll, "__rt_sdiv64", rt_sdiv64);
@@ -211,8 +217,15 @@ pub fn register(d: &mut WinCeDispatcher) {
     // ---- Window / message stubs ----
     d.register_handler(dll, "RegisterClassW", register_class_w);
     d.register_handler(dll, "CreateWindowExW", create_window_ex_w);
+    d.register_handler(dll, "SetWindowLongW", set_window_long_w);
+    d.register_handler(dll, "SetWindowLongA", set_window_long_w);
+    d.register_handler(dll, "GetWindowLongW", get_window_long_w);
+    d.register_handler(dll, "GetWindowLongA", get_window_long_w);
+    d.register_handler(dll, "GetVersionExW", get_version_ex_w);
+    d.register_handler(dll, "GetVersionExA", get_version_ex_w);
     d.register_handler(dll, "DestroyWindow", destroy_window);
     d.register_handler(dll, "FindWindowW", find_window_w);
+    d.register_handler(dll, "GetVersion", get_version);
     d.register_handler(dll, "ShowWindow", one_returning);
     d.register_handler(dll, "UpdateWindow", one_returning);
     d.register_handler(dll, "MoveWindow", one_returning);
@@ -226,6 +239,30 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "TranslateMessage", one_returning);
     d.register_handler(dll, "PostQuitMessage", post_quit_message);
     d.register_handler(dll, "PostMessageW", one_returning);
+    d.register_handler(
+        dll,
+        "MsgWaitForMultipleObjectsEx",
+        msg_wait_for_multiple_objects,
+    );
+    d.register_handler(
+        dll,
+        "MsgWaitForMultipleObjects",
+        msg_wait_for_multiple_objects,
+    );
+    d.register_handler(dll, "EnableWindow", one_returning);
+    d.register_handler(dll, "MessageBeep", one_returning);
+    d.register_handler(dll, "waveOutGetVolume", zero_returning);
+    d.register_handler(dll, "waveOutSetVolume", zero_returning);
+    d.register_handler(dll, "waveOutOpen", zero_returning);
+    d.register_handler(dll, "waveOutClose", zero_returning);
+    d.register_handler(dll, "waveOutWrite", zero_returning);
+    d.register_handler(dll, "waveOutReset", zero_returning);
+    d.register_handler(dll, "waveOutPrepareHeader", zero_returning);
+    d.register_handler(dll, "waveOutUnprepareHeader", zero_returning);
+    d.register_handler(dll, "waveOutGetNumDevs", zero_returning);
+    d.register_handler(dll, "waveOutGetDevCapsW", zero_returning);
+    d.register_handler(dll, "setjmp", setjmp);
+    d.register_handler(dll, "longjmp", zero_returning);
     d.register_handler(dll, "SendMessageW", zero_returning);
     d.register_handler(dll, "InvalidateRect", invalidate_rect);
     d.register_handler(dll, "ValidateRect", one_returning);
@@ -1002,6 +1039,217 @@ fn wcsstr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
 }
 
+/// `size_t wcstombs(char *dst, const wchar_t *src, size_t n)` —
+/// truncate-on-overflow narrow conversion. Lossy: any code unit
+/// outside `0x00..=0xff` becomes `'?'`.
+fn wcstombs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    let n = ctx.arg_u32(2)?;
+    let s = read_wstr(ctx, src, 0x10000)?;
+    let mut out: Vec<u8> = s
+        .iter()
+        .map(|&c| if c < 0x100 { c as u8 } else { b'?' })
+        .collect();
+    let written = if dst != 0 && n > 0 {
+        let take = (n as usize).min(out.len());
+        ctx.cpu.write_mem(dst, &out[..take])?;
+        if take < n as usize {
+            ctx.cpu.write_mem(dst + take as u32, &[0u8])?;
+        }
+        take as u32
+    } else {
+        out.len() as u32
+    };
+    let _ = &mut out;
+    Ok(DispatchOutcome::ReturnedR0(written))
+}
+
+/// `size_t mbstowcs(wchar_t *dst, const char *src, size_t n)`.
+fn mbstowcs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    let n = ctx.arg_u32(2)?;
+    let s = read_cstr(ctx, src, 0x10000)?;
+    let wide: Vec<u16> = s.iter().map(|&b| b as u16).collect();
+    let written = if dst != 0 && n > 0 {
+        let take = (n as usize).min(wide.len());
+        let bytes = wide_to_bytes(&wide[..take]);
+        ctx.cpu.write_mem(dst, &bytes)?;
+        if take < n as usize {
+            ctx.cpu.write_mem(dst + (take as u32) * 2, &[0u8, 0u8])?;
+        }
+        take as u32
+    } else {
+        wide.len() as u32
+    };
+    Ok(DispatchOutcome::ReturnedR0(written))
+}
+
+/// Read a u32 argument from the variadic tail (slot index `idx`,
+/// where 0 is the first variadic argument). The first 4 args go in
+/// r0..r3, the rest are on the stack.
+fn read_vararg_u32(ctx: &mut CallCtx<'_>, idx: u32) -> Result<u32, KernelError> {
+    if idx < 4 {
+        ctx.arg_u32(idx as u8)
+    } else {
+        let sp = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::Sp)?;
+        let off = (idx - 4) * 4;
+        let bytes = ctx.cpu.read_mem(sp + off, 4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+}
+
+/// Render a printf-style format string by walking it character-by-
+/// character and pulling arguments from the variadic tail. Supports
+/// the conversions Pocket PC games actually use: `%d` `%i` `%u`
+/// `%x` `%X` `%c` `%s` `%S` `%ls` `%p`, plus an `l` length modifier
+/// and a basic width/zero-padding spec.
+fn render_printf(
+    ctx: &mut CallCtx<'_>,
+    fmt: &str,
+    fmt_is_wide: bool,
+    arg_start: u32,
+) -> Result<String, KernelError> {
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    let mut next_arg = arg_start;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        // Flags and width.
+        let mut zero_pad = false;
+        let mut width: usize = 0;
+        let mut long = false;
+        loop {
+            match chars.peek().copied() {
+                Some('0') if width == 0 => {
+                    zero_pad = true;
+                    chars.next();
+                }
+                Some(d) if d.is_ascii_digit() => {
+                    width = width * 10 + (d as usize - '0' as usize);
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        if matches!(chars.peek(), Some('l') | Some('L')) {
+            long = true;
+            chars.next();
+        }
+        let conv = match chars.next() {
+            Some(c) => c,
+            None => break,
+        };
+        let mut piece = String::new();
+        match conv {
+            '%' => piece.push('%'),
+            'd' | 'i' => {
+                let v = read_vararg_u32(ctx, next_arg)? as i32;
+                next_arg += 1;
+                piece = v.to_string();
+            }
+            'u' => {
+                let v = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                piece = v.to_string();
+            }
+            'x' => {
+                let v = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                piece = format!("{v:x}");
+            }
+            'X' => {
+                let v = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                piece = format!("{v:X}");
+            }
+            'p' => {
+                let v = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                piece = format!("{v:08X}");
+            }
+            'c' => {
+                let v = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                if let Some(ch) = char::from_u32(v & 0xff) {
+                    piece.push(ch);
+                }
+            }
+            's' => {
+                let p = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                let pulls_wide = if fmt_is_wide { !long } else { long };
+                if p == 0 {
+                    piece.push_str("(null)");
+                } else if pulls_wide {
+                    let w = read_wstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf16_lossy(&w);
+                } else {
+                    let b = read_cstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf8_lossy(&b).into_owned();
+                }
+            }
+            'S' => {
+                let p = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                let pulls_wide = !fmt_is_wide;
+                if p == 0 {
+                    piece.push_str("(null)");
+                } else if pulls_wide {
+                    let w = read_wstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf16_lossy(&w);
+                } else {
+                    let b = read_cstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf8_lossy(&b).into_owned();
+                }
+            }
+            other => {
+                piece.push('%');
+                piece.push(other);
+            }
+        }
+        if width > piece.chars().count() {
+            let pad = width - piece.chars().count();
+            let ch = if zero_pad { '0' } else { ' ' };
+            for _ in 0..pad {
+                out.push(ch);
+            }
+        }
+        out.push_str(&piece);
+    }
+    Ok(out)
+}
+
+/// `int sprintf(char *dst, const char *fmt, ...)`.
+fn sprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    let fmt = read_cstr_string(ctx, fmt_p, 0x4000)?;
+    let s = render_printf(ctx, &fmt, false, 2)?;
+    let mut bytes = s.into_bytes();
+    bytes.push(0);
+    ctx.cpu.write_mem(dst, &bytes)?;
+    Ok(DispatchOutcome::ReturnedR0(bytes.len() as u32 - 1))
+}
+
+/// `int swprintf(wchar_t *dst, const wchar_t *fmt, ...)` and
+/// `int wsprintfW(LPWSTR dst, LPCWSTR fmt, ...)` (same shape).
+fn swprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    let fmt_w = read_wstr(ctx, fmt_p, 0x4000)?;
+    let fmt = String::from_utf16_lossy(&fmt_w);
+    let s = render_printf(ctx, &fmt, true, 2)?;
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0u16)).collect();
+    let bytes = wide_to_bytes(&wide);
+    ctx.cpu.write_mem(dst, &bytes)?;
+    Ok(DispatchOutcome::ReturnedR0(wide.len() as u32 - 1))
+}
+
 fn wide_to_bytes(s: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len() * 2);
     for c in s {
@@ -1395,10 +1643,10 @@ fn crt_fputs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 // ---------- ARM compiler integer division helpers ----------
 
-/// `__rt_sdiv(int dividend in r0, int divisor in r1) -> {r0=quot, r1=rem}`
+/// `__rt_sdiv(int divisor in r0, int dividend in r1) -> {r0=quot, r1=rem}`
 fn rt_sdiv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let n = ctx.arg_u32(0)? as i32;
-    let d = ctx.arg_u32(1)? as i32;
+    let d = ctx.arg_u32(0)? as i32;
+    let n = ctx.arg_u32(1)? as i32;
     if d == 0 {
         return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
     }
@@ -1408,8 +1656,8 @@ fn rt_sdiv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn rt_udiv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let n = ctx.arg_u32(0)?;
-    let d = ctx.arg_u32(1)?;
+    let d = ctx.arg_u32(0)?;
+    let n = ctx.arg_u32(1)?;
     if d == 0 {
         return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
     }
@@ -1417,9 +1665,9 @@ fn rt_udiv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn rt_sdiv64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // (lo,hi) of 64-bit dividend in r0,r1; (lo,hi) of divisor in r2,r3
-    let n = ((ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64) as i64;
-    let d = ((ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64) as i64;
+    // (lo,hi) of 64-bit divisor in r0,r1; (lo,hi) of dividend in r2,r3
+    let d = ((ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64) as i64;
+    let n = ((ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64) as i64;
     if d == 0 {
         return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
     }
@@ -1428,8 +1676,8 @@ fn rt_sdiv64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn rt_udiv64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let n = (ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64;
-    let d = (ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64;
+    let d = (ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64;
+    let n = (ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64;
     if d == 0 {
         return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
     }
@@ -1700,34 +1948,48 @@ fn write_synthetic_msg(
     Ok(())
 }
 
-/// Pick which fake message to deliver next given the current count.
+/// Pick which fake message to deliver next given the current count
+/// and the timer the guest has registered (if any).
 ///
 /// This injects the kind of input traffic a real Pocket PC sees so
 /// games can advance past splash screens that need a tap or key press
-/// to dismiss.
-fn synthetic_message_for(count: u64) -> (u32, u32, u32) {
-    // First eight paints just to let the splash screen render. After
-    // that, every 16th tick we synthesise a tap (left button down +
-    // up) at the centre of the screen plus a `VK_RETURN` keypress.
-    // Everything else is `WM_PAINT`.
+/// to dismiss, and so that timer-driven game loops (the typical
+/// PPC2003 pattern: `WM_CREATE` installs a `~5 ms` timer, `WM_TIMER`
+/// runs the per-frame logic) actually tick.
+fn synthetic_message_for(count: u64, timer_id: u32) -> (u32, u32, u32) {
     const WM_PAINT: u32 = 0x000F;
+    const WM_TIMER: u32 = 0x0113;
     const WM_LBUTTONDOWN: u32 = 0x0201;
     const WM_LBUTTONUP: u32 = 0x0202;
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_KEYUP: u32 = 0x0101;
     const VK_RETURN: u32 = 0x0D;
-    if count < 8 {
+
+    // First few ticks: paint, so the window is on screen before we
+    // inject anything else.
+    if count < 4 {
         return (WM_PAINT, 0, 0);
     }
-    let phase = (count - 8) % 16;
+    // Every 32 ticks we synthesise a tap and a `VK_RETURN`. Real
+    // games consume these to advance through splash screens and
+    // menus.
+    let phase = (count - 4) % 32;
     let centre_lparam = (160u32 << 16) | 120; // y << 16 | x
     match phase {
-        4 => (WM_LBUTTONDOWN, 1, centre_lparam),
-        5 => (WM_LBUTTONUP, 0, centre_lparam),
-        9 => (WM_KEYDOWN, VK_RETURN, 0),
-        10 => (WM_KEYUP, VK_RETURN, 0),
-        _ => (WM_PAINT, 0, 0),
+        4 => return (WM_LBUTTONDOWN, 1, centre_lparam),
+        5 => return (WM_LBUTTONUP, 0, centre_lparam),
+        9 => return (WM_KEYDOWN, VK_RETURN, 0),
+        10 => return (WM_KEYUP, VK_RETURN, 0),
+        _ => {}
     }
+    // If the guest has registered a timer, alternate `WM_TIMER` and
+    // `WM_PAINT` so the game tick runs frequently. Without a real
+    // wall-clock the exact ratio doesn't matter; what matters is
+    // that `WM_TIMER` is delivered at all.
+    if timer_id != 0 && count.is_multiple_of(2) {
+        return (WM_TIMER, timer_id, 0);
+    }
+    (WM_PAINT, 0, 0)
 }
 
 /// `BOOL GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)`
@@ -1746,7 +2008,16 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         write_synthetic_msg(ctx.cpu, lp_msg, 0x0012, 0, 0)?; // WM_QUIT
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    let (msg, wp, lp) = synthetic_message_for(count);
+    if !ctx.kernel.synthetic_create_sent {
+        ctx.kernel.synthetic_create_sent = true;
+        // WM_CREATE — gives the guest's WndProc a chance to run its
+        // window-init code (typically registers a timer that drives
+        // the game tick).
+        write_synthetic_msg(ctx.cpu, lp_msg, 0x0001, 0, 0)?;
+        ctx.kernel.synthetic_message_count = count + 1;
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let (msg, wp, lp) = synthetic_message_for(count, ctx.kernel.synthetic_timer_id);
     write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
     ctx.kernel.synthetic_message_count = count + 1;
     Ok(DispatchOutcome::ReturnedR0(1))
@@ -1761,9 +2032,20 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     let count = ctx.kernel.synthetic_message_count;
     let budget = ctx.kernel.synthetic_message_budget;
     if budget > 0 && count >= budget {
-        return Ok(DispatchOutcome::ReturnedR0(0));
+        // Post WM_QUIT so the game exits the message loop instead
+        // of spinning on PeekMessageW returning 0 forever (which is
+        // what happens with `MsgWaitForMultipleObjectsEx` style
+        // pumps).
+        write_synthetic_msg(ctx.cpu, lp_msg, 0x0012, 0, 0)?;
+        return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let (msg, wp, lp) = synthetic_message_for(count);
+    if !ctx.kernel.synthetic_create_sent {
+        ctx.kernel.synthetic_create_sent = true;
+        write_synthetic_msg(ctx.cpu, lp_msg, 0x0001, 0, 0)?;
+        ctx.kernel.synthetic_message_count = count + 1;
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let (msg, wp, lp) = synthetic_message_for(count, ctx.kernel.synthetic_timer_id);
     write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
     ctx.kernel.synthetic_message_count = count + 1;
     Ok(DispatchOutcome::ReturnedR0(1))
@@ -1772,6 +2054,18 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 fn post_quit_message(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     log::info!("PostQuitMessage called by guest");
     Ok(DispatchOutcome::Halt)
+}
+
+/// `DWORD MsgWaitForMultipleObjectsEx(DWORD nCount, const HANDLE *,
+/// DWORD dwMilliseconds, DWORD dwWakeMask, DWORD dwFlags)`. Real
+/// Win32 returns `WAIT_OBJECT_0 + nCount` when "a new input event is
+/// in the queue". Since our synthetic message pump always has more
+/// messages until the budget is exhausted (and `WM_QUIT` then breaks
+/// the loop), telling the guest "input ready" lets it fall through
+/// to its `PeekMessageW` / `GetMessageW` loop normally.
+fn msg_wait_for_multiple_objects(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let n_count = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(n_count))
 }
 
 fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -2468,6 +2762,75 @@ fn find_window_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
+/// `LONG SetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)` —
+/// returns the previous value (always `0` in our model). When
+/// `nIndex == GWL_WNDPROC` (`-4`), we also re-bind the captured
+/// guest `WndProc` so the synthetic message pump dispatches to the
+/// right entry point if the game subclasses its own window.
+fn set_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let n_index = ctx.arg_u32(1)? as i32;
+    let new_long = ctx.arg_u32(2)?;
+    if n_index == -4 {
+        // GWL_WNDPROC
+        log::info!("SetWindowLongW(GWL_WNDPROC) re-binding WndProc=0x{new_long:08x}");
+        ctx.kernel.wnd_proc = new_long;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `LONG GetWindowLongW(HWND hWnd, int nIndex)` — return `0` for
+/// every slot we don't track (the documented return when never set).
+fn get_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let n_index = ctx.arg_u32(1)? as i32;
+    let v = if n_index == -4 {
+        ctx.kernel.wnd_proc
+    } else {
+        0
+    };
+    Ok(DispatchOutcome::ReturnedR0(v))
+}
+
+const OSVERSIONINFOW_BYTES: u32 = 4 + 4 * 4 + 128 * 2;
+
+/// `BOOL GetVersionExW(LPOSVERSIONINFOW lpVersionInformation)`.
+/// Reports Windows CE 4.20 (Pocket PC 2003 / PPC2003), which is
+/// what every Pocket PC 2002–2003 game we target was built for.
+fn get_version_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let header = ctx.cpu.read_mem(p, 4)?;
+    let cb = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    // We accept any reasonable `cb` — Pocket PC games sometimes set
+    // it to `sizeof(OSVERSIONINFOW)` (276), sometimes to the smaller
+    // `OSVERSIONINFOEXW` ANSI shape, and sometimes to 0 (lazy init).
+    // Real Windows would reject `cb == 0`, but here we'd rather fill
+    // what we can and return success so the guest doesn't take a
+    // failure-only code path.
+    let want = if cb >= OSVERSIONINFOW_BYTES {
+        OSVERSIONINFOW_BYTES
+    } else {
+        cb.max(20)
+    };
+    let mut buf = vec![0u8; want as usize];
+    buf[0..4].copy_from_slice(&want.to_le_bytes());
+    buf[4..8].copy_from_slice(&4u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&20u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&1081u32.to_le_bytes());
+    buf[16..20].copy_from_slice(&3u32.to_le_bytes());
+    ctx.cpu.write_mem(p, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `DWORD GetVersion()` — packed legacy form. Hi word = major.minor
+/// (0x0414 == 4.20), low word = build (1081).
+fn get_version(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0x0439_1404))
+}
+
 fn invalidate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // We don't model dirty rects yet, but bumping the framebuffer
     // dirty counter means hosts (PPM dump, minifb display) re-upload.
@@ -2528,11 +2891,9 @@ fn message_box_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 
 fn set_timer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let id = ctx.arg_u32(1)?;
-    Ok(DispatchOutcome::ReturnedR0(if id == 0 {
-        FAKE_TIMER_BASE
-    } else {
-        id
-    }))
+    let final_id = if id == 0 { FAKE_TIMER_BASE } else { id };
+    ctx.kernel.synthetic_timer_id = final_id;
+    Ok(DispatchOutcome::ReturnedR0(final_id))
 }
 
 fn create_event_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -2914,6 +3275,8 @@ mod tests {
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,
+            synthetic_timer_id: 0,
+            synthetic_create_sent: false,
         }
     }
 

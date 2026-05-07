@@ -120,9 +120,13 @@ fn gx_close_input(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 
 fn gx_get_default_keys(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // The function returns a `GXKeyList` value via a hidden pointer
-    // passed in r0 (sret on ARM AAPCS). We zero-fill it for now.
+    // passed in r0 (sret on ARM AAPCS). The struct holds 8 key
+    // entries of `{SHORT vkXxx; POINT ptXxx;}` — 12 bytes each
+    // (with 2 bytes of padding before the 4-aligned POINT) for a
+    // total of `0x60` bytes. Writing past that is exactly what was
+    // smashing Expresso's saved LR on the way out of GXOpenInput.
     let sret = ctx.arg_u32(0)?;
-    let zero = vec![0u8; 0x80];
+    let zero = vec![0u8; 0x60];
     ctx.cpu.write_mem(sret, &zero)?;
     Ok(DispatchOutcome::ReturnedR0(sret))
 }
@@ -162,6 +166,8 @@ mod tests {
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,
+            synthetic_timer_id: 0,
+            synthetic_create_sent: false,
         }
     }
 
