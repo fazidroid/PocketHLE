@@ -1980,40 +1980,20 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
 /// Pick which fake message to deliver next given the current count
 /// and the timer the guest has registered (if any).
 ///
-/// This injects the kind of input traffic a real Pocket PC sees so
-/// games can advance past splash screens that need a tap or key press
-/// to dismiss, and so that timer-driven game loops (the typical
-/// PPC2003 pattern: `WM_CREATE` installs a `~5 ms` timer, `WM_TIMER`
-/// runs the per-frame logic) actually tick.
+/// This only fabricates *idle* traffic so the run loop never sits
+/// silent — `WM_PAINT` to drive redraws and `WM_TIMER` to drive
+/// timer-based game ticks (the typical PPC2003 pattern: `WM_CREATE`
+/// installs a `~5 ms` timer, `WM_TIMER` runs the per-frame logic).
 ///
-/// Real user input from the host frontend is delivered *before* this
-/// is consulted (see [`get_message_w`] / [`peek_message_w`]); this
-/// fallback only fabricates traffic so the run loop never sits idle.
-fn synthetic_message_for(count: u64, timer_id: u32) -> (u32, u32, u32) {
-    const VK_RETURN: u32 = 0x0D;
-
-    // First few ticks: paint, so the window is on screen before we
-    // inject anything else.
-    if count < 4 {
-        return (WM_PAINT, 0, 0);
-    }
-    // Every 32 ticks we synthesise a tap and a `VK_RETURN`. Real
-    // games consume these to advance through splash screens and
-    // menus when the host hasn't supplied any user input yet.
-    let phase = (count - 4) % 32;
-    let centre_lparam = (160u32 << 16) | 120; // y << 16 | x
-    match phase {
-        4 => return (WM_LBUTTONDOWN, MK_LBUTTON, centre_lparam),
-        5 => return (WM_LBUTTONUP, 0, centre_lparam),
-        9 => return (WM_KEYDOWN, VK_RETURN, 0),
-        10 => return (WM_KEYUP, VK_RETURN, 0),
-        _ => {}
-    }
-    // If the guest has registered a timer, alternate `WM_TIMER` and
-    // `WM_PAINT` so the game tick runs frequently. Without a real
-    // wall-clock the exact ratio doesn't matter; what matters is
-    // that `WM_TIMER` is delivered at all.
-    if timer_id != 0 && count.is_multiple_of(2) {
+/// Real user input — taps and key presses — is exclusively the
+/// frontend's responsibility via [`KernelState::pending_input`]; we
+/// never synthesise user input here. Doing so would mean the game
+/// "presses buttons by itself" between real presses, which is exactly
+/// the user-visible bug we want to avoid.
+fn synthetic_message_for(_count: u64, timer_id: u32) -> (u32, u32, u32) {
+    // Alternate `WM_TIMER` and `WM_PAINT` when a timer is registered
+    // so the game's per-frame logic ticks; otherwise paint-only.
+    if timer_id != 0 && _count.is_multiple_of(2) {
         return (WM_TIMER, timer_id, 0);
     }
     (WM_PAINT, 0, 0)
