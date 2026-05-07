@@ -2272,7 +2272,10 @@ fn bit_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hdc_src = ctx.arg_u32(5)?;
     let x1 = ctx.arg_u32(6)? as i32;
     let y1 = ctx.arg_u32(7)? as i32;
-    let _rop = ctx.arg_u32(8)?;
+    let rop = ctx.arg_u32(8)?;
+    log::debug!(
+        "BitBlt(dst=0x{hdc_dst:08x} dst=({x},{y},{cx}x{cy}) src=0x{hdc_src:08x} src=({x1},{y1}) rop=0x{rop:08x})"
+    );
     bit_blt_inner(ctx, hdc_dst, x, y, cx, cy, hdc_src, x1, y1)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -2388,6 +2391,112 @@ fn bit_blt_inner(
     if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc_dst) {
         dst.blit_from_bytes(x, y, x1, y1, cx, cy, &src_pixels, src_w, src_h);
     }
+    sync_dst_dib_to_guest(ctx, hdc_dst)?;
+    Ok(())
+}
+
+/// Pocket PC games frequently `BitBlt` an asset into a `CreateDIBSection`
+/// memory DC and then read the pixels out by dereferencing the
+/// `ppvBits` pointer the section reported. Our drawing primitives keep
+/// the canonical pixels in a host-side RGB565 cache (`Bitmap::pixels`),
+/// so without an explicit flush the guest's pointer would still point
+/// at zero-initialized memory and every subsequent direct-pixel read
+/// (e.g. the splash-screen blit-to-FB seen in JumpyBall) would silently
+/// produce a black frame.
+///
+/// After every operation that mutates a DC, call this to push the host
+/// pixels back into the guest VA at `dib_bits_va` in the DIB's native
+/// bit depth and orientation.
+fn sync_dst_dib_to_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelError> {
+    let dc = match ctx.kernel.gdi.dc(hdc).cloned() {
+        Some(dc) => dc,
+        None => return Ok(()),
+    };
+    if !matches!(dc.surface, pocket_kernel::gdi::DcSurface::Memory) {
+        return Ok(());
+    }
+    let bm_h = match dc.selected_bitmap {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    let bm = match ctx.kernel.gdi.bitmap(bm_h).cloned() {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+    let bits_va = match bm.dib_bits_va {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let mut buf = vec![0u8; (bm.dib_row_stride * bm.height) as usize];
+    for src_y in 0..bm.height {
+        let dst_y = if bm.dib_bottom_up {
+            bm.height - 1 - src_y
+        } else {
+            src_y
+        };
+        let src_row = (src_y * bm.width * 2) as usize;
+        let dst_row = (dst_y * bm.dib_row_stride) as usize;
+        for x in 0..bm.width {
+            let off = src_row + (x as usize) * 2;
+            if off + 1 >= bm.pixels.len() {
+                continue;
+            }
+            let px = u16::from_le_bytes([bm.pixels[off], bm.pixels[off + 1]]);
+            let r = (((px >> 11) & 0x1f) as u32 * 255 / 31) as u8;
+            let g = (((px >> 5) & 0x3f) as u32 * 255 / 63) as u8;
+            let b = ((px & 0x1f) as u32 * 255 / 31) as u8;
+            match bm.bpp {
+                24 => {
+                    let off2 = dst_row + (x as usize) * 3;
+                    if off2 + 2 < buf.len() {
+                        buf[off2] = b;
+                        buf[off2 + 1] = g;
+                        buf[off2 + 2] = r;
+                    }
+                }
+                32 => {
+                    let off2 = dst_row + (x as usize) * 4;
+                    if off2 + 3 < buf.len() {
+                        buf[off2] = b;
+                        buf[off2 + 1] = g;
+                        buf[off2 + 2] = r;
+                        buf[off2 + 3] = 0;
+                    }
+                }
+                16 => {
+                    let off2 = dst_row + (x as usize) * 2;
+                    if off2 + 1 < buf.len() {
+                        buf[off2] = px as u8;
+                        buf[off2 + 1] = (px >> 8) as u8;
+                    }
+                }
+                8 if !bm.dib_palette.is_empty() => {
+                    // Map RGB565 back to a paletted index by closest-match.
+                    let mut best_i = 0u8;
+                    let mut best_d = u32::MAX;
+                    for (i, &p) in bm.dib_palette.iter().enumerate() {
+                        let pr = ((p >> 11) & 0x1f) as u32 * 255 / 31;
+                        let pg = ((p >> 5) & 0x3f) as u32 * 255 / 63;
+                        let pb = (p & 0x1f) as u32 * 255 / 31;
+                        let dr = pr.abs_diff(r as u32);
+                        let dg = pg.abs_diff(g as u32);
+                        let db = pb.abs_diff(b as u32);
+                        let d = dr * dr + dg * dg + db * db;
+                        if d < best_d {
+                            best_d = d;
+                            best_i = i as u8;
+                        }
+                    }
+                    let off2 = dst_row + x as usize;
+                    if off2 < buf.len() {
+                        buf[off2] = best_i;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ctx.cpu.write_mem(bits_va, &buf)?;
     Ok(())
 }
 
