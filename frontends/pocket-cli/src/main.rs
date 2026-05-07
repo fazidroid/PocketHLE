@@ -537,7 +537,7 @@ struct MultiHook {
 impl pocket_core::kernel::FrameHook for MultiHook {
     fn on_frame(
         &mut self,
-        state: &pocket_core::kernel::KernelState,
+        state: &mut pocket_core::kernel::KernelState,
     ) -> pocket_core::kernel::FrameAction {
         let mut action = pocket_core::kernel::FrameAction::Continue;
         for h in self.hooks.iter_mut() {
@@ -570,7 +570,7 @@ impl DumpFrameHook {
 impl pocket_core::kernel::FrameHook for DumpFrameHook {
     fn on_frame(
         &mut self,
-        state: &pocket_core::kernel::KernelState,
+        state: &mut pocket_core::kernel::KernelState,
     ) -> pocket_core::kernel::FrameAction {
         let counter = state.framebuffer.frame_counter;
         if counter == self.last_dumped_frame {
@@ -637,7 +637,7 @@ mod display_window {
     }
 
     impl FrameHook for DisplayHook {
-        fn on_frame(&mut self, state: &KernelState) -> FrameAction {
+        fn on_frame(&mut self, state: &mut KernelState) -> FrameAction {
             let counter = state.framebuffer.frame_counter;
             let new_frame = counter != self.last_frame;
             if new_frame {

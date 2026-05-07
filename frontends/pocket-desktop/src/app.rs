@@ -2,11 +2,26 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use eframe::egui::{self, Color32, RichText, ScrollArea, Vec2};
+use eframe::egui::{self, Color32, Rect, RichText, ScrollArea, Sense, Vec2};
 
+use pocket_core::kernel::{InputEvent, FB_HEIGHT, FB_WIDTH};
 use pocket_library::{CpuBackendPref, GameEntry, GameSettings, LauncherConfig, Library};
 
-use crate::runner::{FrameSnapshot, RunOutcome, Runner};
+use crate::runner::{FrameSnapshot, InputCommand, RunOutcome, Runner};
+
+/// Virtual button layout for the Run screen — modelled after the
+/// j2me-loader gamepad: a D-pad on the left and three action buttons
+/// (A / B / Start) on the right. Pressing a button sends a
+/// `WM_KEYDOWN`/`WM_KEYUP` pair down to the guest, mapped to the
+/// canonical Pocket PC virtual-key codes from `gx.h`.
+const VK_UP: u16 = 0x26;
+const VK_DOWN: u16 = 0x28;
+const VK_LEFT: u16 = 0x25;
+const VK_RIGHT: u16 = 0x27;
+const VK_RETURN: u16 = 0x0D; // Action / center.
+const VK_ESCAPE: u16 = 0x1B; // Back.
+const VK_TSOFT1: u16 = 0xC1; // Soft-key 1.
+const VK_TSOFT2: u16 = 0xC2; // Soft-key 2.
 
 /// Top-level egui app.
 pub struct PocketLauncher {
@@ -20,6 +35,17 @@ pub struct PocketLauncher {
     /// is running. `Some` between [`Self::spawn_run`] and
     /// `UiEvent::RunFinished`; `None` otherwise.
     frame_rx: Option<Receiver<FrameSnapshot>>,
+    /// Channel for sending [`InputCommand`]s (taps / D-pad / stop)
+    /// to the running emulator. Mirrors `frame_rx`.
+    input_tx: Option<Sender<InputCommand>>,
+    /// Track which virtual buttons are currently held so we can fire
+    /// matching `WM_KEYUP` when the user releases them. Indexed by
+    /// VK code.
+    pressed_keys: std::collections::HashSet<u16>,
+    /// `Some` while a stylus drag is in progress — carries the last
+    /// reported game-space coordinates so we don't spam the guest
+    /// with redundant events.
+    pointer_down_at: Option<(u16, u16)>,
     /// Game currently being launched, used as a status caption
     /// while the run is in progress.
     running_game: Option<String>,
@@ -55,6 +81,9 @@ impl PocketLauncher {
             events_rx: rx,
             events_tx: tx,
             frame_rx: None,
+            input_tx: None,
+            pressed_keys: std::collections::HashSet::new(),
+            pointer_down_at: None,
             running_game: None,
             status: "Welcome to PocketHLE.".to_string(),
             config_draft: None,
@@ -81,6 +110,9 @@ impl PocketLauncher {
                     }
                     self.status = outcome.summary;
                     self.frame_rx = None;
+                    self.input_tx = None;
+                    self.pressed_keys.clear();
+                    self.pointer_down_at = None;
                     self.running_game = None;
                 }
             }
@@ -367,26 +399,162 @@ impl PocketLauncher {
     }
 
     fn ui_run(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Run output");
+        ui.horizontal(|ui| {
+            ui.heading("Run");
+            if let Some(name) = self.running_game.as_ref() {
+                ui.label(format!("— {name}"));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Back to library").clicked() {
+                    // Best-effort — if the runner thread already
+                    // exited the channel will just drop the message.
+                    if let Some(tx) = self.input_tx.as_ref() {
+                        let _ = tx.send(InputCommand::Stop);
+                    }
+                    self.screen = Screen::Library;
+                }
+            });
+        });
+        ui.add_space(6.0);
+        ui.horizontal_top(|ui| {
+            self.ui_run_screen(ui);
+            ui.add_space(12.0);
+            self.ui_virtual_pad(ui);
+        });
         ui.add_space(8.0);
-        if let Some(name) = self.running_game.as_ref() {
-            ui.label(format!("Running {name}…"));
-        }
         if let Some(s) = self.last_frame_status.as_ref() {
-            ui.label(s);
+            ui.label(RichText::new(s).small().color(Color32::from_gray(170)));
         }
-        ui.add_space(8.0);
-        if let Some(tex) = self.last_frame_texture.as_ref() {
-            let size = tex.size_vec2();
-            let avail_w = ui.available_width().min(size.x * 2.0);
-            let scale = avail_w / size.x;
-            ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size * scale));
-        } else {
-            ui.label("(no framebuffer captured yet — try Run again)");
+    }
+
+    /// Render the live framebuffer (or placeholder) and forward any
+    /// pointer presses on it as `WM_LBUTTONDOWN` / `WM_LBUTTONUP`
+    /// events with stylus coordinates in 240×320 game space.
+    fn ui_run_screen(&mut self, ui: &mut egui::Ui) {
+        let Some(tex) = self.last_frame_texture.clone() else {
+            ui.allocate_ui(
+                Vec2::new(FB_WIDTH as f32 * 2.0, FB_HEIGHT as f32 * 2.0),
+                |ui| {
+                    ui.label("(no framebuffer captured yet — try Run again)");
+                },
+            );
+            return;
+        };
+        let size = tex.size_vec2();
+        // Display at 2x for readability, the same way the CLI's
+        // minifb DisplayHook scales.
+        let scale = 2.0_f32;
+        let display_size = size * scale;
+        let (rect, response) = ui.allocate_exact_size(display_size, Sense::click_and_drag());
+        let image = egui::Image::from_texture(&tex).fit_to_exact_size(display_size);
+        image.paint_at(ui, rect);
+        self.handle_pointer(&rect, &response);
+    }
+
+    fn handle_pointer(&mut self, rect: &Rect, response: &egui::Response) {
+        let Some(pos) = response.interact_pointer_pos() else {
+            // No pointer over the framebuffer this frame — if the
+            // user just released the button, send a corresponding
+            // PointerUp at the last known coords.
+            if response.drag_stopped() || response.clicked() {
+                if let Some((x, y)) = self.pointer_down_at.take() {
+                    self.send_input(InputEvent::PointerUp { x, y });
+                }
+            }
+            return;
+        };
+        let local = pos - rect.min;
+        let scale_x = FB_WIDTH as f32 / rect.width();
+        let scale_y = FB_HEIGHT as f32 / rect.height();
+        let game_x = (local.x * scale_x).clamp(0.0, (FB_WIDTH - 1) as f32) as u16;
+        let game_y = (local.y * scale_y).clamp(0.0, (FB_HEIGHT - 1) as f32) as u16;
+        if response.drag_started() || response.is_pointer_button_down_on() {
+            // Either freshly pressed, or holding & dragging — if we
+            // weren't already tracking a press, fire PointerDown.
+            if self.pointer_down_at.is_none() {
+                self.send_input(InputEvent::PointerDown {
+                    x: game_x,
+                    y: game_y,
+                });
+            }
+            self.pointer_down_at = Some((game_x, game_y));
         }
-        ui.add_space(12.0);
-        if ui.button("Back to library").clicked() {
-            self.screen = Screen::Library;
+        if response.drag_stopped() || response.clicked() {
+            self.send_input(InputEvent::PointerUp {
+                x: game_x,
+                y: game_y,
+            });
+            self.pointer_down_at = None;
+        }
+    }
+
+    /// j2me-loader-inspired virtual gamepad: a D-pad on the left and
+    /// three action buttons (A / B / Start) plus two soft keys on
+    /// the right. Each button drives a `WM_KEYDOWN`/`WM_KEYUP` pair
+    /// while held.
+    fn ui_virtual_pad(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Controls").strong());
+            ui.add_space(4.0);
+            // ----- D-pad: 3x3 grid with cardinal arrows -----
+            egui::Grid::new("vpad_dpad")
+                .spacing(Vec2::new(2.0, 2.0))
+                .show(ui, |ui| {
+                    ui.label("");
+                    self.vbutton(ui, "▲", VK_UP, 44.0);
+                    ui.label("");
+                    ui.end_row();
+                    self.vbutton(ui, "◀", VK_LEFT, 44.0);
+                    self.vbutton(ui, "●", VK_RETURN, 44.0);
+                    self.vbutton(ui, "▶", VK_RIGHT, 44.0);
+                    ui.end_row();
+                    ui.label("");
+                    self.vbutton(ui, "▼", VK_DOWN, 44.0);
+                    ui.label("");
+                    ui.end_row();
+                });
+            ui.add_space(8.0);
+            // ----- Soft keys -----
+            ui.horizontal(|ui| {
+                self.vbutton(ui, "Soft1", VK_TSOFT1, 60.0);
+                self.vbutton(ui, "Soft2", VK_TSOFT2, 60.0);
+            });
+            ui.add_space(4.0);
+            // ----- Back / start -----
+            ui.horizontal(|ui| {
+                self.vbutton(ui, "Back", VK_ESCAPE, 60.0);
+                self.vbutton(ui, "Start", VK_RETURN, 60.0);
+            });
+        });
+    }
+
+    /// Render one virtual button. Pressed-while-pointer-is-down
+    /// generates `WM_KEYDOWN` once; releasing fires `WM_KEYUP`.
+    fn vbutton(&mut self, ui: &mut egui::Ui, label: &str, vk: u16, size: f32) {
+        let was_pressed = self.pressed_keys.contains(&vk);
+        let mut button = egui::Button::new(RichText::new(label).size(16.0).strong())
+            .min_size(Vec2::new(size, size));
+        if was_pressed {
+            button = button.fill(Color32::from_rgb(80, 130, 255));
+        }
+        let response = ui.add_sized(Vec2::new(size, size), button);
+        let now_pressed = response.is_pointer_button_down_on();
+        match (was_pressed, now_pressed) {
+            (false, true) => {
+                self.pressed_keys.insert(vk);
+                self.send_input(InputEvent::KeyDown { vk });
+            }
+            (true, false) => {
+                self.pressed_keys.remove(&vk);
+                self.send_input(InputEvent::KeyUp { vk });
+            }
+            _ => {}
+        }
+    }
+
+    fn send_input(&self, ev: InputEvent) {
+        if let Some(tx) = self.input_tx.as_ref() {
+            let _ = tx.send(InputCommand::Input(ev));
         }
     }
 
@@ -427,13 +595,17 @@ impl PocketLauncher {
         self.screen = Screen::Run;
         self.running_game = Some(game.display_name.clone());
         let (frame_tx, frame_rx) = mpsc::channel();
+        let (input_tx, input_rx) = mpsc::channel();
         self.frame_rx = Some(frame_rx);
+        self.input_tx = Some(input_tx);
+        self.pressed_keys.clear();
+        self.pointer_down_at = None;
         let library_root = self.library.root().to_path_buf();
         let game = game.clone();
         let tx = self.events_tx.clone();
         let runner = self.runner.clone();
         std::thread::spawn(move || {
-            let outcome = runner.run_game(library_root, game, Some(frame_tx));
+            let outcome = runner.run_game(library_root, game, Some(frame_tx), Some(input_rx));
             let _ = tx.send(UiEvent::RunFinished(outcome));
         });
         self.status = "Starting emulator...".to_string();

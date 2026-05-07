@@ -17,7 +17,7 @@
 //! exposes a [`Dispatcher`] trait that an API layer registers itself
 //! against.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use byteorder::{ByteOrder, LittleEndian};
 use indexmap::IndexMap;
@@ -78,6 +78,38 @@ pub enum KernelError {
     Loader(String),
     #[error("dispatcher error: {0}")]
     Dispatch(String),
+}
+
+/// External input the host frontend wants delivered to the guest.
+///
+/// Real Pocket PC apps see input as window messages — `WM_LBUTTONDOWN` /
+/// `WM_LBUTTONUP` / `WM_KEYDOWN` / `WM_KEYUP` arriving via the
+/// `GetMessageW` queue. The host frontends (egui desktop, JNI Android,
+/// optionally CLI) push these events into [`KernelState::pending_input`]
+/// and the synthetic message pump in `pocket-winceapi::coredll` drains
+/// the queue and converts each event into the right MSG before falling
+/// back to its synthetic timer / paint loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputEvent {
+    /// Stylus down at game-space `(x, y)` (0..240, 0..320). Translated
+    /// into `WM_LBUTTONDOWN` with the standard `lParam = (y << 16) | x`.
+    PointerDown {
+        x: u16,
+        y: u16,
+    },
+    /// Stylus up. Translated into `WM_LBUTTONUP`.
+    PointerUp {
+        x: u16,
+        y: u16,
+    },
+    /// Hardware / D-pad / virtual-keyboard key press. `vk` is a
+    /// standard Win32 virtual-key code (e.g. `VK_LEFT = 0x25`).
+    KeyDown {
+        vk: u16,
+    },
+    KeyUp {
+        vk: u16,
+    },
 }
 
 /// Result of dispatching a hooked call back to the host.
@@ -153,6 +185,15 @@ pub struct KernelState {
     /// `GetMessageW` so the guest's `WndProc` runs its window-init
     /// code (which typically calls `SetTimer`).
     pub synthetic_create_sent: bool,
+    /// Input events queued by the host frontend (mouse / D-pad /
+    /// keyboard). Drained by `GetMessageW` / `PeekMessageW` before
+    /// any synthetic timer / paint message is fabricated, so real
+    /// user input always wins over the synthetic pump.
+    pub pending_input: VecDeque<InputEvent>,
+    /// Set by the host frontend to ask the run loop to stop cleanly
+    /// at the next slice boundary. Used by the desktop GUI's "Back to
+    /// library" button so the user can interrupt a running game.
+    pub should_stop: bool,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -381,10 +422,17 @@ impl Process {
             trap_page.extend_from_slice(&ARM_BX_LR);
         }
         cpu.write_mem(KERNEL_TRAP_BASE, &trap_page)?;
-        // Install a halt-on-hit watch on the well-known terminate
-        // syscalls reached via the MS CRT __doexit path. Without
-        // this, the guest's ExitProcess returns through `bx lr`
-        // back into a poisoned LR / popped 0 → bogus null deref.
+        // Install code hooks on the well-known WinCE kernel-trap
+        // entry points reached via the MS CRT __doexit path. The run
+        // loop treats hits there as a soft `bx lr` return: real
+        // games periodically jump through `0xF000_F7F8` / `_F7FC`
+        // for syscalls (Sleep, EventModify, etc.) and we have no way
+        // to dispatch those individually under HLE — but the trap
+        // page is filled with `bx lr`, so a soft return mirrors the
+        // "naked syscall returns straight back" behaviour. The
+        // separate `pc < 0x1000` guard in `run_main_loop_with_hook`
+        // still catches the actual `ExitProcess` case where the CRT
+        // popped a poisoned LR == 0.
         for &exit_va in &[0xF000_F7F8u32, 0xF000_F7FCu32, 0xF000_FFFCu32] {
             cpu.add_code_hook(exit_va)?;
         }
@@ -410,6 +458,8 @@ impl Process {
                 wnd_proc: 0,
                 synthetic_timer_id: 0,
                 synthetic_create_sent: false,
+                pending_input: VecDeque::new(),
+                should_stop: false,
             },
         })
     }
@@ -443,15 +493,20 @@ pub enum FrameAction {
 /// Callback that observes the framebuffer between dispatch slices.
 /// Used by the host-side frontend to display the rendered frame and
 /// pump window events.
+///
+/// The hook receives `&mut KernelState` so it can also push
+/// [`InputEvent`]s onto [`KernelState::pending_input`] in response
+/// to host UI input — that's how a desktop GUI forwards a tap on the
+/// emulated screen into a `WM_LBUTTONDOWN` for the guest.
 pub trait FrameHook {
     /// Called between dispatcher slices. The hook receives the
-    /// kernel state — typically the framebuffer — and returns
-    /// whether emulation should keep running.
-    fn on_frame(&mut self, state: &KernelState) -> FrameAction;
+    /// kernel state and returns whether emulation should keep
+    /// running.
+    fn on_frame(&mut self, state: &mut KernelState) -> FrameAction;
 }
 
-impl<F: FnMut(&KernelState) -> FrameAction> FrameHook for F {
-    fn on_frame(&mut self, state: &KernelState) -> FrameAction {
+impl<F: FnMut(&mut KernelState) -> FrameAction> FrameHook for F {
+    fn on_frame(&mut self, state: &mut KernelState) -> FrameAction {
         self(state)
     }
 }
@@ -542,11 +597,35 @@ pub fn run_main_loop_with_hook(
                 let thunk = match process.find_thunk(addr) {
                     Some(t) => t.clone(),
                     None => {
-                        // A `--watch` breakpoint or other non-thunk
-                        // code hook was hit. Dump CPU state for the
-                        // diagnostic and HALT — otherwise unicorn
-                        // would re-fire the hook on resume and we'd
-                        // spin forever.
+                        // A non-thunk code hook fired. The expected
+                        // case is the WinCE kernel-trap region
+                        // (0xF000_0000..) — every page there is
+                        // pre-filled with `bx lr`, so a real device
+                        // would just return straight to the caller.
+                        // Treat it that way: log once at debug level
+                        // and emulate `bx lr` ourselves (set PC to LR
+                        // & ~1, continue). The `pc < 0x1000` guard
+                        // at the top of the loop still catches the
+                        // genuine "poisoned LR after ExitProcess"
+                        // case where LR is 0.
+                        if (KERNEL_TRAP_BASE..KERNEL_TRAP_BASE.saturating_add(KERNEL_TRAP_SIZE))
+                            .contains(&addr)
+                        {
+                            log::debug!(
+                                "kernel-trap soft-return at 0x{addr:08x} (R0=0x{r0:08x}, LR=0x{lr:08x})",
+                                r0 = cpu.read_reg(ArmReg::R0).unwrap_or(0),
+                                lr = cpu.read_reg(ArmReg::Lr).unwrap_or(0),
+                            );
+                            let lr = cpu.read_reg(ArmReg::Lr)?;
+                            pc = lr & !1;
+                            // Skip the frame-hook for this slice —
+                            // we did not actually advance the
+                            // emulator, just bounced through a trap.
+                            continue;
+                        }
+                        // Some other host-installed hook (e.g.
+                        // `--watch` from the CLI). Dump CPU state
+                        // and halt cleanly.
                         log::warn!("watch hit at 0x{addr:08x}\n{regs}", regs = dump_regs(cpu),);
                         return Ok(());
                     }
@@ -584,10 +663,14 @@ pub fn run_main_loop_with_hook(
             StopReason::Requested | StopReason::OutOfBounds => return Ok(()),
         }
         if let Some(hook) = frame_hook.as_deref_mut() {
-            if hook.on_frame(&process.state) == FrameAction::Stop {
+            if hook.on_frame(&mut process.state) == FrameAction::Stop {
                 log::info!("frame hook requested stop");
                 return Ok(());
             }
+        }
+        if process.state.should_stop {
+            log::info!("frame hook flagged should_stop");
+            return Ok(());
         }
     }
     let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(0);

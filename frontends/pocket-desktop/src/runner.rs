@@ -2,11 +2,11 @@
 //! desktop GUI.
 
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use pocket_core::kernel::{FrameAction, FrameHook, KernelState};
+use pocket_core::kernel::{FrameAction, FrameHook, InputEvent, KernelState};
 use pocket_core::Emulator;
 use pocket_library::{CpuBackendPref, GameEntry};
 
@@ -25,6 +25,7 @@ impl Runner {
         library_root: PathBuf,
         game: GameEntry,
         live_tx: Option<Sender<FrameSnapshot>>,
+        input_rx: Option<Receiver<InputCommand>>,
     ) -> RunOutcome {
         let _guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let exe = game.executable_path(&library_root);
@@ -85,15 +86,17 @@ impl Runner {
 
         let extracted = game.extracted_dir(&library_root);
         emu.mount_dir("\\Application\\", &extracted);
-        // Match the CLI's synthetic message budget so guests reach
-        // their first WM_PAINT in the same number of slices.
-        emu.set_synthetic_message_budget(240);
+        // GUI users actually play the game, so don't auto-fire
+        // `WM_QUIT` after a fixed number of synthetic messages —
+        // budget=0 means "run until the user stops or the game
+        // calls ExitProcess". Real input from the virtual D-pad /
+        // stylus tap arrives through `input_rx` and feeds the
+        // synthetic message pump in pocket-winceapi.
+        emu.set_synthetic_message_budget(0);
 
-        let run_result = if let Some(tx) = live_tx {
-            let mut hook = LivePreviewHook::new(tx);
+        let run_result = {
+            let mut hook = RunHook::new(live_tx, input_rx);
             emu.run_with_hook(&mut hook)
-        } else {
-            emu.run()
         };
         match run_result {
             Ok(()) => summary_lines.push("Emulator exited cleanly.".to_string()),
@@ -145,42 +148,86 @@ impl FrameSnapshot {
     }
 }
 
-/// Frame hook that pushes one [`FrameSnapshot`] across `tx` every
-/// time the guest produces a new frame, so the GUI can paint a live
-/// preview while the emulator is still running.
-struct LivePreviewHook {
-    tx: Sender<FrameSnapshot>,
-    last_frame: u64,
-    failed: bool,
+/// Command pushed by the GUI thread into the running emulator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCommand {
+    /// User input (tap / D-pad / key) to forward to the guest.
+    Input(InputEvent),
+    /// "Back to library" button — ask the run loop to stop cleanly.
+    Stop,
 }
 
-impl LivePreviewHook {
-    fn new(tx: Sender<FrameSnapshot>) -> Self {
+/// Frame hook that:
+///  - pushes one [`FrameSnapshot`] across `frame_tx` every time the
+///    guest produces a new frame, so the GUI paints a live preview;
+///  - drains pending [`InputCommand`]s from `input_rx` and forwards
+///    them into the kernel's input queue / stop flag.
+struct RunHook {
+    frame_tx: Option<Sender<FrameSnapshot>>,
+    input_rx: Option<Receiver<InputCommand>>,
+    last_frame: u64,
+    frame_send_failed: bool,
+    input_disconnected: bool,
+}
+
+impl RunHook {
+    fn new(
+        frame_tx: Option<Sender<FrameSnapshot>>,
+        input_rx: Option<Receiver<InputCommand>>,
+    ) -> Self {
         Self {
-            tx,
+            frame_tx,
+            input_rx,
             last_frame: 0,
-            failed: false,
+            frame_send_failed: false,
+            input_disconnected: false,
         }
     }
 }
 
-impl FrameHook for LivePreviewHook {
-    fn on_frame(&mut self, state: &KernelState) -> FrameAction {
-        if self.failed {
-            return FrameAction::Continue;
+impl FrameHook for RunHook {
+    fn on_frame(&mut self, state: &mut KernelState) -> FrameAction {
+        // Forward any UI input the user has produced since the last
+        // slice into the kernel's pending input queue. Stop signals
+        // turn into a `FrameAction::Stop`.
+        let mut stop_requested = false;
+        if !self.input_disconnected {
+            if let Some(rx) = self.input_rx.as_ref() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(InputCommand::Input(ev)) => state.pending_input.push_back(ev),
+                        Ok(InputCommand::Stop) => stop_requested = true,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            self.input_disconnected = true;
+                            break;
+                        }
+                    }
+                }
+            }
         }
-        let counter = state.framebuffer.frame_counter;
-        if counter == self.last_frame {
-            return FrameAction::Continue;
+
+        // Stream the latest framebuffer up to the GUI.
+        if !self.frame_send_failed {
+            if let Some(tx) = self.frame_tx.as_ref() {
+                let counter = state.framebuffer.frame_counter;
+                if counter != self.last_frame {
+                    self.last_frame = counter;
+                    let snapshot = FrameSnapshot::from_framebuffer(&state.framebuffer);
+                    if tx.send(snapshot).is_err() {
+                        // GUI thread dropped the receiver — the user
+                        // closed the run screen / quit the launcher.
+                        self.frame_send_failed = true;
+                    }
+                }
+            }
         }
-        self.last_frame = counter;
-        let snapshot = FrameSnapshot::from_framebuffer(&state.framebuffer);
-        if self.tx.send(snapshot).is_err() {
-            // UI thread dropped the receiver — the user closed the
-            // run screen / quit the launcher. Stop sending so we
-            // don't keep allocating frame buffers we'll never read.
-            self.failed = true;
+
+        if stop_requested {
+            state.should_stop = true;
+            FrameAction::Stop
+        } else {
+            FrameAction::Continue
         }
-        FrameAction::Continue
     }
 }
