@@ -170,8 +170,8 @@ jobs:
         working-directory: frontends/pocket-android
         run: |
           gradle wrapper --gradle-version 8.7
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: PocketHLE-android
-          path: frontends/pocket-android/app/build/outputs/apk/release/*.apk
+          path: frontends/pocket-android/app/build/outputs/apk/debug/*.apk
