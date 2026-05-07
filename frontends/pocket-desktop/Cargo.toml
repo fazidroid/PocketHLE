@@ -28,7 +28,10 @@ serde_json.workspace = true
 eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.27"
 egui_extras = { version = "0.27", features = ["image"] }
-rfd = { version = "0.14", default-features = false, features = ["xdg-portal", "tokio"] }
+# Use GTK3 file dialog on Linux — xdg-portal in 0.14 requires a live
+# Tokio reactor for sync calls and panics if run from a plain thread.
+# GTK3 is synchronous and works inside a `std::thread::spawn`.
+rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
 directories = "5"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
