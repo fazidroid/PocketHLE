@@ -6,7 +6,7 @@ use eframe::egui::{self, Color32, RichText, ScrollArea, Vec2};
 
 use pocket_library::{CpuBackendPref, GameEntry, GameSettings, LauncherConfig, Library};
 
-use crate::runner::{RunOutcome, Runner};
+use crate::runner::{FrameSnapshot, RunOutcome, Runner};
 
 /// Top-level egui app.
 pub struct PocketLauncher {
@@ -16,6 +16,13 @@ pub struct PocketLauncher {
     runner: Runner,
     events_rx: Receiver<UiEvent>,
     events_tx: Sender<UiEvent>,
+    /// Live framebuffer updates streamed by [`Runner`] while a game
+    /// is running. `Some` between [`Self::spawn_run`] and
+    /// `UiEvent::RunFinished`; `None` otherwise.
+    frame_rx: Option<Receiver<FrameSnapshot>>,
+    /// Game currently being launched, used as a status caption
+    /// while the run is in progress.
+    running_game: Option<String>,
     status: String,
     config_draft: Option<LauncherConfig>,
     game_settings_draft: Option<(String, GameSettings)>,
@@ -47,6 +54,8 @@ impl PocketLauncher {
             runner: Runner::new(),
             events_rx: rx,
             events_tx: tx,
+            frame_rx: None,
+            running_game: None,
             status: "Welcome to PocketHLE.".to_string(),
             config_draft: None,
             game_settings_draft: None,
@@ -68,16 +77,32 @@ impl PocketLauncher {
                 UiEvent::RunFinished(outcome) => {
                     self.last_frame_status = Some(outcome.summary.clone());
                     if let Some(frame) = outcome.framebuffer {
-                        let size = [frame.width as usize, frame.height as usize];
-                        let img = egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
-                        let tex =
-                            ctx.load_texture("pockethle-fb", img, egui::TextureOptions::NEAREST);
-                        self.last_frame_texture = Some(tex);
+                        self.upload_frame_texture(ctx, &frame);
                     }
                     self.status = outcome.summary;
+                    self.frame_rx = None;
+                    self.running_game = None;
                 }
             }
         }
+        // Drain any live preview frames the background runner may
+        // have produced since the last UI tick.
+        let mut latest: Option<FrameSnapshot> = None;
+        if let Some(rx) = self.frame_rx.as_ref() {
+            while let Ok(frame) = rx.try_recv() {
+                latest = Some(frame);
+            }
+        }
+        if let Some(frame) = latest {
+            self.upload_frame_texture(ctx, &frame);
+        }
+    }
+
+    fn upload_frame_texture(&mut self, ctx: &egui::Context, frame: &FrameSnapshot) {
+        let size = [frame.width as usize, frame.height as usize];
+        let img = egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
+        let tex = ctx.load_texture("pockethle-fb", img, egui::TextureOptions::NEAREST);
+        self.last_frame_texture = Some(tex);
     }
 
     fn reload_library(&mut self) {
@@ -344,7 +369,10 @@ impl PocketLauncher {
     fn ui_run(&mut self, ui: &mut egui::Ui) {
         ui.heading("Run output");
         ui.add_space(8.0);
-        if let Some(s) = &self.last_frame_status {
+        if let Some(name) = self.running_game.as_ref() {
+            ui.label(format!("Running {name}…"));
+        }
+        if let Some(s) = self.last_frame_status.as_ref() {
             ui.label(s);
         }
         ui.add_space(8.0);
@@ -397,12 +425,15 @@ impl PocketLauncher {
         self.last_frame_texture = None;
         self.last_frame_status = None;
         self.screen = Screen::Run;
+        self.running_game = Some(game.display_name.clone());
+        let (frame_tx, frame_rx) = mpsc::channel();
+        self.frame_rx = Some(frame_rx);
         let library_root = self.library.root().to_path_buf();
         let game = game.clone();
         let tx = self.events_tx.clone();
         let runner = self.runner.clone();
         std::thread::spawn(move || {
-            let outcome = runner.run_game(library_root, game);
+            let outcome = runner.run_game(library_root, game, Some(frame_tx));
             let _ = tx.send(UiEvent::RunFinished(outcome));
         });
         self.status = "Starting emulator...".to_string();

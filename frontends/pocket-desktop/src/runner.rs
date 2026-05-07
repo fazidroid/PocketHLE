@@ -2,9 +2,11 @@
 //! desktop GUI.
 
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use pocket_core::kernel::{FrameAction, FrameHook, KernelState};
 use pocket_core::Emulator;
 use pocket_library::{CpuBackendPref, GameEntry};
 
@@ -18,23 +20,57 @@ impl Runner {
         Self::default()
     }
 
-    pub fn run_game(&self, library_root: PathBuf, game: GameEntry) -> RunOutcome {
+    pub fn run_game(
+        &self,
+        library_root: PathBuf,
+        game: GameEntry,
+        live_tx: Option<Sender<FrameSnapshot>>,
+    ) -> RunOutcome {
         let _guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let exe = game.executable_path(&library_root);
         let mut summary_lines = vec![format!("Game: {}", game.display_name)];
-        summary_lines.push(format!("Backend: {}", game.settings.cpu_backend.label()));
-        summary_lines.push(format!("Executable: {}", exe.display()));
 
-        let mut emu = match game.settings.cpu_backend {
-            CpuBackendPref::Stub => Emulator::with_stub_cpu(),
+        // The Stub CPU does not interpret instructions — it is a
+        // trace-only harness that exists so loader-level code can be
+        // unit-tested without pulling in unicorn-engine. Trying to
+        // actually `run` a game on it is guaranteed to crash with
+        // "guest jumped to unmapped address 0x00000000" because the
+        // stub never sets LR while pretending to call a guest
+        // function. End users who click "Run" in the GUI always
+        // want the real ARM core, regardless of what is persisted in
+        // their `library.json` — so when a Stub-backed game is
+        // launched and unicorn is compiled in, we silently promote
+        // the run to Unicorn. This is defense-in-depth on top of
+        // [`pocket_library::Library::migrate_legacy_entries`], which
+        // covers users who downgrade or who have a stale
+        // `library.json` from before that migration existed.
+        let requested_backend = game.settings.cpu_backend;
+        let mut effective_backend = requested_backend;
+        let mut emu = match requested_backend {
             CpuBackendPref::Unicorn => match build_unicorn() {
                 Ok(emu) => emu,
                 Err(e) => {
                     summary_lines.push(format!("Unicorn unavailable, falling back to stub: {e}"));
+                    effective_backend = CpuBackendPref::Stub;
                     Emulator::with_stub_cpu()
                 }
             },
+            CpuBackendPref::Stub => match build_unicorn() {
+                Ok(emu) => {
+                    summary_lines.push(
+                        "Saved CPU backend was Stub (trace-only); promoting to \
+                         Unicorn so the game can actually execute."
+                            .to_string(),
+                    );
+                    effective_backend = CpuBackendPref::Unicorn;
+                    emu
+                }
+                Err(_) => Emulator::with_stub_cpu(),
+            },
         };
+        summary_lines.push(format!("Backend: {}", effective_backend.label()));
+        summary_lines.push(format!("Executable: {}", exe.display()));
+
         emu.set_halt_on_unimplemented(game.settings.halt_on_unimplemented);
         emu.max_slices = game.settings.max_slices;
         emu.instruction_budget_per_slice = game.settings.instructions_per_slice;
@@ -49,8 +85,17 @@ impl Runner {
 
         let extracted = game.extracted_dir(&library_root);
         emu.mount_dir("\\Application\\", &extracted);
+        // Match the CLI's synthetic message budget so guests reach
+        // their first WM_PAINT in the same number of slices.
+        emu.set_synthetic_message_budget(240);
 
-        match emu.run() {
+        let run_result = if let Some(tx) = live_tx {
+            let mut hook = LivePreviewHook::new(tx);
+            emu.run_with_hook(&mut hook)
+        } else {
+            emu.run()
+        };
+        match run_result {
             Ok(()) => summary_lines.push("Emulator exited cleanly.".to_string()),
             Err(e) => summary_lines.push(format!("Emulator stopped: {e:#}")),
         }
@@ -97,5 +142,45 @@ impl FrameSnapshot {
             height: fb.height,
             rgba: fb.snapshot_rgba8888(),
         }
+    }
+}
+
+/// Frame hook that pushes one [`FrameSnapshot`] across `tx` every
+/// time the guest produces a new frame, so the GUI can paint a live
+/// preview while the emulator is still running.
+struct LivePreviewHook {
+    tx: Sender<FrameSnapshot>,
+    last_frame: u64,
+    failed: bool,
+}
+
+impl LivePreviewHook {
+    fn new(tx: Sender<FrameSnapshot>) -> Self {
+        Self {
+            tx,
+            last_frame: 0,
+            failed: false,
+        }
+    }
+}
+
+impl FrameHook for LivePreviewHook {
+    fn on_frame(&mut self, state: &KernelState) -> FrameAction {
+        if self.failed {
+            return FrameAction::Continue;
+        }
+        let counter = state.framebuffer.frame_counter;
+        if counter == self.last_frame {
+            return FrameAction::Continue;
+        }
+        self.last_frame = counter;
+        let snapshot = FrameSnapshot::from_framebuffer(&state.framebuffer);
+        if self.tx.send(snapshot).is_err() {
+            // UI thread dropped the receiver — the user closed the
+            // run screen / quit the launcher. Stop sending so we
+            // don't keep allocating frame buffers we'll never read.
+            self.failed = true;
+        }
+        FrameAction::Continue
     }
 }
