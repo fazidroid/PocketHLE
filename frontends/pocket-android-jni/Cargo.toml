@@ -12,7 +12,9 @@ name = "pockethle_jni"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+# Default builds include the real ARM CPU (unicorn-engine). The stub
+# backend exists for tracing only and is not useful at runtime.
+default = ["unicorn"]
 unicorn = ["pocket-core/unicorn"]
 
 [dependencies]

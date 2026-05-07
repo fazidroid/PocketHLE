@@ -22,7 +22,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: clippy (stub backend)
+    name: clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,29 +30,31 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: install GUI dev libs
+      - name: install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-3-dev libxkbcommon-dev libssl-dev pkg-config \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev libxi-dev \
-            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev
+            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev \
+            cmake build-essential libclang-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test-stub:
-    name: cargo test (stub backend)
+  test:
+    name: cargo test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: install GUI dev libs
+      - name: install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-3-dev libxkbcommon-dev libssl-dev pkg-config \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev libxi-dev \
-            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev
+            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev \
+            cmake build-essential libclang-dev
       - run: cargo build --workspace --release
       - run: cargo test --workspace --release
 
@@ -78,16 +80,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: install GUI dev libs
+      - name: install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-3-dev libxkbcommon-dev libssl-dev pkg-config \
             libwayland-dev libx11-dev libxcb1-dev libxrandr-dev libxinerama-dev libxi-dev \
-            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev
-      - name: build CLI + desktop
+            libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev \
+            cmake build-essential libclang-dev
+      - name: build CLI + desktop (with unicorn-engine)
         run: |
-          cargo build --release -p pocket-cli
+          cargo build --release -p pocket-cli --features unicorn
           cargo build --release -p pocket-desktop
       - name: stage artifacts
         run: |
@@ -155,7 +158,11 @@ jobs:
           add-to-path: true
       - name: install cargo-ndk
         run: cargo install cargo-ndk --locked
-      - name: cross-compile native lib
+      - name: install cmake (for unicorn-engine cross-compile)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+      - name: cross-compile native lib (with unicorn-engine)
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
