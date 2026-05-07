@@ -78,7 +78,7 @@ enum Command {
         /// that `pockethle run game.cab` produces visible output
         /// out of the box. Pass a smaller value for fast smoke
         /// tests, or `0` for no upper bound.
-        #[arg(long, default_value_t = 2_000_000)]
+        #[arg(long, default_value_t = 50_000_000)]
         max_slices: u64,
         #[arg(long, default_value_t = 1_000_000)]
         instructions_per_slice: u64,
@@ -602,13 +602,14 @@ mod display_window {
         window: Window,
         buffer: Vec<u32>,
         last_frame: u64,
+        ticks_since_poll: u64,
     }
 
     impl DisplayHook {
         pub fn new() -> Result<Self> {
             let w = pocket_core::kernel::FB_WIDTH as usize;
             let h = pocket_core::kernel::FB_HEIGHT as usize;
-            let mut window = Window::new(
+            let window = Window::new(
                 "PocketHLE",
                 w,
                 h,
@@ -619,19 +620,28 @@ mod display_window {
                 },
             )
             .context("opening minifb window")?;
-            window.set_target_fps(60);
+            // No `set_target_fps`: minifb's FPS cap blocks every
+            // `update_with_buffer` call to ~16 ms, but `on_frame`
+            // is invoked *per emulator slice*. With the cap on,
+            // the entire run loop gets throttled to ~60 slices/s,
+            // which is several orders of magnitude below what a
+            // real PPC2003 game needs to reach its first WM_PAINT.
+            // Frame pacing comes from the guest's own GAPI flips.
             Ok(Self {
                 window,
                 buffer: vec![0; w * h],
                 last_frame: 0,
+                ticks_since_poll: 0,
             })
         }
     }
 
     impl FrameHook for DisplayHook {
         fn on_frame(&mut self, state: &KernelState) -> FrameAction {
-            if state.framebuffer.frame_counter != self.last_frame {
-                self.last_frame = state.framebuffer.frame_counter;
+            let counter = state.framebuffer.frame_counter;
+            let new_frame = counter != self.last_frame;
+            if new_frame {
+                self.last_frame = counter;
                 let rgba = state.framebuffer.snapshot_rgba8888();
                 for (i, px) in self.buffer.iter_mut().enumerate() {
                     let off = i * 4;
@@ -641,14 +651,25 @@ mod display_window {
                     *px = (r << 16) | (g << 8) | b;
                 }
             }
+            if !self.window.is_open() {
+                return FrameAction::Stop;
+            }
             let w = pocket_core::kernel::FB_WIDTH as usize;
             let h = pocket_core::kernel::FB_HEIGHT as usize;
-            if self.window.is_open() {
+            if new_frame {
                 let _ = self.window.update_with_buffer(&self.buffer, w, h);
-                FrameAction::Continue
+                self.ticks_since_poll = 0;
             } else {
-                FrameAction::Stop
+                // Pump the window event queue every N slices so that
+                // close/resize/move keeps responding even while the
+                // guest is busy in a long compute loop with no flips.
+                self.ticks_since_poll = self.ticks_since_poll.saturating_add(1);
+                if self.ticks_since_poll >= 100_000 {
+                    self.ticks_since_poll = 0;
+                    self.window.update();
+                }
             }
+            FrameAction::Continue
         }
     }
 }
