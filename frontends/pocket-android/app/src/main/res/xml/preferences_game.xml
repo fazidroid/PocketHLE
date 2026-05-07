@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <ListPreference
+        android:key="cpu_backend"
+        android:title="@string/pref_cpu_backend_title"
+        android:entries="@array/cpu_backend_entries"
+        android:entryValues="@array/cpu_backend_values"
+        android:defaultValue="stub" />
+
+    <EditTextPreference
+        android:key="max_slices"
+        android:title="@string/pref_max_slices_title"
+        android:inputType="number"
+        android:defaultValue="1024" />
+
+    <EditTextPreference
+        android:key="instructions_per_slice"
+        android:title="@string/pref_instr_per_slice_title"
+        android:inputType="number"
+        android:defaultValue="1000000" />
+
+    <SwitchPreferenceCompat
+        android:key="halt_on_unimplemented"
+        android:title="@string/pref_halt_unimpl_title"
+        android:summary="@string/pref_halt_unimpl_summary"
+        android:defaultValue="false" />
+</PreferenceScreen>
