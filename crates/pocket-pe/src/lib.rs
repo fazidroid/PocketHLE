@@ -19,6 +19,9 @@ use goblin::pe::PE;
 use indexmap::IndexMap;
 use thiserror::Error;
 
+pub mod resources;
+pub use resources::{collect_resources, ResourceEntry, ResourceKey};
+
 pub mod machine {
     /// Legacy ARM (`IMAGE_FILE_MACHINE_ARM`). Used by Pocket PC 2002 / 2003
     /// and most Windows Mobile 5/6 binaries — typically ARMv4T or ARMv5TE.
@@ -122,6 +125,9 @@ pub struct LoadedImage {
     /// Map from RVA to "DLL name" for every export of this image, if the
     /// PE happens to be a DLL. For executables this is empty.
     pub exports: IndexMap<String, u32>,
+    /// Flat list of `.rsrc` directory entries. Empty if the image
+    /// has no resource section.
+    pub resources: Vec<ResourceEntry>,
 }
 
 impl LoadedImage {
@@ -205,6 +211,7 @@ pub fn load_bytes(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
 
     let imports = collect_imports(bytes, &pe)?;
     let exports = collect_exports(&pe);
+    let resources = collect_resources(bytes, &pe).unwrap_or_default();
 
     Ok(LoadedImage {
         source_path: String::new(),
@@ -216,6 +223,7 @@ pub fn load_bytes(bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         sections,
         imports,
         exports,
+        resources,
     })
 }
 
@@ -367,6 +375,7 @@ mod tests {
             sections: vec![],
             imports: vec![],
             exports: IndexMap::new(),
+            resources: vec![],
         };
         assert_eq!(img.machine_name(), "ARM (legacy)");
         assert_eq!(img.entry_va(), 0x10000);

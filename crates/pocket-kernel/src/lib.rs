@@ -24,9 +24,15 @@ use indexmap::IndexMap;
 use thiserror::Error;
 
 use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Cpu, CpuError, Prot, StopReason};
-use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage};
+use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
+pub mod font;
+pub mod framebuffer;
+pub mod gdi;
 pub mod vfs;
+
+pub use framebuffer::{Framebuffer, FB_BYTES, FB_HEIGHT, FB_WIDTH};
+pub use gdi::{GdiState, Surface};
 
 /// Default base address of the synthetic IAT thunk pool.
 pub const THUNK_REGION_BASE: u32 = 0x7000_0000;
@@ -54,7 +60,12 @@ pub const KERNEL_TRAP_SIZE: u32 = 0x0001_0000;
 /// Base of the guest-side heap region. 16 MiB is plenty for the
 /// little games we target and still leaves headroom for the stack.
 pub const HEAP_BASE: u32 = 0x5000_0000;
-pub const HEAP_SIZE: u32 = 0x0100_0000;
+/// 64 MiB. Real Pocket PC processes only get ~32 MiB of total VA,
+/// but games almost never come close to that — and our handle table
+/// for `CreateDIBSection` etc. lives inside the same heap region,
+/// so we keep it generous so back-to-back DIB allocations don't run
+/// the game into an unmapped page.
+pub const HEAP_SIZE: u32 = 0x0400_0000;
 
 /// "bx lr" in ARM mode (little endian).
 pub const ARM_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
@@ -81,6 +92,11 @@ pub enum DispatchOutcome {
     /// The host has not implemented this API. PocketHLE will log a
     /// loud warning and synthesize a `0` return.
     Unimplemented,
+    /// Reroute control flow into the guest at `pc`, leaving LR/SP and
+    /// argument registers exactly as the handler set them up. Used to
+    /// trampoline into guest WndProc / atexit / signal handlers from
+    /// inside an HLE call (e.g. `DispatchMessageW`).
+    JumpTo(u32),
 }
 
 /// Trait an API layer registers with the kernel. Called every time
@@ -101,6 +117,42 @@ pub trait Dispatcher {
 pub struct KernelState {
     pub heap: Heap,
     pub vfs: vfs::Vfs,
+    /// Software-rendered display the GDI/GAPI handlers paint into.
+    pub framebuffer: Framebuffer,
+    /// Tracked GDI objects (DCs, bitmaps, brushes, pens, fonts).
+    pub gdi: GdiState,
+    /// Flat resource table for `FindResourceW` / `LoadResource`.
+    pub resources: Vec<ResourceEntry>,
+    /// Image base for resource RVA → VA conversion.
+    pub image_base: u32,
+    /// Set the first time `GXBeginDraw` runs. The dispatcher maps the
+    /// framebuffer region into the guest VA space lazily — but that
+    /// requires `&mut dyn Cpu`, which isn't available outside a call,
+    /// so we let the GAPI handlers do it.
+    pub fb_mapped: bool,
+    /// Number of synthetic `WM_PAINT` / `WM_TIMER` messages already
+    /// fed to the guest. Used by `GetMessageW` / `PeekMessageW` to
+    /// terminate the message loop after a configurable number of
+    /// frames, so headless runs don't loop forever.
+    pub synthetic_message_count: u64,
+    /// Maximum synthetic frame messages to inject. `0` means
+    /// unlimited.
+    pub synthetic_message_budget: u64,
+    /// Address of the guest's last-registered window procedure. Set
+    /// by `RegisterClassW`, used by `DispatchMessageW` to trampoline
+    /// into guest-side WM_PAINT / WM_KEYDOWN handlers.
+    pub wnd_proc: u32,
+    /// `nIDEvent` of the timer the guest most recently registered via
+    /// `SetTimer`, or `0` if none. The synthetic message pump uses
+    /// this to inject `WM_TIMER` messages with a wParam the guest
+    /// will recognise.
+    pub synthetic_timer_id: u32,
+    /// `true` once the synthetic message pump has delivered
+    /// `WM_CREATE`. Real Windows fires `WM_CREATE` synchronously
+    /// from `CreateWindowExW`; we instead fire it on the very first
+    /// `GetMessageW` so the guest's `WndProc` runs its window-init
+    /// code (which typically calls `SetTimer`).
+    pub synthetic_create_sent: bool,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -140,6 +192,12 @@ pub struct Heap {
     size: u32,
     /// Sorted by start VA. Each entry is `(start, size)` of free space.
     free: Vec<(u32, u32)>,
+    /// Out-of-band tracker of `(user_ptr -> requested_size)` for every
+    /// outstanding allocation. We keep it host-side so the guest can
+    /// not accidentally corrupt the bookkeeping by writing past its
+    /// own buffer (Pocket PC games do this all the time). It also lets
+    /// `Heap::msize(p)` answer in O(1).
+    live: HashMap<u32, u32>,
 }
 
 const HEAP_HEADER_BYTES: u32 = 8;
@@ -151,6 +209,7 @@ impl Heap {
             base,
             size,
             free: vec![(base, size)],
+            live: HashMap::new(),
         }
     }
 
@@ -177,22 +236,37 @@ impl Heap {
                 } else {
                     self.free[i] = (start + need, sz - need);
                 }
-                return Some(start + HEAP_HEADER_BYTES);
+                let user_ptr = start + HEAP_HEADER_BYTES;
+                self.live.insert(user_ptr, requested);
+                return Some(user_ptr);
             }
         }
         None
     }
 
-    /// Free a previously allocated chunk. The header at `user_ptr - 8`
-    /// stores `(block_start, block_size)`. We trust the caller (the
-    /// guest) — bad frees are logged and ignored.
-    pub fn free(&mut self, user_ptr: u32, recorded_size: u32) {
+    /// Look up the user-requested size of `user_ptr`, or `None` if the
+    /// pointer is not the result of a still-live `Heap::alloc`.
+    pub fn msize(&self, user_ptr: u32) -> Option<u32> {
+        self.live.get(&user_ptr).copied()
+    }
+
+    /// Free a previously allocated chunk. The size is recovered from
+    /// our live-block table; if the caller passes a bogus pointer we
+    /// log and ignore.
+    pub fn free(&mut self, user_ptr: u32) {
+        if user_ptr == 0 {
+            return;
+        }
+        let Some(user_size) = self.live.remove(&user_ptr) else {
+            log::warn!("heap.free: unknown pointer 0x{user_ptr:08x} (double free?)");
+            return;
+        };
         if user_ptr < self.base + HEAP_HEADER_BYTES {
             log::warn!("heap.free: ignoring out-of-range pointer 0x{user_ptr:08x}");
             return;
         }
         let block_start = user_ptr - HEAP_HEADER_BYTES;
-        let block_size = recorded_size + HEAP_HEADER_BYTES;
+        let block_size = Self::align_up(user_size.max(1)) + HEAP_HEADER_BYTES;
         if block_start + block_size > self.base + self.size {
             log::warn!("heap.free: chunk overflows heap; ignoring");
             return;
@@ -307,7 +381,16 @@ impl Process {
             trap_page.extend_from_slice(&ARM_BX_LR);
         }
         cpu.write_mem(KERNEL_TRAP_BASE, &trap_page)?;
+        // Install a halt-on-hit watch on the well-known terminate
+        // syscalls reached via the MS CRT __doexit path. Without
+        // this, the guest's ExitProcess returns through `bx lr`
+        // back into a poisoned LR / popped 0 → bogus null deref.
+        for &exit_va in &[0xF000_F7F8u32, 0xF000_F7FCu32, 0xF000_FFFCu32] {
+            cpu.add_code_hook(exit_va)?;
+        }
 
+        let resources = image.resources.clone();
+        let img_base = image.image_base;
         Ok(Process {
             image,
             thunks,
@@ -317,6 +400,16 @@ impl Process {
             state: KernelState {
                 heap,
                 vfs: vfs::Vfs::new(),
+                framebuffer: Framebuffer::default(),
+                gdi: GdiState::new(),
+                resources,
+                image_base: img_base,
+                fb_mapped: false,
+                synthetic_message_count: 0,
+                synthetic_message_budget: 240,
+                wnd_proc: 0,
+                synthetic_timer_id: 0,
+                synthetic_create_sent: false,
             },
         })
     }
@@ -339,6 +432,30 @@ impl Process {
     }
 }
 
+/// Returned from a [`FrameHook`] to indicate whether emulation
+/// should continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameAction {
+    Continue,
+    Stop,
+}
+
+/// Callback that observes the framebuffer between dispatch slices.
+/// Used by the host-side frontend to display the rendered frame and
+/// pump window events.
+pub trait FrameHook {
+    /// Called between dispatcher slices. The hook receives the
+    /// kernel state — typically the framebuffer — and returns
+    /// whether emulation should keep running.
+    fn on_frame(&mut self, state: &KernelState) -> FrameAction;
+}
+
+impl<F: FnMut(&KernelState) -> FrameAction> FrameHook for F {
+    fn on_frame(&mut self, state: &KernelState) -> FrameAction {
+        self(state)
+    }
+}
+
 /// Drive emulated execution in a loop, dispatching each thunk hit
 /// through `dispatcher` until a [`DispatchOutcome::Halt`] is returned
 /// or the configured instruction budget is exhausted.
@@ -349,13 +466,60 @@ pub fn run_main_loop(
     instruction_budget_per_slice: u64,
     max_slices: u64,
 ) -> Result<(), KernelError> {
-    let mut pc = process.image.entry_va();
+    run_main_loop_with_hook(
+        cpu,
+        process,
+        dispatcher,
+        instruction_budget_per_slice,
+        max_slices,
+        None,
+    )
+}
+
+/// Same as [`run_main_loop`], but also calls `frame_hook` between
+/// each slice so the host-side window can repaint and pump events.
+pub fn run_main_loop_with_hook(
+    cpu: &mut dyn Cpu,
+    process: &mut Process,
+    dispatcher: &mut dyn Dispatcher,
+    instruction_budget_per_slice: u64,
+    max_slices: u64,
+    mut frame_hook: Option<&mut dyn FrameHook>,
+) -> Result<(), KernelError> {
+    let mut pc = match std::env::var("POCKETHLE_OVERRIDE_ENTRY") {
+        Ok(v) => {
+            let parsed = if let Some(stripped) = v.strip_prefix("0x") {
+                u32::from_str_radix(stripped, 16)
+            } else {
+                v.parse::<u32>()
+            }
+            .map_err(|_| KernelError::Loader("invalid POCKETHLE_OVERRIDE_ENTRY".into()))?;
+            log::info!("POCKETHLE_OVERRIDE_ENTRY=0x{parsed:08x}");
+            parsed
+        }
+        Err(_) => process.image.entry_va(),
+    };
     log::info!(
         "entering emulated main: entry=0x{:08x}, stack_top=0x{:08x}",
         pc,
         process.stack_top
     );
     for _slice in 0..max_slices {
+        // PC=0 (or any address in the unmapped null page) means
+        // the guest jumped through a null function pointer or popped
+        // a poisoned LR off the stack. Without an explicit halt,
+        // unicorn's `emu_start` typically returns `Ok(0 instructions)`
+        // and we'd spin forever. Surface it as a real crash with the
+        // CPU dump.
+        if pc < 0x1000 {
+            log::error!(
+                "guest jumped to NULL/low address pc=0x{pc:08x}\n{regs}",
+                regs = dump_regs(cpu),
+            );
+            return Err(KernelError::Loader(format!(
+                "guest jumped to unmapped address 0x{pc:08x}"
+            )));
+        }
         let stop = match cpu.run_until_hook(pc, instruction_budget_per_slice) {
             Ok(s) => s,
             Err(e) => {
@@ -375,35 +539,63 @@ pub fn run_main_loop(
                 continue;
             }
             StopReason::Hook(addr) => {
-                let thunk = {
-                    let t = process.find_thunk(addr).ok_or_else(|| {
-                        KernelError::Dispatch(format!("hook fired at unmapped 0x{addr:08x}"))
-                    })?;
-                    t.clone()
+                let thunk = match process.find_thunk(addr) {
+                    Some(t) => t.clone(),
+                    None => {
+                        // A `--watch` breakpoint or other non-thunk
+                        // code hook was hit. Dump CPU state for the
+                        // diagnostic and HALT — otherwise unicorn
+                        // would re-fire the hook on resume and we'd
+                        // spin forever.
+                        log::warn!("watch hit at 0x{addr:08x}\n{regs}", regs = dump_regs(cpu),);
+                        return Ok(());
+                    }
                 };
                 let outcome = dispatcher.dispatch(cpu, &thunk, &mut process.state)?;
-                let r0_default = match outcome {
+                match outcome {
                     DispatchOutcome::Halt => {
                         log::info!("dispatcher requested halt at {}", thunk.label());
                         return Ok(());
                     }
-                    DispatchOutcome::ReturnedR0(v) => Some((v, None)),
-                    DispatchOutcome::ReturnedR0R1(a, b) => Some((a, Some(b))),
-                    DispatchOutcome::Unimplemented => Some((0, None)),
-                };
-                if let Some((v, maybe_hi)) = r0_default {
-                    cpu.write_reg(ArmReg::R0, v)?;
-                    if let Some(hi) = maybe_hi {
-                        cpu.write_reg(ArmReg::R1, hi)?;
+                    DispatchOutcome::ReturnedR0(v) => {
+                        cpu.write_reg(ArmReg::R0, v)?;
+                        let lr = cpu.read_reg(ArmReg::Lr)?;
+                        pc = lr & !1;
+                    }
+                    DispatchOutcome::ReturnedR0R1(a, b) => {
+                        cpu.write_reg(ArmReg::R0, a)?;
+                        cpu.write_reg(ArmReg::R1, b)?;
+                        let lr = cpu.read_reg(ArmReg::Lr)?;
+                        pc = lr & !1;
+                    }
+                    DispatchOutcome::Unimplemented => {
+                        cpu.write_reg(ArmReg::R0, 0)?;
+                        let lr = cpu.read_reg(ArmReg::Lr)?;
+                        pc = lr & !1;
+                    }
+                    DispatchOutcome::JumpTo(target) => {
+                        // Trampoline into a guest function — `target` is
+                        // the new PC, the handler is responsible for
+                        // setting LR / R0..R3 / SP appropriately.
+                        pc = target & !1;
                     }
                 }
-                let lr = cpu.read_reg(ArmReg::Lr)?;
-                pc = lr & !1; // strip Thumb bit
             }
             StopReason::Requested | StopReason::OutOfBounds => return Ok(()),
         }
+        if let Some(hook) = frame_hook.as_deref_mut() {
+            if hook.on_frame(&process.state) == FrameAction::Stop {
+                log::info!("frame hook requested stop");
+                return Ok(());
+            }
+        }
     }
-    log::warn!("main loop hit max_slices={max_slices}; exiting");
+    let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(0);
+    log::warn!(
+        "main loop hit max_slices={max_slices}; exiting at pc=0x{pc_now:08x}\n{regs}{mem}",
+        regs = dump_regs(cpu),
+        mem = dump_mem_around(cpu, pc_now, 16),
+    );
     Ok(())
 }
 
@@ -421,8 +613,10 @@ mod tests {
         let b = h.alloc(128).unwrap();
         assert!(b > a);
         assert!(h.free_bytes() < initial_free);
-        h.free(a, 64);
-        h.free(b, 128);
+        assert_eq!(h.msize(a), Some(64));
+        assert_eq!(h.msize(b), Some(128));
+        h.free(a);
+        h.free(b);
         // After freeing both, the heap should be fully coalesced.
         assert_eq!(h.free_bytes(), initial_free);
     }
@@ -462,6 +656,7 @@ mod tests {
             }],
             imports: vec![],
             exports: IndexMap::new(),
+            resources: vec![],
         };
         let mut cpu = StubCpu::new();
         let p = Process::map_into(img, &mut cpu, &|_, _| None).unwrap();

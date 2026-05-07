@@ -22,14 +22,20 @@
 //! reaches `WinMain`.
 
 use pocket_cpu::regs::ArmReg;
+use pocket_kernel::framebuffer::{colorref_to_rgb565, FB_HEIGHT, FB_WIDTH};
+use pocket_kernel::gdi::{
+    Surface, GDI_SCREEN_DC, STOCK_BLACK_BRUSH, STOCK_BLACK_PEN, STOCK_NULL_BRUSH, STOCK_NULL_PEN,
+    STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
+};
 use pocket_kernel::{DispatchOutcome, KernelError};
+use pocket_pe::ResourceKey;
 
 use crate::{CallCtx, WinCeDispatcher};
 
 const FAKE_MODULE_HANDLE: u32 = 0x1000_0000;
 const FAKE_HWND: u32 = 0xDEAD_0001;
-const FAKE_GDI_BASE: u32 = 0xDEAD_1000;
 const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
+const PAINTSTRUCT_BYTES: u32 = 32;
 
 pub fn register(d: &mut WinCeDispatcher) {
     let dll = "coredll.dll";
@@ -41,9 +47,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "TerminateProcess", exit_process);
     d.register_handler(dll, "GetLastError", zero_returning);
     d.register_handler(dll, "SetLastError", zero_returning);
-    d.register_handler(dll, "GetCommandLineW", null_returning);
+    d.register_handler(dll, "GetCommandLineW", get_command_line_w);
     d.register_handler(dll, "GetModuleHandleW", get_module_handle_w);
-    d.register_handler(dll, "GetModuleFileNameW", zero_returning);
+    d.register_handler(dll, "GetModuleFileNameW", get_module_file_name_w);
     d.register_handler(dll, "GetProcAddress", null_returning);
     d.register_handler(dll, "LoadLibraryW", load_library_w);
     d.register_handler(dll, "FreeLibrary", one_returning);
@@ -53,6 +59,44 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_setjmp", setjmp);
     d.register_handler(dll, "longjmp", longjmp);
     d.register_handler(dll, "_except_handler3", except_handler3);
+
+    // ---- ARMv4 soft-float helpers (no VFP). Names follow the EVC4
+    // convention: `s` = single-precision, `d` = double-precision,
+    // `i` = i32, `u` = u32, `i64` = i64, `u64` = u64.
+    d.register_handler(dll, "__adds", soft_adds);
+    d.register_handler(dll, "__subs", soft_subs);
+    d.register_handler(dll, "__muls", soft_muls);
+    d.register_handler(dll, "__divs", soft_divs);
+    d.register_handler(dll, "__negs", soft_negs);
+    d.register_handler(dll, "__cmps", soft_cmps);
+    d.register_handler(dll, "__eqs", soft_eqs);
+    d.register_handler(dll, "__nes", soft_nes);
+    d.register_handler(dll, "__lts", soft_lts);
+    d.register_handler(dll, "__les", soft_les);
+    d.register_handler(dll, "__gts", soft_gts);
+    d.register_handler(dll, "__ges", soft_ges);
+    d.register_handler(dll, "__itos", soft_itos);
+    d.register_handler(dll, "__utos", soft_utos);
+    d.register_handler(dll, "__stoi", soft_stoi);
+    d.register_handler(dll, "__stou", soft_stou);
+    d.register_handler(dll, "__stod", soft_stod);
+    d.register_handler(dll, "__addd", soft_addd);
+    d.register_handler(dll, "__subd", soft_subd);
+    d.register_handler(dll, "__muld", soft_muld);
+    d.register_handler(dll, "__divd", soft_divd);
+    d.register_handler(dll, "__negd", soft_negd);
+    d.register_handler(dll, "__cmpd", soft_cmpd);
+    d.register_handler(dll, "__eqd", soft_eqd);
+    d.register_handler(dll, "__ned", soft_ned);
+    d.register_handler(dll, "__ltd", soft_ltd);
+    d.register_handler(dll, "__led", soft_led);
+    d.register_handler(dll, "__gtd", soft_gtd);
+    d.register_handler(dll, "__ged", soft_ged);
+    d.register_handler(dll, "__itod", soft_itod);
+    d.register_handler(dll, "__utod", soft_utod);
+    d.register_handler(dll, "__dtoi", soft_dtoi);
+    d.register_handler(dll, "__dtou", soft_dtou);
+    d.register_handler(dll, "__dtos", soft_dtos);
 
     // ---- Memory / string CRT ----
     d.register_handler(dll, "memset", memset);
@@ -80,8 +124,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "wcschr", wcschr);
     d.register_handler(dll, "wcsrchr", wcsrchr);
     d.register_handler(dll, "wcsstr", wcsstr);
-    d.register_handler(dll, "swprintf", zero_returning);
-    d.register_handler(dll, "wsprintfW", zero_returning);
+    d.register_handler(dll, "swprintf", swprintf);
+    d.register_handler(dll, "wsprintfW", swprintf);
+    d.register_handler(dll, "sprintf", sprintf);
+    d.register_handler(dll, "wsprintfA", sprintf);
+    d.register_handler(dll, "wcstombs", wcstombs);
+    d.register_handler(dll, "mbstowcs", mbstowcs);
 
     // ---- File I/O backed by the VFS ----
     d.register_handler(dll, "CreateFileW", create_file_w);
@@ -95,13 +143,44 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "FindClose", one_returning);
     d.register_handler(dll, "DeleteFileW", one_returning);
     d.register_handler(dll, "SetFileAttributesW", one_returning);
-    d.register_handler(dll, "GetFileAttributesW", zero_returning);
+    d.register_handler(dll, "GetFileAttributesW", get_file_attributes_w);
     d.register_handler(dll, "CreateDirectoryW", one_returning);
+
+    // ---- C-runtime style file I/O on top of the same VFS ----
+    d.register_handler(dll, "fopen", crt_fopen);
+    d.register_handler(dll, "_wfopen", crt_wfopen);
+    d.register_handler(dll, "fclose", crt_fclose);
+    d.register_handler(dll, "fread", crt_fread);
+    d.register_handler(dll, "fwrite", crt_fwrite);
+    d.register_handler(dll, "fseek", crt_fseek);
+    d.register_handler(dll, "ftell", crt_ftell);
+    d.register_handler(dll, "feof", crt_feof);
+    d.register_handler(dll, "fflush", one_returning);
+    d.register_handler(dll, "fgetc", crt_fgetc);
+    d.register_handler(dll, "fputc", crt_fputc);
+    d.register_handler(dll, "fgets", crt_fgets);
+    d.register_handler(dll, "fputs", crt_fputs);
+    d.register_handler(dll, "rewind", crt_rewind);
+
+    // ---- ARM signed/unsigned division helpers (MS compiler).
+    // Microsoft's `__rt_*div` family has `r0=divisor, r1=dividend`
+    // (flipped from the AEABI helpers). Result is in r0, remainder
+    // in r1. (See LLVM commit `rL283383` for the canonical
+    // documentation of this quirk.)
+    d.register_handler(dll, "__rt_sdiv", rt_sdiv);
+    d.register_handler(dll, "__rt_udiv", rt_udiv);
+    d.register_handler(dll, "__rt_sdiv64", rt_sdiv64);
+    d.register_handler(dll, "__rt_udiv64", rt_udiv64);
+    d.register_handler(dll, "__rt_srsh", rt_srsh);
+    d.register_handler(dll, "__rt_sdiv10", rt_sdiv10);
+    d.register_handler(dll, "__rt_udiv10", rt_udiv10);
 
     // ---- Heap ----
     d.register_handler(dll, "LocalAlloc", local_alloc);
     d.register_handler(dll, "LocalFree", local_free);
     d.register_handler(dll, "LocalReAlloc", local_realloc);
+    d.register_handler(dll, "LocalSize", local_size);
+    d.register_handler(dll, "_msize", local_size);
     d.register_handler(dll, "HeapCreate", heap_create);
     d.register_handler(dll, "HeapDestroy", one_returning);
     d.register_handler(dll, "HeapAlloc", heap_alloc);
@@ -116,54 +195,166 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "realloc", realloc);
     d.register_handler(dll, "_new", malloc);
     d.register_handler(dll, "_delete", free);
+    // MSVC-mangled C++ scalar new/delete:
+    //   ??2@YAPAXI@Z  = void* operator new(unsigned int)
+    //   ??3@YAXPAX@Z  = void  operator delete(void*)
+    //   ??_U@YAPAXI@Z = void* operator new[](unsigned int)
+    //   ??_V@YAXPAX@Z = void  operator delete[](void*)
+    d.register_handler(dll, "??2@YAPAXI@Z", malloc);
+    d.register_handler(dll, "??3@YAXPAX@Z", free);
+    d.register_handler(dll, "??_U@YAPAXI@Z", malloc);
+    d.register_handler(dll, "??_V@YAXPAX@Z", free);
 
     // ---- Resources ----
-    d.register_handler(dll, "FindResourceW", null_returning);
-    d.register_handler(dll, "LoadResource", null_returning);
-    d.register_handler(dll, "LockResource", null_returning);
+    d.register_handler(dll, "FindResourceW", find_resource_w);
+    d.register_handler(dll, "LoadResource", load_resource);
+    d.register_handler(dll, "LockResource", lock_resource);
+    d.register_handler(dll, "SizeofResource", sizeof_resource);
+    d.register_handler(dll, "LoadBitmapW", load_bitmap_w);
+    d.register_handler(dll, "GetObjectW", get_object_w);
+    d.register_handler(dll, "LoadStringW", load_string_w);
 
     // ---- Window / message stubs ----
     d.register_handler(dll, "RegisterClassW", register_class_w);
     d.register_handler(dll, "CreateWindowExW", create_window_ex_w);
+    d.register_handler(dll, "SetWindowLongW", set_window_long_w);
+    d.register_handler(dll, "SetWindowLongA", set_window_long_w);
+    d.register_handler(dll, "GetWindowLongW", get_window_long_w);
+    d.register_handler(dll, "GetWindowLongA", get_window_long_w);
+    d.register_handler(dll, "GetVersionExW", get_version_ex_w);
+    d.register_handler(dll, "GetVersionExA", get_version_ex_w);
+    d.register_handler(dll, "DestroyWindow", destroy_window);
+    d.register_handler(dll, "FindWindowW", find_window_w);
+    d.register_handler(dll, "GetVersion", get_version);
     d.register_handler(dll, "ShowWindow", one_returning);
     d.register_handler(dll, "UpdateWindow", one_returning);
+    d.register_handler(dll, "MoveWindow", one_returning);
+    d.register_handler(dll, "SetForegroundWindow", one_returning);
+    d.register_handler(dll, "SetFocus", one_returning);
+    d.register_handler(dll, "SetWindowPos", one_returning);
     d.register_handler(dll, "DefWindowProcW", zero_returning);
-    d.register_handler(dll, "DispatchMessageW", zero_returning);
+    d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
-    d.register_handler(dll, "PeekMessageW", zero_returning);
+    d.register_handler(dll, "PeekMessageW", peek_message_w);
     d.register_handler(dll, "TranslateMessage", one_returning);
     d.register_handler(dll, "PostQuitMessage", post_quit_message);
     d.register_handler(dll, "PostMessageW", one_returning);
+    d.register_handler(
+        dll,
+        "MsgWaitForMultipleObjectsEx",
+        msg_wait_for_multiple_objects,
+    );
+    d.register_handler(
+        dll,
+        "MsgWaitForMultipleObjects",
+        msg_wait_for_multiple_objects,
+    );
+    d.register_handler(dll, "EnableWindow", one_returning);
+    d.register_handler(dll, "MessageBeep", one_returning);
+    d.register_handler(dll, "waveOutGetVolume", zero_returning);
+    d.register_handler(dll, "waveOutSetVolume", zero_returning);
+    d.register_handler(dll, "waveOutOpen", zero_returning);
+    d.register_handler(dll, "waveOutClose", zero_returning);
+    d.register_handler(dll, "waveOutWrite", zero_returning);
+    d.register_handler(dll, "waveOutReset", zero_returning);
+    d.register_handler(dll, "waveOutPrepareHeader", zero_returning);
+    d.register_handler(dll, "waveOutUnprepareHeader", zero_returning);
+    d.register_handler(dll, "waveOutGetNumDevs", zero_returning);
+    d.register_handler(dll, "waveOutGetDevCapsW", zero_returning);
+    d.register_handler(dll, "setjmp", setjmp);
+    d.register_handler(dll, "longjmp", zero_returning);
     d.register_handler(dll, "SendMessageW", zero_returning);
-    d.register_handler(dll, "InvalidateRect", one_returning);
+    d.register_handler(dll, "InvalidateRect", invalidate_rect);
+    d.register_handler(dll, "ValidateRect", one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
+    d.register_handler(dll, "GetClientRect", get_client_rect);
+    d.register_handler(dll, "GetWindowRect", get_window_rect);
+    d.register_handler(dll, "ClientToScreen", one_returning);
+    d.register_handler(dll, "ScreenToClient", one_returning);
+    d.register_handler(dll, "LoadIconW", load_icon_w);
+    d.register_handler(dll, "LoadCursorW", load_icon_w);
+    d.register_handler(dll, "LoadAcceleratorsW", load_accelerators_w);
+    d.register_handler(dll, "TranslateAcceleratorW", zero_returning);
+    d.register_handler(dll, "DialogBoxIndirectParamW", dialog_box_indirect_param_w);
+    d.register_handler(dll, "DialogBoxParamW", dialog_box_indirect_param_w);
+    d.register_handler(dll, "EndDialog", one_returning);
+    d.register_handler(dll, "MessageBoxW", message_box_w);
+    d.register_handler(dll, "SetTimer", set_timer);
+    d.register_handler(dll, "KillTimer", one_returning);
 
-    // ---- GDI ----
-    for f in [
-        "BeginPaint",
-        "EndPaint",
-        "GetDC",
-        "ReleaseDC",
-        "CreateCompatibleDC",
-        "CreateCompatibleBitmap",
-        "CreateSolidBrush",
-        "CreatePen",
-        "CreateFontIndirectW",
-        "GetStockObject",
-        "SelectObject",
-    ] {
-        d.register_handler(dll, f, fake_gdi_handle);
-    }
-    d.register_handler(dll, "DeleteObject", one_returning);
-    d.register_handler(dll, "DeleteDC", one_returning);
-    d.register_handler(dll, "BitBlt", one_returning);
-    d.register_handler(dll, "Rectangle", one_returning);
-    d.register_handler(dll, "FillRect", one_returning);
-    d.register_handler(dll, "SetBkMode", zero_returning);
-    d.register_handler(dll, "SetBkColor", zero_returning);
-    d.register_handler(dll, "SetTextColor", zero_returning);
-    d.register_handler(dll, "TextOutW", one_returning);
-    d.register_handler(dll, "ExtTextOutW", one_returning);
+    // ---- GDI (real, framebuffer-backed) ----
+    d.register_handler(dll, "GetDC", get_dc);
+    d.register_handler(dll, "ReleaseDC", one_returning);
+    d.register_handler(dll, "BeginPaint", begin_paint);
+    d.register_handler(dll, "EndPaint", end_paint);
+    d.register_handler(dll, "CreateCompatibleDC", create_compatible_dc);
+    d.register_handler(dll, "CreateCompatibleBitmap", create_compatible_bitmap);
+    d.register_handler(dll, "CreateDIBSection", create_dib_section);
+    d.register_handler(dll, "CreateBitmap", create_bitmap);
+    d.register_handler(dll, "CreateSolidBrush", create_solid_brush);
+    d.register_handler(dll, "CreatePen", create_pen);
+    d.register_handler(dll, "CreateFontIndirectW", create_font_indirect);
+    d.register_handler(dll, "GetStockObject", get_stock_object);
+    d.register_handler(dll, "SelectObject", select_object);
+    d.register_handler(dll, "DeleteObject", delete_object);
+    d.register_handler(dll, "DeleteDC", delete_object);
+    d.register_handler(dll, "BitBlt", bit_blt);
+    d.register_handler(dll, "StretchBlt", stretch_blt);
+    d.register_handler(dll, "PatBlt", pat_blt);
+    d.register_handler(dll, "Rectangle", rectangle);
+    d.register_handler(dll, "Ellipse", ellipse);
+    d.register_handler(dll, "RoundRect", rectangle);
+    d.register_handler(dll, "Polygon", one_returning);
+    d.register_handler(dll, "Polyline", one_returning);
+    d.register_handler(dll, "MoveToEx", one_returning);
+    d.register_handler(dll, "LineTo", one_returning);
+    d.register_handler(dll, "FillRect", fill_rect);
+    d.register_handler(dll, "FrameRect", fill_rect);
+    d.register_handler(dll, "DrawTextW", draw_text_w);
+    d.register_handler(dll, "DrawEdge", one_returning);
+    d.register_handler(dll, "DrawFocusRect", one_returning);
+    d.register_handler(dll, "SetBkMode", set_bk_mode);
+    d.register_handler(dll, "SetBkColor", set_bk_color);
+    d.register_handler(dll, "SetTextColor", set_text_color);
+    d.register_handler(dll, "TextOutW", text_out_w);
+    d.register_handler(dll, "ExtTextOutW", ext_text_out_w);
+    d.register_handler(dll, "ExtEscape", ext_escape);
+    d.register_handler(dll, "Escape", ext_escape);
+    d.register_handler(dll, "GetDeviceCaps", get_device_caps);
+    d.register_handler(dll, "SetROP2", one_returning);
+    d.register_handler(dll, "SetStretchBltMode", one_returning);
+    d.register_handler(dll, "GdiSetBatchLimit", one_returning);
+    d.register_handler(dll, "GdiFlush", one_returning);
+
+    // ---- Random / time ----
+    d.register_handler(dll, "rand", rand_handler);
+    d.register_handler(dll, "srand", srand_handler);
+    d.register_handler(dll, "time", time_handler);
+
+    // ---- Misc kernel/IPC stubs ----
+    d.register_handler(dll, "KernelIoControl", zero_returning);
+    d.register_handler(dll, "SystemParametersInfoW", one_returning);
+    d.register_handler(dll, "GetSystemPowerStatusEx", one_returning);
+    d.register_handler(dll, "EventModify", one_returning);
+    d.register_handler(dll, "CreateEventW", create_event_w);
+    d.register_handler(dll, "SetEvent", one_returning);
+    d.register_handler(dll, "ResetEvent", one_returning);
+    d.register_handler(dll, "WaitForSingleObject", zero_returning);
+    d.register_handler(dll, "InitializeCriticalSection", zero_returning);
+    d.register_handler(dll, "DeleteCriticalSection", zero_returning);
+    d.register_handler(dll, "EnterCriticalSection", zero_returning);
+    d.register_handler(dll, "LeaveCriticalSection", zero_returning);
+    d.register_handler(dll, "GetCurrentThreadId", get_current_thread_id);
+    d.register_handler(dll, "GetCurrentProcessId", get_current_thread_id);
+    d.register_handler(dll, "GetCurrentProcess", get_current_thread_id);
+    d.register_handler(dll, "CreateThread", create_thread);
+
+    // ---- Registry stubs ----
+    d.register_handler(dll, "RegOpenKeyExW", invalid_handle_returning);
+    d.register_handler(dll, "RegCreateKeyExW", invalid_handle_returning);
+    d.register_handler(dll, "RegQueryValueExW", zero_returning);
+    d.register_handler(dll, "RegSetValueExW", zero_returning);
+    d.register_handler(dll, "RegCloseKey", zero_returning);
 }
 
 // ---------- generic helpers ----------
@@ -182,16 +373,6 @@ fn null_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 
 fn invalid_handle_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(INVALID_HANDLE_VALUE))
-}
-
-/// Returns a synthetic non-null GDI handle. We allocate sequential
-/// values from `FAKE_GDI_BASE` so that the trace log makes it obvious
-/// when the game hands the same handle back to us.
-fn fake_gdi_handle(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static NEXT: AtomicU32 = AtomicU32::new(FAKE_GDI_BASE);
-    let h = NEXT.fetch_add(1, Ordering::Relaxed);
-    Ok(DispatchOutcome::ReturnedR0(h))
 }
 
 // ---------- process / time ----------
@@ -227,6 +408,61 @@ fn get_module_handle_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
 
 fn load_library_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(FAKE_MODULE_HANDLE))
+}
+
+/// Synthetic guest path of the running executable. This matches the
+/// usual Pocket PC install location and contains a backslash so that
+/// `wcsrchr(path, L'\\')` returns a non-null pointer.
+const FAKE_EXE_PATH: &str = "\\Program Files\\Game\\Game.exe";
+
+fn write_wide_str(
+    cpu: &mut dyn pocket_cpu::Cpu,
+    dst: u32,
+    cap: u32,
+    s: &str,
+) -> Result<u32, KernelError> {
+    if dst == 0 || cap == 0 {
+        return Ok(0);
+    }
+    let mut out = Vec::with_capacity(s.len() * 2 + 2);
+    let copy_n = (cap as usize).saturating_sub(1);
+    for (i, ch) in s.encode_utf16().enumerate() {
+        if i >= copy_n {
+            break;
+        }
+        out.extend_from_slice(&ch.to_le_bytes());
+    }
+    out.extend_from_slice(&0u16.to_le_bytes());
+    cpu.write_mem(dst, &out)?;
+    Ok((out.len() as u32 / 2).saturating_sub(1))
+}
+
+fn get_module_file_name_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // GetModuleFileNameW(HINSTANCE hModule, LPWSTR lpFilename, DWORD nSize) -> DWORD
+    let _h = ctx.arg_u32(0)?;
+    let dst = ctx.arg_u32(1)?;
+    let cap = ctx.arg_u32(2)?;
+    let written = write_wide_str(ctx.cpu, dst, cap, FAKE_EXE_PATH)?;
+    Ok(DispatchOutcome::ReturnedR0(written))
+}
+
+fn get_command_line_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // We allocate a static guest-readable string the first time we're
+    // called and return its VA on every subsequent call.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CACHED: AtomicU32 = AtomicU32::new(0);
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Ok(DispatchOutcome::ReturnedR0(cached));
+    }
+    let bytes_needed = (FAKE_EXE_PATH.encode_utf16().count() as u32 + 1) * 2;
+    let va = match ctx.kernel.heap.alloc(bytes_needed) {
+        Some(p) => p,
+        None => return Ok(DispatchOutcome::ReturnedR0(0)),
+    };
+    write_wide_str(ctx.cpu, va, bytes_needed / 2, FAKE_EXE_PATH)?;
+    CACHED.store(va, Ordering::Relaxed);
+    Ok(DispatchOutcome::ReturnedR0(va))
 }
 
 // ---------- CRT prologue helpers ----------
@@ -290,7 +526,21 @@ fn longjmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         ArmReg::Sp,
         ArmReg::Lr,
     ];
-    let blob = ctx.cpu.read_mem(buf, regs_to_restore.len() as u32 * 4)?;
+    // A NULL or otherwise unmapped jmp_buf typically means the C++
+    // SEH unwinder is asking for cleanup without a matching setjmp.
+    // Treat it as a no-op (`R0=value`, resume from LR) and let the
+    // caller continue. If that path turns out to be a fatal abort
+    // signal in some game we can revisit.
+    let blob = match ctx.cpu.read_mem(buf, regs_to_restore.len() as u32 * 4) {
+        Ok(b) => b,
+        Err(_) => {
+            log::debug!(
+                "longjmp(buf=0x{buf:08x}, val={val}) with unmapped jmp_buf; treating as no-op"
+            );
+            let ret = if val == 0 { 1 } else { val };
+            return Ok(DispatchOutcome::ReturnedR0(ret));
+        }
+    };
     for (i, r) in regs_to_restore.iter().enumerate() {
         let off = i * 4;
         let v = u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]);
@@ -310,6 +560,194 @@ fn longjmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// exception — `ExceptionContinueSearch == 1`.
 fn except_handler3(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+// ---------- ARMv4 soft-float helpers ----------
+//
+// AAPCS calling convention without VFP:
+//   - single-precision floats are bit-cast to u32 and passed/returned in
+//     integer registers (r0 for first arg, r1 for second, ...).
+//   - double-precision floats are bit-cast to u64 and passed in
+//     consecutive register pairs r0:r1 (low:high) and r2:r3.
+//   - 64-bit returns go in r0:r1.
+//
+// The actual symbol names come from the EVC4 / Microsoft Visual C
+// runtime for ARM Pocket PC. `s` suffix = single-precision, `d` = double.
+
+fn read_f32(ctx: &mut CallCtx<'_>, idx: u8) -> Result<f32, KernelError> {
+    Ok(f32::from_bits(ctx.arg_u32(idx)?))
+}
+
+fn read_f64(ctx: &mut CallCtx<'_>, idx_lo: u8) -> Result<f64, KernelError> {
+    let lo = ctx.arg_u32(idx_lo)? as u64;
+    let hi = ctx.arg_u32(idx_lo + 1)? as u64;
+    Ok(f64::from_bits((hi << 32) | lo))
+}
+
+fn ret_f32(v: f32) -> DispatchOutcome {
+    DispatchOutcome::ReturnedR0(v.to_bits())
+}
+
+fn ret_f64(v: f64) -> DispatchOutcome {
+    let bits = v.to_bits();
+    DispatchOutcome::ReturnedR0R1(bits as u32, (bits >> 32) as u32)
+}
+
+fn soft_adds(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f32(ctx, 0)? + read_f32(ctx, 1)?))
+}
+fn soft_subs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f32(ctx, 0)? - read_f32(ctx, 1)?))
+}
+fn soft_muls(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f32(ctx, 0)? * read_f32(ctx, 1)?))
+}
+fn soft_divs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f32(ctx, 0)? / read_f32(ctx, 1)?))
+}
+fn soft_negs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(-read_f32(ctx, 0)?))
+}
+fn soft_cmps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let a = read_f32(ctx, 0)?;
+    let b = read_f32(ctx, 1)?;
+    let r: i32 = if a < b {
+        -1
+    } else if a > b {
+        1
+    } else {
+        0
+    };
+    Ok(DispatchOutcome::ReturnedR0(r as u32))
+}
+fn soft_eqs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? == read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_nes(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? != read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_lts(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? < read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_les(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? <= read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_gts(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? > read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_ges(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f32(ctx, 0)? >= read_f32(ctx, 1)?) as u32,
+    ))
+}
+fn soft_itos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(ctx.arg_u32(0)? as i32 as f32))
+}
+fn soft_utos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(ctx.arg_u32(0)? as f32))
+}
+fn soft_stoi(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(read_f32(ctx, 0)? as i32 as u32))
+}
+fn soft_stou(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let v = read_f32(ctx, 0)?;
+    let r = if v < 0.0 || !v.is_finite() {
+        0
+    } else {
+        v as u32
+    };
+    Ok(DispatchOutcome::ReturnedR0(r))
+}
+fn soft_stod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_f32(ctx, 0)? as f64))
+}
+fn soft_addd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_f64(ctx, 0)? + read_f64(ctx, 2)?))
+}
+fn soft_subd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_f64(ctx, 0)? - read_f64(ctx, 2)?))
+}
+fn soft_muld(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_f64(ctx, 0)? * read_f64(ctx, 2)?))
+}
+fn soft_divd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(read_f64(ctx, 0)? / read_f64(ctx, 2)?))
+}
+fn soft_negd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(-read_f64(ctx, 0)?))
+}
+fn soft_cmpd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let a = read_f64(ctx, 0)?;
+    let b = read_f64(ctx, 2)?;
+    let r: i32 = if a < b {
+        -1
+    } else if a > b {
+        1
+    } else {
+        0
+    };
+    Ok(DispatchOutcome::ReturnedR0(r as u32))
+}
+fn soft_eqd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? == read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_ned(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? != read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_ltd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? < read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_led(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? <= read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_gtd(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? > read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_ged(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(
+        (read_f64(ctx, 0)? >= read_f64(ctx, 2)?) as u32,
+    ))
+}
+fn soft_itod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(ctx.arg_u32(0)? as i32 as f64))
+}
+fn soft_utod(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(ctx.arg_u32(0)? as f64))
+}
+fn soft_dtoi(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(read_f64(ctx, 0)? as i32 as u32))
+}
+fn soft_dtou(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let v = read_f64(ctx, 0)?;
+    let r = if v < 0.0 || !v.is_finite() {
+        0
+    } else {
+        v as u32
+    };
+    Ok(DispatchOutcome::ReturnedR0(r))
+}
+fn soft_dtos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f64(ctx, 0)? as f32))
 }
 
 // ---------- mem / string CRT ----------
@@ -601,6 +1039,217 @@ fn wcsstr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
 }
 
+/// `size_t wcstombs(char *dst, const wchar_t *src, size_t n)` —
+/// truncate-on-overflow narrow conversion. Lossy: any code unit
+/// outside `0x00..=0xff` becomes `'?'`.
+fn wcstombs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    let n = ctx.arg_u32(2)?;
+    let s = read_wstr(ctx, src, 0x10000)?;
+    let mut out: Vec<u8> = s
+        .iter()
+        .map(|&c| if c < 0x100 { c as u8 } else { b'?' })
+        .collect();
+    let written = if dst != 0 && n > 0 {
+        let take = (n as usize).min(out.len());
+        ctx.cpu.write_mem(dst, &out[..take])?;
+        if take < n as usize {
+            ctx.cpu.write_mem(dst + take as u32, &[0u8])?;
+        }
+        take as u32
+    } else {
+        out.len() as u32
+    };
+    let _ = &mut out;
+    Ok(DispatchOutcome::ReturnedR0(written))
+}
+
+/// `size_t mbstowcs(wchar_t *dst, const char *src, size_t n)`.
+fn mbstowcs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    let n = ctx.arg_u32(2)?;
+    let s = read_cstr(ctx, src, 0x10000)?;
+    let wide: Vec<u16> = s.iter().map(|&b| b as u16).collect();
+    let written = if dst != 0 && n > 0 {
+        let take = (n as usize).min(wide.len());
+        let bytes = wide_to_bytes(&wide[..take]);
+        ctx.cpu.write_mem(dst, &bytes)?;
+        if take < n as usize {
+            ctx.cpu.write_mem(dst + (take as u32) * 2, &[0u8, 0u8])?;
+        }
+        take as u32
+    } else {
+        wide.len() as u32
+    };
+    Ok(DispatchOutcome::ReturnedR0(written))
+}
+
+/// Read a u32 argument from the variadic tail (slot index `idx`,
+/// where 0 is the first variadic argument). The first 4 args go in
+/// r0..r3, the rest are on the stack.
+fn read_vararg_u32(ctx: &mut CallCtx<'_>, idx: u32) -> Result<u32, KernelError> {
+    if idx < 4 {
+        ctx.arg_u32(idx as u8)
+    } else {
+        let sp = ctx.cpu.read_reg(pocket_cpu::regs::ArmReg::Sp)?;
+        let off = (idx - 4) * 4;
+        let bytes = ctx.cpu.read_mem(sp + off, 4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+}
+
+/// Render a printf-style format string by walking it character-by-
+/// character and pulling arguments from the variadic tail. Supports
+/// the conversions Pocket PC games actually use: `%d` `%i` `%u`
+/// `%x` `%X` `%c` `%s` `%S` `%ls` `%p`, plus an `l` length modifier
+/// and a basic width/zero-padding spec.
+fn render_printf(
+    ctx: &mut CallCtx<'_>,
+    fmt: &str,
+    fmt_is_wide: bool,
+    arg_start: u32,
+) -> Result<String, KernelError> {
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    let mut next_arg = arg_start;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        // Flags and width.
+        let mut zero_pad = false;
+        let mut width: usize = 0;
+        let mut long = false;
+        loop {
+            match chars.peek().copied() {
+                Some('0') if width == 0 => {
+                    zero_pad = true;
+                    chars.next();
+                }
+                Some(d) if d.is_ascii_digit() => {
+                    width = width * 10 + (d as usize - '0' as usize);
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        if matches!(chars.peek(), Some('l') | Some('L')) {
+            long = true;
+            chars.next();
+        }
+        let conv = match chars.next() {
+            Some(c) => c,
+            None => break,
+        };
+        let mut piece = String::new();
+        match conv {
+            '%' => piece.push('%'),
+            'd' | 'i' => {
+                let v = read_vararg_u32(ctx, next_arg)? as i32;
+                next_arg += 1;
+                piece = v.to_string();
+            }
+            'u' => {
+                let v = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                piece = v.to_string();
+            }
+            'x' => {
+                let v = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                piece = format!("{v:x}");
+            }
+            'X' => {
+                let v = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                piece = format!("{v:X}");
+            }
+            'p' => {
+                let v = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                piece = format!("{v:08X}");
+            }
+            'c' => {
+                let v = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                if let Some(ch) = char::from_u32(v & 0xff) {
+                    piece.push(ch);
+                }
+            }
+            's' => {
+                let p = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                let pulls_wide = if fmt_is_wide { !long } else { long };
+                if p == 0 {
+                    piece.push_str("(null)");
+                } else if pulls_wide {
+                    let w = read_wstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf16_lossy(&w);
+                } else {
+                    let b = read_cstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf8_lossy(&b).into_owned();
+                }
+            }
+            'S' => {
+                let p = read_vararg_u32(ctx, next_arg)?;
+                next_arg += 1;
+                let pulls_wide = !fmt_is_wide;
+                if p == 0 {
+                    piece.push_str("(null)");
+                } else if pulls_wide {
+                    let w = read_wstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf16_lossy(&w);
+                } else {
+                    let b = read_cstr(ctx, p, 0x10000)?;
+                    piece = String::from_utf8_lossy(&b).into_owned();
+                }
+            }
+            other => {
+                piece.push('%');
+                piece.push(other);
+            }
+        }
+        if width > piece.chars().count() {
+            let pad = width - piece.chars().count();
+            let ch = if zero_pad { '0' } else { ' ' };
+            for _ in 0..pad {
+                out.push(ch);
+            }
+        }
+        out.push_str(&piece);
+    }
+    Ok(out)
+}
+
+/// `int sprintf(char *dst, const char *fmt, ...)`.
+fn sprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    let fmt = read_cstr_string(ctx, fmt_p, 0x4000)?;
+    let s = render_printf(ctx, &fmt, false, 2)?;
+    let mut bytes = s.into_bytes();
+    bytes.push(0);
+    ctx.cpu.write_mem(dst, &bytes)?;
+    Ok(DispatchOutcome::ReturnedR0(bytes.len() as u32 - 1))
+}
+
+/// `int swprintf(wchar_t *dst, const wchar_t *fmt, ...)` and
+/// `int wsprintfW(LPWSTR dst, LPCWSTR fmt, ...)` (same shape).
+fn swprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    let fmt_w = read_wstr(ctx, fmt_p, 0x4000)?;
+    let fmt = String::from_utf16_lossy(&fmt_w);
+    let s = render_printf(ctx, &fmt, true, 2)?;
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0u16)).collect();
+    let bytes = wide_to_bytes(&wide);
+    ctx.cpu.write_mem(dst, &bytes)?;
+    Ok(DispatchOutcome::ReturnedR0(wide.len() as u32 - 1))
+}
+
 fn wide_to_bytes(s: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len() * 2);
     for c in s {
@@ -725,6 +1374,48 @@ fn get_file_size(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(size as u32))
 }
 
+/// `DWORD GetFileAttributesW(LPCWSTR path)` — query the VFS so that
+/// games which probe asset paths before opening them get sensible
+/// answers. Returns `FILE_ATTRIBUTE_NORMAL` (0x80) for regular files
+/// and `FILE_ATTRIBUTE_DIRECTORY` (0x10) for directories. Missing
+/// files / NULL pointers / unmounted prefixes return
+/// `INVALID_FILE_ATTRIBUTES` (0xFFFF_FFFF) just like Windows does.
+fn get_file_attributes_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    let name_p = ctx.arg_u32(0)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(INVALID_FILE_ATTRIBUTES));
+    }
+    let name_w = match read_wstr(ctx, name_p, 260) {
+        Ok(n) => n,
+        Err(_) => return Ok(DispatchOutcome::ReturnedR0(INVALID_FILE_ATTRIBUTES)),
+    };
+    let path = String::from_utf16_lossy(&name_w);
+    let host = match ctx.kernel.vfs.resolve(&path) {
+        Some(p) => p,
+        None => {
+            log::trace!("GetFileAttributesW({path:?}) -> INVALID (no mount)");
+            return Ok(DispatchOutcome::ReturnedR0(INVALID_FILE_ATTRIBUTES));
+        }
+    };
+    let meta = match std::fs::metadata(&host) {
+        Ok(m) => m,
+        Err(_) => {
+            log::trace!("GetFileAttributesW({path:?}) -> INVALID (host miss {host:?})");
+            return Ok(DispatchOutcome::ReturnedR0(INVALID_FILE_ATTRIBUTES));
+        }
+    };
+    let attrs = if meta.is_dir() {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    log::trace!("GetFileAttributesW({path:?}) -> 0x{attrs:08x}");
+    Ok(DispatchOutcome::ReturnedR0(attrs))
+}
+
 /// `DWORD SetFilePointer(HANDLE h, LONG distance, LONG* hi, DWORD whence)`
 fn set_file_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     use pocket_kernel::vfs::SeekKind;
@@ -739,6 +1430,280 @@ fn set_file_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     };
     let pos = ctx.kernel.vfs.seek(handle, distance, kind).unwrap_or(0);
     Ok(DispatchOutcome::ReturnedR0(pos as u32))
+}
+
+// ---------- C-runtime file I/O ----------
+
+fn read_cstr_string(ctx: &mut CallCtx<'_>, p: u32, max: u32) -> Result<String, KernelError> {
+    if p == 0 {
+        return Ok(String::new());
+    }
+    let bytes = read_cstr(ctx, p, max)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
+    use pocket_kernel::vfs::Access;
+    let access = if mode.contains('+') {
+        Access::ReadWrite
+    } else if mode.starts_with('w') || mode.starts_with('a') {
+        Access::Write
+    } else {
+        Access::Read
+    };
+    let create = mode.starts_with('w') || mode.starts_with('a') || mode.contains('+');
+    // Pocket PC games sometimes pass `Game/data.bin` without a leading
+    // backslash; the VFS expects `\Game\…`. Try both spellings so the
+    // ROM lookup succeeds.
+    let candidates = [
+        path.to_string(),
+        if path.starts_with('\\') {
+            path.to_string()
+        } else {
+            format!("\\{path}")
+        },
+        path.replace('/', "\\"),
+        format!("\\{}", path.replace('/', "\\")),
+    ];
+    for cand in &candidates {
+        if let Some(h) = ctx.kernel.vfs.open(cand, access, create) {
+            log::trace!("fopen({cand:?}, {mode:?}) -> 0x{h:08x}");
+            return h;
+        }
+    }
+    log::trace!("fopen({path:?}, {mode:?}) -> NULL");
+    0
+}
+
+fn crt_fopen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    let mode_p = ctx.arg_u32(1)?;
+    let name = read_cstr_string(ctx, name_p, 260)?;
+    let mode = read_cstr_string(ctx, mode_p, 8)?;
+    let h = open_cstr_path(ctx, &name, &mode);
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn crt_wfopen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    let mode_p = ctx.arg_u32(1)?;
+    let name_w = read_wstr(ctx, name_p, 260)?;
+    let mode_w = read_wstr(ctx, mode_p, 8)?;
+    let name = String::from_utf16_lossy(&name_w);
+    let mode = String::from_utf16_lossy(&mode_w);
+    let h = open_cstr_path(ctx, &name, &mode);
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn crt_fclose(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    ctx.kernel.vfs.close(h);
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn crt_fread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let buf = ctx.arg_u32(0)?;
+    let size = ctx.arg_u32(1)?;
+    let count = ctx.arg_u32(2)?;
+    let h = ctx.arg_u32(3)?;
+    let total = size.saturating_mul(count);
+    if !ctx.kernel.vfs.is_open(h) || total == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut tmp = vec![0u8; total as usize];
+    let n = ctx.kernel.vfs.read(h, &mut tmp).unwrap_or(0);
+    if buf != 0 && n > 0 {
+        ctx.cpu.write_mem(buf, &tmp[..n])?;
+    }
+    let elements = (n as u32).checked_div(size).unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(elements))
+}
+
+fn crt_fwrite(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let buf = ctx.arg_u32(0)?;
+    let size = ctx.arg_u32(1)?;
+    let count = ctx.arg_u32(2)?;
+    let h = ctx.arg_u32(3)?;
+    let total = size.saturating_mul(count);
+    if !ctx.kernel.vfs.is_open(h) || total == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(buf, total)?;
+    let n = ctx.kernel.vfs.write(h, &bytes).unwrap_or(0);
+    let elements = (n as u32).checked_div(size).unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(elements))
+}
+
+fn crt_fseek(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use pocket_kernel::vfs::SeekKind;
+    let h = ctx.arg_u32(0)?;
+    let off = ctx.arg_u32(1)? as i32 as i64;
+    let whence = ctx.arg_u32(2)?;
+    let kind = match whence {
+        0 => SeekKind::Begin,
+        1 => SeekKind::Current,
+        2 => SeekKind::End,
+        _ => SeekKind::Begin,
+    };
+    let r = ctx.kernel.vfs.seek(h, off, kind);
+    Ok(DispatchOutcome::ReturnedR0(if r.is_some() {
+        0
+    } else {
+        u32::MAX
+    }))
+}
+
+fn crt_ftell(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use pocket_kernel::vfs::SeekKind;
+    let h = ctx.arg_u32(0)?;
+    let pos = ctx.kernel.vfs.seek(h, 0, SeekKind::Current).unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(pos as u32))
+}
+
+fn crt_feof(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use pocket_kernel::vfs::SeekKind;
+    let h = ctx.arg_u32(0)?;
+    let size = ctx.kernel.vfs.size(h).unwrap_or(0);
+    let pos = ctx.kernel.vfs.seek(h, 0, SeekKind::Current).unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(if pos >= size { 1 } else { 0 }))
+}
+
+fn crt_rewind(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use pocket_kernel::vfs::SeekKind;
+    let h = ctx.arg_u32(0)?;
+    let _ = ctx.kernel.vfs.seek(h, 0, SeekKind::Begin);
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn crt_fgetc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    if !ctx.kernel.vfs.is_open(h) {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    let mut buf = [0u8; 1];
+    let n = ctx.kernel.vfs.read(h, &mut buf).unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(if n == 0 {
+        u32::MAX
+    } else {
+        buf[0] as u32
+    }))
+}
+
+fn crt_fputc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let c = ctx.arg_u32(0)?;
+    let h = ctx.arg_u32(1)?;
+    if !ctx.kernel.vfs.is_open(h) {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    let _ = ctx.kernel.vfs.write(h, &[c as u8]);
+    Ok(DispatchOutcome::ReturnedR0(c & 0xFF))
+}
+
+fn crt_fgets(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let buf = ctx.arg_u32(0)?;
+    let n = ctx.arg_u32(1)?;
+    let h = ctx.arg_u32(2)?;
+    if buf == 0 || n <= 1 || !ctx.kernel.vfs.is_open(h) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut out = Vec::with_capacity(n as usize);
+    let mut byte = [0u8; 1];
+    while out.len() + 1 < n as usize {
+        let read = ctx.kernel.vfs.read(h, &mut byte).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        out.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    out.push(0);
+    ctx.cpu.write_mem(buf, &out)?;
+    Ok(DispatchOutcome::ReturnedR0(buf))
+}
+
+fn crt_fputs(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let s_p = ctx.arg_u32(0)?;
+    let h = ctx.arg_u32(1)?;
+    if !ctx.kernel.vfs.is_open(h) {
+        return Ok(DispatchOutcome::ReturnedR0(u32::MAX));
+    }
+    let s = read_cstr(ctx, s_p, 4096)?;
+    let n = ctx.kernel.vfs.write(h, &s).unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(if n > 0 {
+        1
+    } else {
+        u32::MAX
+    }))
+}
+
+// ---------- ARM compiler integer division helpers ----------
+
+/// `__rt_sdiv(int divisor in r0, int dividend in r1) -> {r0=quot, r1=rem}`
+fn rt_sdiv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let d = ctx.arg_u32(0)? as i32;
+    let n = ctx.arg_u32(1)? as i32;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
+    }
+    let q = n.wrapping_div(d) as u32;
+    let r = n.wrapping_rem(d) as u32;
+    Ok(DispatchOutcome::ReturnedR0R1(q, r))
+}
+
+fn rt_udiv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let d = ctx.arg_u32(0)?;
+    let n = ctx.arg_u32(1)?;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
+    }
+    Ok(DispatchOutcome::ReturnedR0R1(n / d, n % d))
+}
+
+fn rt_sdiv64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // (lo,hi) of 64-bit divisor in r0,r1; (lo,hi) of dividend in r2,r3
+    let d = ((ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64) as i64;
+    let n = ((ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64) as i64;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
+    }
+    let q = n.wrapping_div(d) as u64;
+    Ok(DispatchOutcome::ReturnedR0R1(q as u32, (q >> 32) as u32))
+}
+
+fn rt_udiv64(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let d = (ctx.arg_u32(1)? as u64) << 32 | ctx.arg_u32(0)? as u64;
+    let n = (ctx.arg_u32(3)? as u64) << 32 | ctx.arg_u32(2)? as u64;
+    if d == 0 {
+        return Ok(DispatchOutcome::ReturnedR0R1(0, 0));
+    }
+    let q = n / d;
+    Ok(DispatchOutcome::ReturnedR0R1(q as u32, (q >> 32) as u32))
+}
+
+fn rt_srsh(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Arithmetic right shift of a 64-bit value: r0 lo, r1 hi, r2 shift.
+    let lo = ctx.arg_u32(0)?;
+    let hi = ctx.arg_u32(1)?;
+    let s = ctx.arg_u32(2)? & 63;
+    let v = ((hi as u64) << 32 | lo as u64) as i64 >> s;
+    Ok(DispatchOutcome::ReturnedR0R1(v as u32, (v >> 32) as u32))
+}
+
+fn rt_sdiv10(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let n = ctx.arg_u32(0)? as i32;
+    let q = n.wrapping_div(10) as u32;
+    let r = n.wrapping_rem(10) as u32;
+    Ok(DispatchOutcome::ReturnedR0R1(q, r))
+}
+
+fn rt_udiv10(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let n = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0R1(n / 10, n % 10))
 }
 
 // ---------- heap ----------
@@ -764,6 +1729,18 @@ fn local_realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let p = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
     do_realloc(ctx, p, size)
+}
+
+/// `LocalSize(HLOCAL hMem)` — return the size of the block, or 0 for
+/// an unknown pointer. Doubles as the C runtime `_msize`.
+fn local_size(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let sz = if p == 0 {
+        0
+    } else {
+        ctx.kernel.heap.msize(p).unwrap_or(0)
+    };
+    Ok(DispatchOutcome::ReturnedR0(sz))
 }
 
 fn heap_create(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -826,9 +1803,10 @@ fn realloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     do_realloc(ctx, p, size)
 }
 
-/// Shared allocation path for every alloc-shaped API. Stores the
-/// requested size in the 4 bytes immediately preceding the user
-/// pointer so [`do_free`] can recover it.
+/// Shared allocation path for every alloc-shaped API. The host-side
+/// [`pocket_kernel::Heap`] tracks the requested size out of band, so
+/// `LocalSize` / `_msize` / `do_free` / `do_realloc` can recover it
+/// later without trusting guest memory.
 fn do_alloc(
     ctx: &mut CallCtx<'_>,
     size: u32,
@@ -841,10 +1819,7 @@ fn do_alloc(
             return Ok(DispatchOutcome::ReturnedR0(0));
         }
     };
-    // Stash size at user_ptr - 4 (header is 8 bytes, but we only need
-    // 4 to record the requested size; the other 4 are reserved).
-    ctx.cpu.write_mem(user_ptr - 4, &size.to_le_bytes())?;
-    if zero_init {
+    if zero_init && size > 0 {
         let zeros = vec![0u8; size as usize];
         ctx.cpu.write_mem(user_ptr, &zeros)?;
     }
@@ -852,12 +1827,7 @@ fn do_alloc(
 }
 
 fn do_free(ctx: &mut CallCtx<'_>, user_ptr: u32) {
-    let header = ctx.cpu.read_mem(user_ptr - 4, 4).unwrap_or_default();
-    if header.len() < 4 {
-        return;
-    }
-    let size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-    ctx.kernel.heap.free(user_ptr, size);
+    ctx.kernel.heap.free(user_ptr);
 }
 
 fn do_realloc(
@@ -868,12 +1838,7 @@ fn do_realloc(
     if p == 0 {
         return do_alloc(ctx, new_size, false);
     }
-    let header = ctx.cpu.read_mem(p - 4, 4).unwrap_or_default();
-    let old_size = if header.len() == 4 {
-        u32::from_le_bytes([header[0], header[1], header[2], header[3]])
-    } else {
-        0
-    };
+    let old_size = ctx.kernel.heap.msize(p).unwrap_or(0);
     if new_size == 0 {
         do_free(ctx, p);
         return Ok(DispatchOutcome::ReturnedR0(0));
@@ -882,7 +1847,6 @@ fn do_realloc(
         Some(np) => np,
         None => return Ok(DispatchOutcome::ReturnedR0(0)),
     };
-    ctx.cpu.write_mem(new_p - 4, &new_size.to_le_bytes())?;
     let to_copy = old_size.min(new_size);
     if to_copy > 0 {
         let bytes = ctx.cpu.read_mem(p, to_copy)?;
@@ -894,7 +1858,31 @@ fn do_realloc(
 
 // ---------- window / message ----------
 
-fn register_class_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn register_class_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // The first argument is `const WNDCLASS *`. On 32-bit Windows
+    // the layout is:
+    //   UINT      style;          (off 0)
+    //   WNDPROC   lpfnWndProc;    (off 4)
+    //   int       cbClsExtra;     (off 8)
+    //   int       cbWndExtra;     (off 12)
+    //   HINSTANCE hInstance;      (off 16)
+    //   ...
+    // We only care about lpfnWndProc — capture it so DispatchMessageW
+    // can trampoline into the guest WndProc.
+    let lpwc = ctx.arg_u32(0)?;
+    if lpwc != 0 {
+        if let Ok(buf) = ctx.cpu.read_mem(lpwc + 4, 4) {
+            let proc_va = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if proc_va != 0 {
+                ctx.kernel.wnd_proc = proc_va;
+                log::info!(
+                    "RegisterClassW captured WndProc=0x{:08x} from WNDCLASS at 0x{:08x}",
+                    proc_va,
+                    lpwc
+                );
+            }
+        }
+    }
     // ATOMs are 16-bit; return a non-zero one.
     Ok(DispatchOutcome::ReturnedR0(0xC001))
 }
@@ -903,28 +1891,181 @@ fn create_window_ex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
 }
 
+fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // DispatchMessageW(const MSG *lpMsg) — pass the message into the
+    // captured WndProc and trampoline guest execution into it. The
+    // WndProc's epilogue will return to our LR (the message-loop
+    // call site), so the loop continues normally.
+    let lp_msg = ctx.arg_u32(0)?;
+    let wnd_proc = ctx.kernel.wnd_proc;
+    if wnd_proc == 0 || lp_msg == 0 {
+        // No registered WndProc / no message → behave like the old
+        // stub: return 0, control resumes from LR.
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let buf = match ctx.cpu.read_mem(lp_msg, 16) {
+        Ok(b) => b,
+        Err(_) => return Ok(DispatchOutcome::ReturnedR0(0)),
+    };
+    let hwnd = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let message = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let wparam = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let lparam = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    log::debug!(
+        "DispatchMessageW trampoline -> WndProc(hwnd=0x{:x}, msg=0x{:x}, wp=0x{:x}, lp=0x{:x}) at 0x{:08x}",
+        hwnd, message, wparam, lparam, wnd_proc
+    );
+    use pocket_cpu::regs::ArmReg;
+    ctx.cpu.write_reg(ArmReg::R0, hwnd)?;
+    ctx.cpu.write_reg(ArmReg::R1, message)?;
+    ctx.cpu.write_reg(ArmReg::R2, wparam)?;
+    ctx.cpu.write_reg(ArmReg::R3, lparam)?;
+    // LR is already the message-loop's return address — leave it.
+    Ok(DispatchOutcome::JumpTo(wnd_proc))
+}
+
+/// Build a synthetic `MSG` blob (28 bytes on 32-bit Windows) and write
+/// it into the guest pointer. `message` selects which window message
+/// (e.g. `WM_PAINT = 0x000F` or `WM_QUIT = 0x0012`).
+fn write_synthetic_msg(
+    cpu: &mut dyn pocket_cpu::Cpu,
+    lp_msg: u32,
+    message: u32,
+    wparam: u32,
+    lparam: u32,
+) -> Result<(), KernelError> {
+    if lp_msg == 0 {
+        return Ok(());
+    }
+    // MSG: HWND hwnd; UINT message; WPARAM wParam; LPARAM lParam;
+    //      DWORD time; POINT pt; — 28 bytes total.
+    let mut msg = [0u8; 28];
+    msg[0..4].copy_from_slice(&FAKE_HWND.to_le_bytes());
+    msg[4..8].copy_from_slice(&message.to_le_bytes());
+    msg[8..12].copy_from_slice(&wparam.to_le_bytes());
+    msg[12..16].copy_from_slice(&lparam.to_le_bytes());
+    cpu.write_mem(lp_msg, &msg)?;
+    Ok(())
+}
+
+/// Pick which fake message to deliver next given the current count
+/// and the timer the guest has registered (if any).
+///
+/// This injects the kind of input traffic a real Pocket PC sees so
+/// games can advance past splash screens that need a tap or key press
+/// to dismiss, and so that timer-driven game loops (the typical
+/// PPC2003 pattern: `WM_CREATE` installs a `~5 ms` timer, `WM_TIMER`
+/// runs the per-frame logic) actually tick.
+fn synthetic_message_for(count: u64, timer_id: u32) -> (u32, u32, u32) {
+    const WM_PAINT: u32 = 0x000F;
+    const WM_TIMER: u32 = 0x0113;
+    const WM_LBUTTONDOWN: u32 = 0x0201;
+    const WM_LBUTTONUP: u32 = 0x0202;
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_KEYUP: u32 = 0x0101;
+    const VK_RETURN: u32 = 0x0D;
+
+    // First few ticks: paint, so the window is on screen before we
+    // inject anything else.
+    if count < 4 {
+        return (WM_PAINT, 0, 0);
+    }
+    // Every 32 ticks we synthesise a tap and a `VK_RETURN`. Real
+    // games consume these to advance through splash screens and
+    // menus.
+    let phase = (count - 4) % 32;
+    let centre_lparam = (160u32 << 16) | 120; // y << 16 | x
+    match phase {
+        4 => return (WM_LBUTTONDOWN, 1, centre_lparam),
+        5 => return (WM_LBUTTONUP, 0, centre_lparam),
+        9 => return (WM_KEYDOWN, VK_RETURN, 0),
+        10 => return (WM_KEYUP, VK_RETURN, 0),
+        _ => {}
+    }
+    // If the guest has registered a timer, alternate `WM_TIMER` and
+    // `WM_PAINT` so the game tick runs frequently. Without a real
+    // wall-clock the exact ratio doesn't matter; what matters is
+    // that `WM_TIMER` is delivered at all.
+    if timer_id != 0 && count.is_multiple_of(2) {
+        return (WM_TIMER, timer_id, 0);
+    }
+    (WM_PAINT, 0, 0)
+}
+
 /// `BOOL GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)`
 ///
-/// We have no real message queue. We answer with a single `WM_QUIT`
-/// after the first call — that gracefully tears down the message loop
-/// in any well-written WinCE app and gives us a clean exit.
+/// We have no real OS message queue. To drive an HLE'd Pocket PC game
+/// to actually paint, we fabricate a series of `WM_PAINT` messages
+/// interspersed with synthetic taps and key presses (up to
+/// `synthetic_message_budget`), then signal `WM_QUIT` with a `0`
+/// return so the loop tears down cleanly.
 fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let lp_msg = ctx.arg_u32(0)?;
-    if lp_msg != 0 {
-        // MSG layout: HWND hwnd; UINT message; WPARAM wParam; LPARAM lParam;
-        // DWORD time; POINT pt; -- 28 bytes total on 32-bit.
-        let mut msg = [0u8; 28];
-        // message field at offset 4 = WM_QUIT (0x12)
-        msg[4..8].copy_from_slice(&0x0012u32.to_le_bytes());
-        ctx.cpu.write_mem(lp_msg, &msg)?;
+    let count = ctx.kernel.synthetic_message_count;
+    let budget = ctx.kernel.synthetic_message_budget;
+    let exhausted = budget > 0 && count >= budget;
+    if exhausted {
+        write_synthetic_msg(ctx.cpu, lp_msg, 0x0012, 0, 0)?; // WM_QUIT
+        return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    // Returning 0 tells the loop to terminate, which is what WM_QUIT does.
-    Ok(DispatchOutcome::ReturnedR0(0))
+    if !ctx.kernel.synthetic_create_sent {
+        ctx.kernel.synthetic_create_sent = true;
+        // WM_CREATE — gives the guest's WndProc a chance to run its
+        // window-init code (typically registers a timer that drives
+        // the game tick).
+        write_synthetic_msg(ctx.cpu, lp_msg, 0x0001, 0, 0)?;
+        ctx.kernel.synthetic_message_count = count + 1;
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let (msg, wp, lp) = synthetic_message_for(count, ctx.kernel.synthetic_timer_id);
+    write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
+    ctx.kernel.synthetic_message_count = count + 1;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL PeekMessageW(LPMSG, HWND, UINT, UINT, UINT removeMode)` —
+/// returns 1 with the next synthetic message until our budget is
+/// exhausted, then 0. This is what most GAPI-based games actually
+/// poll on.
+fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let lp_msg = ctx.arg_u32(0)?;
+    let count = ctx.kernel.synthetic_message_count;
+    let budget = ctx.kernel.synthetic_message_budget;
+    if budget > 0 && count >= budget {
+        // Post WM_QUIT so the game exits the message loop instead
+        // of spinning on PeekMessageW returning 0 forever (which is
+        // what happens with `MsgWaitForMultipleObjectsEx` style
+        // pumps).
+        write_synthetic_msg(ctx.cpu, lp_msg, 0x0012, 0, 0)?;
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    if !ctx.kernel.synthetic_create_sent {
+        ctx.kernel.synthetic_create_sent = true;
+        write_synthetic_msg(ctx.cpu, lp_msg, 0x0001, 0, 0)?;
+        ctx.kernel.synthetic_message_count = count + 1;
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let (msg, wp, lp) = synthetic_message_for(count, ctx.kernel.synthetic_timer_id);
+    write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
+    ctx.kernel.synthetic_message_count = count + 1;
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn post_quit_message(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     log::info!("PostQuitMessage called by guest");
     Ok(DispatchOutcome::Halt)
+}
+
+/// `DWORD MsgWaitForMultipleObjectsEx(DWORD nCount, const HANDLE *,
+/// DWORD dwMilliseconds, DWORD dwWakeMask, DWORD dwFlags)`. Real
+/// Win32 returns `WAIT_OBJECT_0 + nCount` when "a new input event is
+/// in the queue". Since our synthetic message pump always has more
+/// messages until the budget is exhausted (and `WM_QUIT` then breaks
+/// the loop), telling the guest "input ready" lets it fall through
+/// to its `PeekMessageW` / `GetMessageW` loop normally.
+fn msg_wait_for_multiple_objects(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let n_count = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(n_count))
 }
 
 fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -939,6 +2080,1290 @@ fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     Ok(DispatchOutcome::ReturnedR0(v))
 }
 
+// ---------- GDI ----------
+
+fn get_dc(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(GDI_SCREEN_DC))
+}
+
+fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // BeginPaint(hwnd, lpPaint) -> HDC. Fill the PAINTSTRUCT enough
+    // for the caller (most games only read .hdc / .rcPaint).
+    let _hwnd = ctx.arg_u32(0)?;
+    let lp_paint = ctx.arg_u32(1)?;
+    if lp_paint != 0 {
+        let mut buf = [0u8; PAINTSTRUCT_BYTES as usize];
+        // hdc
+        buf[0..4].copy_from_slice(&GDI_SCREEN_DC.to_le_bytes());
+        // fErase = 1
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        // rcPaint = (0,0, FB_WIDTH, FB_HEIGHT)
+        buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&FB_WIDTH.to_le_bytes());
+        buf[20..24].copy_from_slice(&FB_HEIGHT.to_le_bytes());
+        ctx.cpu.write_mem(lp_paint, &buf)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(GDI_SCREEN_DC))
+}
+
+fn end_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ctx.kernel.framebuffer.mark_dirty();
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn create_compatible_dc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.kernel.gdi.create_memory_dc();
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn create_compatible_bitmap(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hdc = ctx.arg_u32(0)?;
+    let w = ctx.arg_u32(1)?;
+    let h = ctx.arg_u32(2)?;
+    let handle = ctx.kernel.gdi.create_compatible_bitmap(w, h);
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+fn create_solid_brush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let color = ctx.arg_u32(0)?;
+    let h = ctx.kernel.gdi.create_solid_brush(color);
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn create_pen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _style = ctx.arg_u32(0)?;
+    let width = ctx.arg_u32(1)?;
+    let color = ctx.arg_u32(2)?;
+    let h = ctx.kernel.gdi.create_pen(color, width);
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn create_font_indirect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // We ignore the LOGFONT contents; just allocate a font handle so
+    // the caller can SelectObject it. Default height 0 is fine.
+    let h = ctx.kernel.gdi.create_font(0);
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn get_stock_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Map stock indices to our pre-registered handles.
+    let idx = ctx.arg_u32(0)?;
+    let h = match idx {
+        0 => STOCK_WHITE_BRUSH, // WHITE_BRUSH
+        1 => 0xDEAD_5702,       // LTGRAY_BRUSH (synthetic)
+        2 => 0xDEAD_5703,       // GRAY_BRUSH
+        4 => STOCK_BLACK_BRUSH, // BLACK_BRUSH
+        5 => STOCK_NULL_BRUSH,  // NULL_BRUSH / HOLLOW_BRUSH
+        6 => STOCK_WHITE_PEN,   // WHITE_PEN
+        7 => STOCK_BLACK_PEN,   // BLACK_PEN
+        8 => STOCK_NULL_PEN,    // NULL_PEN
+        17 => 0xDEAD_5710,      // DEFAULT_GUI_FONT
+        _ => STOCK_WHITE_BRUSH,
+    };
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn select_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let obj = ctx.arg_u32(1)?;
+    let prev = ctx.kernel.gdi.select_into(dc, obj);
+    Ok(DispatchOutcome::ReturnedR0(prev))
+}
+
+fn delete_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let _ = ctx.kernel.gdi.delete(h);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn set_bk_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let mode = ctx.arg_u32(1)?;
+    if let Some(d) = ctx.kernel.gdi.dc_mut(dc) {
+        d.bk_transparent = mode == 1; // TRANSPARENT
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn set_bk_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let color = ctx.arg_u32(1)?;
+    if let Some(d) = ctx.kernel.gdi.dc_mut(dc) {
+        d.bk_color = color;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn set_text_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let color = ctx.arg_u32(1)?;
+    if let Some(d) = ctx.kernel.gdi.dc_mut(dc) {
+        d.text_color = color;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// Borrow either the framebuffer or a memory bitmap as a writable
+/// surface, given a DC handle.
+fn surface_for_dc<'a>(state: &'a mut pocket_kernel::KernelState, dc: u32) -> Option<Surface<'a>> {
+    let dc_meta = state.gdi.dc(dc)?.clone();
+    match dc_meta.surface {
+        pocket_kernel::gdi::DcSurface::Screen => Some(Surface::Screen(&mut state.framebuffer)),
+        pocket_kernel::gdi::DcSurface::Memory => {
+            let bm = dc_meta.selected_bitmap?;
+            state.gdi.bitmap_mut(bm).map(Surface::Bitmap)
+        }
+    }
+}
+
+fn fill_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // FillRect(hdc, lprc, hbr): fill rectangle with brush colour.
+    let hdc = ctx.arg_u32(0)?;
+    let rc_ptr = ctx.arg_u32(1)?;
+    let hbr = ctx.arg_u32(2)?;
+    let rc = ctx.cpu.read_mem(rc_ptr, 16)?;
+    let l = i32::from_le_bytes([rc[0], rc[1], rc[2], rc[3]]);
+    let t = i32::from_le_bytes([rc[4], rc[5], rc[6], rc[7]]);
+    let r = i32::from_le_bytes([rc[8], rc[9], rc[10], rc[11]]);
+    let b = i32::from_le_bytes([rc[12], rc[13], rc[14], rc[15]]);
+    let color = ctx
+        .kernel
+        .gdi
+        .brush(hbr)
+        .map(|b| b.color)
+        .unwrap_or(0x00ff_ffff);
+    let rgb = colorref_to_rgb565(color);
+    if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
+        surf.fill_rect(l, t, r - l, b - t, rgb);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn rectangle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Rectangle(hdc, l, t, r, b)
+    let hdc = ctx.arg_u32(0)?;
+    let l = ctx.arg_u32(1)? as i32;
+    let t = ctx.arg_u32(2)? as i32;
+    let r = ctx.arg_u32(3)? as i32;
+    let b = ctx.arg_u32(4)? as i32;
+    let dc_meta = ctx
+        .kernel
+        .gdi
+        .dc(hdc)
+        .cloned()
+        .ok_or_else(|| KernelError::Dispatch(format!("Rectangle: bad HDC 0x{hdc:08x}")))?;
+    let fill_rgb = colorref_to_rgb565(dc_meta.brush_color);
+    let stroke_rgb = colorref_to_rgb565(dc_meta.pen_color);
+    if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
+        surf.fill_rect(l, t, r - l, b - t, fill_rgb);
+        surf.stroke_rect(l, t, r - l, b - t, stroke_rgb);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn bit_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // BitBlt(hdcDest, x, y, cx, cy, hdcSrc, x1, y1, rop) → BOOL.
+    let hdc_dst = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    let cx = ctx.arg_u32(3)? as i32;
+    let cy = ctx.arg_u32(4)? as i32;
+    let hdc_src = ctx.arg_u32(5)?;
+    let x1 = ctx.arg_u32(6)? as i32;
+    let y1 = ctx.arg_u32(7)? as i32;
+    let rop = ctx.arg_u32(8)?;
+    log::debug!(
+        "BitBlt(dst=0x{hdc_dst:08x} dst=({x},{y},{cx}x{cy}) src=0x{hdc_src:08x} src=({x1},{y1}) rop=0x{rop:08x})"
+    );
+    bit_blt_inner(ctx, hdc_dst, x, y, cx, cy, hdc_src, x1, y1)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// Read a DIB-backed bitmap's current pixels from guest memory and
+/// convert them to RGB565. This makes writes the guest performed
+/// directly through `ppvBits` (after `CreateDIBSection`) visible to
+/// the rendering pipeline.
+fn snapshot_dib(cpu: &mut dyn pocket_cpu::Cpu, bm: &pocket_kernel::gdi::Bitmap) -> Option<Vec<u8>> {
+    let bits_va = bm.dib_bits_va?;
+    let raw = cpu.read_mem(bits_va, bm.dib_row_stride * bm.height).ok()?;
+    let mut out = vec![0u8; (bm.width * bm.height * 2) as usize];
+    for src_y in 0..bm.height {
+        let dst_y = if bm.dib_bottom_up {
+            bm.height - 1 - src_y
+        } else {
+            src_y
+        };
+        let row_off = (src_y * bm.dib_row_stride) as usize;
+        let dst_row = (dst_y * bm.width * 2) as usize;
+        for x in 0..bm.width {
+            let rgb = match bm.bpp {
+                8 => {
+                    let idx = raw[row_off + x as usize] as usize;
+                    *bm.dib_palette.get(idx).unwrap_or(&0)
+                }
+                4 => {
+                    let b = raw[row_off + (x as usize) / 2];
+                    let nib = if x & 1 == 0 { b >> 4 } else { b & 0x0F };
+                    *bm.dib_palette.get(nib as usize).unwrap_or(&0)
+                }
+                1 => {
+                    let b = raw[row_off + (x as usize) / 8];
+                    let bit = 7 - (x & 7);
+                    let v = ((b >> bit) & 1) as usize;
+                    *bm.dib_palette.get(v).unwrap_or(&0)
+                }
+                16 => u16::from_le_bytes([
+                    raw[row_off + x as usize * 2],
+                    raw[row_off + x as usize * 2 + 1],
+                ]),
+                24 => pocket_kernel::framebuffer::pack_rgb565(
+                    raw[row_off + x as usize * 3 + 2],
+                    raw[row_off + x as usize * 3 + 1],
+                    raw[row_off + x as usize * 3],
+                ),
+                32 => pocket_kernel::framebuffer::pack_rgb565(
+                    raw[row_off + x as usize * 4 + 2],
+                    raw[row_off + x as usize * 4 + 1],
+                    raw[row_off + x as usize * 4],
+                ),
+                _ => 0,
+            };
+            let off = dst_row + (x as usize) * 2;
+            out[off] = rgb as u8;
+            out[off + 1] = (rgb >> 8) as u8;
+        }
+    }
+    Some(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bit_blt_inner(
+    ctx: &mut CallCtx<'_>,
+    hdc_dst: u32,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    hdc_src: u32,
+    x1: i32,
+    y1: i32,
+) -> Result<(), KernelError> {
+    // Read the source: either selected bitmap of a memory DC, or a
+    // snapshot of the framebuffer if BitBlt-ing from the screen.
+    let (src_pixels, src_w, src_h) = match ctx.kernel.gdi.dc(hdc_src).cloned() {
+        Some(dc) => match dc.surface {
+            pocket_kernel::gdi::DcSurface::Screen => (
+                ctx.kernel.framebuffer.pixels.clone(),
+                ctx.kernel.framebuffer.width,
+                ctx.kernel.framebuffer.height,
+            ),
+            pocket_kernel::gdi::DcSurface::Memory => match dc.selected_bitmap {
+                Some(bh) => {
+                    let snapshot = ctx
+                        .kernel
+                        .gdi
+                        .bitmap(bh)
+                        .filter(|b| b.dib_bits_va.is_some())
+                        .cloned();
+                    if let Some(b) = snapshot {
+                        if let Some(pix) = snapshot_dib(ctx.cpu, &b) {
+                            (pix, b.width, b.height)
+                        } else {
+                            (b.pixels.clone(), b.width, b.height)
+                        }
+                    } else {
+                        match ctx.kernel.gdi.bitmap(bh) {
+                            Some(b) => (b.pixels.clone(), b.width, b.height),
+                            None => (Vec::new(), 0, 0),
+                        }
+                    }
+                }
+                None => (Vec::new(), 0, 0),
+            },
+        },
+        None => (Vec::new(), 0, 0),
+    };
+
+    if src_w == 0 || src_h == 0 {
+        return Ok(());
+    }
+    if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc_dst) {
+        dst.blit_from_bytes(x, y, x1, y1, cx, cy, &src_pixels, src_w, src_h);
+    }
+    sync_dst_dib_to_guest(ctx, hdc_dst)?;
+    Ok(())
+}
+
+/// Pocket PC games frequently `BitBlt` an asset into a `CreateDIBSection`
+/// memory DC and then read the pixels out by dereferencing the
+/// `ppvBits` pointer the section reported. Our drawing primitives keep
+/// the canonical pixels in a host-side RGB565 cache (`Bitmap::pixels`),
+/// so without an explicit flush the guest's pointer would still point
+/// at zero-initialized memory and every subsequent direct-pixel read
+/// (e.g. the splash-screen blit-to-FB seen in JumpyBall) would silently
+/// produce a black frame.
+///
+/// After every operation that mutates a DC, call this to push the host
+/// pixels back into the guest VA at `dib_bits_va` in the DIB's native
+/// bit depth and orientation.
+fn sync_dst_dib_to_guest(ctx: &mut CallCtx<'_>, hdc: u32) -> Result<(), KernelError> {
+    let dc = match ctx.kernel.gdi.dc(hdc).cloned() {
+        Some(dc) => dc,
+        None => return Ok(()),
+    };
+    if !matches!(dc.surface, pocket_kernel::gdi::DcSurface::Memory) {
+        return Ok(());
+    }
+    let bm_h = match dc.selected_bitmap {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    let bm = match ctx.kernel.gdi.bitmap(bm_h).cloned() {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+    let bits_va = match bm.dib_bits_va {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let mut buf = vec![0u8; (bm.dib_row_stride * bm.height) as usize];
+    for src_y in 0..bm.height {
+        let dst_y = if bm.dib_bottom_up {
+            bm.height - 1 - src_y
+        } else {
+            src_y
+        };
+        let src_row = (src_y * bm.width * 2) as usize;
+        let dst_row = (dst_y * bm.dib_row_stride) as usize;
+        for x in 0..bm.width {
+            let off = src_row + (x as usize) * 2;
+            if off + 1 >= bm.pixels.len() {
+                continue;
+            }
+            let px = u16::from_le_bytes([bm.pixels[off], bm.pixels[off + 1]]);
+            let r = (((px >> 11) & 0x1f) as u32 * 255 / 31) as u8;
+            let g = (((px >> 5) & 0x3f) as u32 * 255 / 63) as u8;
+            let b = ((px & 0x1f) as u32 * 255 / 31) as u8;
+            match bm.bpp {
+                24 => {
+                    let off2 = dst_row + (x as usize) * 3;
+                    if off2 + 2 < buf.len() {
+                        buf[off2] = b;
+                        buf[off2 + 1] = g;
+                        buf[off2 + 2] = r;
+                    }
+                }
+                32 => {
+                    let off2 = dst_row + (x as usize) * 4;
+                    if off2 + 3 < buf.len() {
+                        buf[off2] = b;
+                        buf[off2 + 1] = g;
+                        buf[off2 + 2] = r;
+                        buf[off2 + 3] = 0;
+                    }
+                }
+                16 => {
+                    let off2 = dst_row + (x as usize) * 2;
+                    if off2 + 1 < buf.len() {
+                        buf[off2] = px as u8;
+                        buf[off2 + 1] = (px >> 8) as u8;
+                    }
+                }
+                8 if !bm.dib_palette.is_empty() => {
+                    // Map RGB565 back to a paletted index by closest-match.
+                    let mut best_i = 0u8;
+                    let mut best_d = u32::MAX;
+                    for (i, &p) in bm.dib_palette.iter().enumerate() {
+                        let pr = ((p >> 11) & 0x1f) as u32 * 255 / 31;
+                        let pg = ((p >> 5) & 0x3f) as u32 * 255 / 63;
+                        let pb = (p & 0x1f) as u32 * 255 / 31;
+                        let dr = pr.abs_diff(r as u32);
+                        let dg = pg.abs_diff(g as u32);
+                        let db = pb.abs_diff(b as u32);
+                        let d = dr * dr + dg * dg + db * db;
+                        if d < best_d {
+                            best_d = d;
+                            best_i = i as u8;
+                        }
+                    }
+                    let off2 = dst_row + x as usize;
+                    if off2 < buf.len() {
+                        buf[off2] = best_i;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ctx.cpu.write_mem(bits_va, &buf)?;
+    Ok(())
+}
+
+// ---------- Resources ----------
+
+fn read_wide_resource_key(ctx: &mut CallCtx<'_>, raw: u32) -> Result<ResourceKey, KernelError> {
+    if raw < 0x1_0000 {
+        // MAKEINTRESOURCE encoding — low 16 bits are an integer ID.
+        Ok(ResourceKey::Id(raw))
+    } else {
+        let mut name = String::new();
+        let mut va = raw;
+        for _ in 0..256 {
+            let b = ctx.cpu.read_mem(va, 2)?;
+            let cu = u16::from_le_bytes([b[0], b[1]]);
+            if cu == 0 {
+                break;
+            }
+            if let Some(c) = char::from_u32(cu as u32) {
+                name.push(c);
+            }
+            va = va.wrapping_add(2);
+        }
+        Ok(ResourceKey::Name(name))
+    }
+}
+
+fn find_resource_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // FindResourceW(hModule, lpName, lpType)
+    let _hmod = ctx.arg_u32(0)?;
+    let name_raw = ctx.arg_u32(1)?;
+    let type_raw = ctx.arg_u32(2)?;
+    let want_name = read_wide_resource_key(ctx, name_raw)?;
+    let want_type = read_wide_resource_key(ctx, type_raw)?;
+    if let Some(entry) = ctx
+        .kernel
+        .resources
+        .iter()
+        .find(|e| e.ty == want_type && e.name == want_name)
+    {
+        let va = ctx.kernel.image_base.wrapping_add(entry.data_rva);
+        log::trace!(
+            "FindResourceW(name={want_name:?}, type={want_type:?}) -> 0x{va:08x} ({} bytes)",
+            entry.size
+        );
+        return Ok(DispatchOutcome::ReturnedR0(va));
+    }
+    log::trace!("FindResourceW(name={want_name:?}, type={want_type:?}) -> NULL");
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn load_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // LoadResource just returns the same handle on Windows when the
+    // resource is in-image. We've already encoded the data VA in the
+    // FindResource result.
+    let h = ctx.arg_u32(1)?;
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn lock_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+fn sizeof_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // SizeofResource(hModule, hResInfo) — hResInfo is the VA we
+    // returned from FindResourceW. We look up by data_rva.
+    let h = ctx.arg_u32(1)?;
+    let rva = h.wrapping_sub(ctx.kernel.image_base);
+    if let Some(e) = ctx.kernel.resources.iter().find(|e| e.data_rva == rva) {
+        return Ok(DispatchOutcome::ReturnedR0(e.size));
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `HBITMAP LoadBitmapW(HINSTANCE hInstance, LPCWSTR lpBitmapName)` —
+/// look the bitmap up in the PE's embedded resources, decode the
+/// BITMAPINFO header + palette + pixel data into our internal RGB565
+/// `Bitmap`, register it with the GDI state, and return the handle.
+///
+/// Pocket PC games typically ship 8-bpp paletted DIBs to save space;
+/// we also handle 24-bpp BGR and 16-bpp RGB565/RGB555.
+fn load_bitmap_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const RT_BITMAP: ResourceKey = ResourceKey::Id(2);
+    let _hinst = ctx.arg_u32(0)?;
+    let name_raw = ctx.arg_u32(1)?;
+    let want_name = read_wide_resource_key(ctx, name_raw)?;
+    let entry = match ctx
+        .kernel
+        .resources
+        .iter()
+        .find(|e| e.ty == RT_BITMAP && e.name == want_name)
+        .cloned()
+    {
+        Some(e) => e,
+        None => {
+            log::trace!("LoadBitmapW(name={want_name:?}) -> NULL (resource not found)");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    // Read the bitmap data straight out of the guest's mapped image.
+    let va = ctx.kernel.image_base.wrapping_add(entry.data_rva);
+    let raw = match ctx.cpu.read_mem(va, entry.size) {
+        Ok(b) => b,
+        Err(_) => {
+            log::trace!("LoadBitmapW({want_name:?}) -> NULL (image not mapped at 0x{va:08x})");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    let pixels_565 = match decode_dib_to_rgb565(&raw) {
+        Some(p) => p,
+        None => {
+            log::trace!("LoadBitmapW({want_name:?}) -> NULL (unsupported DIB)");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    let (w, h) = pixels_565.dims;
+    let handle = ctx.kernel.gdi.create_compatible_bitmap(w, h);
+    if let Some(b) = ctx.kernel.gdi.bitmap_mut(handle) {
+        // Bitmap::new pre-allocates `w*h*2` bytes; just blit our
+        // already-RGB565-converted image on top.
+        debug_assert_eq!(b.pixels.len(), pixels_565.bytes.len());
+        b.pixels.copy_from_slice(&pixels_565.bytes);
+    }
+    log::trace!(
+        "LoadBitmapW(name={want_name:?}) -> handle 0x{handle:08x} ({}x{} from {} bytes)",
+        w,
+        h,
+        entry.size
+    );
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+struct DecodedDib {
+    bytes: Vec<u8>,
+    dims: (u32, u32),
+}
+
+/// Decode a Windows DIB (`BITMAPINFOHEADER` + palette + pixels) into
+/// a top-down RGB565 little-endian buffer of size `w*h*2`. Returns
+/// `None` if the format is not yet implemented.
+fn decode_dib_to_rgb565(raw: &[u8]) -> Option<DecodedDib> {
+    if raw.len() < 40 {
+        return None;
+    }
+    let header_size = u32::from_le_bytes(raw[0..4].try_into().ok()?);
+    if header_size < 40 {
+        return None;
+    }
+    let width = i32::from_le_bytes(raw[4..8].try_into().ok()?);
+    let height_raw = i32::from_le_bytes(raw[8..12].try_into().ok()?);
+    let _planes = u16::from_le_bytes(raw[12..14].try_into().ok()?);
+    let bpp = u16::from_le_bytes(raw[14..16].try_into().ok()?);
+    let compression = u32::from_le_bytes(raw[16..20].try_into().ok()?);
+    let used_colors = u32::from_le_bytes(raw[32..36].try_into().ok()?);
+    if width <= 0 || height_raw == 0 || compression != 0 {
+        return None;
+    }
+    let bottom_up = height_raw > 0;
+    let height = height_raw.unsigned_abs();
+    let width = width as u32;
+
+    // Palette table sits right after the header. For paletted
+    // formats the table size is `used_colors` (or 2^bpp if zero).
+    let palette_entries = match bpp {
+        1 | 4 | 8 => {
+            if used_colors == 0 {
+                1u32 << bpp
+            } else {
+                used_colors
+            }
+        }
+        _ => 0,
+    };
+    let palette_off = header_size as usize;
+    let pixels_off = palette_off + (palette_entries as usize) * 4;
+    if pixels_off > raw.len() {
+        return None;
+    }
+    // Palette is BGRX in DIB order.
+    let mut palette = vec![0u16; palette_entries as usize];
+    for (i, slot) in palette.iter_mut().enumerate() {
+        let p = palette_off + i * 4;
+        *slot = bgrx_to_rgb565(raw[p], raw[p + 1], raw[p + 2]);
+    }
+
+    // Each row is padded to a 4-byte boundary.
+    let row_bytes = match bpp {
+        1 => width.div_ceil(8),
+        4 => width.div_ceil(2),
+        8 => width,
+        16 => width * 2,
+        24 => width * 3,
+        32 => width * 4,
+        _ => return None,
+    };
+    let row_stride = (row_bytes + 3) & !3;
+
+    let mut out = vec![0u8; (width as usize) * (height as usize) * 2];
+    for src_y in 0..height {
+        // BMP rows are bottom-up unless the height field is negative.
+        let dst_y = if bottom_up { height - 1 - src_y } else { src_y };
+        let row_off = pixels_off + (src_y as usize) * (row_stride as usize);
+        if row_off + row_bytes as usize > raw.len() {
+            return None;
+        }
+        let dst_row_start = (dst_y as usize) * (width as usize) * 2;
+        for x in 0..width {
+            let rgb565 = match bpp {
+                8 => {
+                    let idx = raw[row_off + x as usize] as usize;
+                    *palette.get(idx).unwrap_or(&0)
+                }
+                4 => {
+                    let b = raw[row_off + (x as usize) / 2];
+                    let nib = if x & 1 == 0 { b >> 4 } else { b & 0x0F };
+                    *palette.get(nib as usize).unwrap_or(&0)
+                }
+                1 => {
+                    let b = raw[row_off + (x as usize) / 8];
+                    let bit = 7 - (x & 7);
+                    let v = ((b >> bit) & 1) as usize;
+                    *palette.get(v).unwrap_or(&0)
+                }
+                16 => u16::from_le_bytes([
+                    raw[row_off + x as usize * 2],
+                    raw[row_off + x as usize * 2 + 1],
+                ]),
+                24 => bgrx_to_rgb565(
+                    raw[row_off + x as usize * 3],
+                    raw[row_off + x as usize * 3 + 1],
+                    raw[row_off + x as usize * 3 + 2],
+                ),
+                32 => bgrx_to_rgb565(
+                    raw[row_off + x as usize * 4],
+                    raw[row_off + x as usize * 4 + 1],
+                    raw[row_off + x as usize * 4 + 2],
+                ),
+                _ => 0,
+            };
+            let off = dst_row_start + (x as usize) * 2;
+            out[off] = rgb565 as u8;
+            out[off + 1] = (rgb565 >> 8) as u8;
+        }
+    }
+    Some(DecodedDib {
+        bytes: out,
+        dims: (width, height),
+    })
+}
+
+/// 24-bit BGR → 16-bit RGB565.
+fn bgrx_to_rgb565(b: u8, g: u8, r: u8) -> u16 {
+    let r5 = (r as u16 >> 3) & 0x1F;
+    let g6 = (g as u16 >> 2) & 0x3F;
+    let b5 = (b as u16 >> 3) & 0x1F;
+    (r5 << 11) | (g6 << 5) | b5
+}
+
+/// `int LoadStringW(HINSTANCE hInst, UINT uID, LPWSTR lpBuf, int cch)` —
+/// look up the string in the PE's `RT_STRING` (type 6) resource.
+/// Resource strings are bundled in blocks of 16; block id is
+/// `(uID >> 4) + 1`, sub-index is `uID & 0xF`. Each block is a
+/// stream of `(WORD len, wchar_t[len])` records, optionally padded.
+///
+/// Returns the number of wide chars copied (excluding the trailing
+/// NUL); writes a NUL into `lpBuf[0]` and returns 0 if not found.
+fn load_string_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const RT_STRING: ResourceKey = ResourceKey::Id(6);
+    let _hinst = ctx.arg_u32(0)?;
+    let id = ctx.arg_u32(1)? & 0xFFFF;
+    let buf = ctx.arg_u32(2)?;
+    let cch = ctx.arg_u32(3)? as usize;
+
+    let block_id = (id >> 4) + 1;
+    let sub = (id & 0xF) as usize;
+    let mut wide: Vec<u16> = Vec::new();
+    if let Some(entry) = ctx
+        .kernel
+        .resources
+        .iter()
+        .find(|e| e.ty == RT_STRING && e.name == ResourceKey::Id(block_id))
+        .cloned()
+    {
+        let va = ctx.kernel.image_base.wrapping_add(entry.data_rva);
+        if let Ok(bytes) = ctx.cpu.read_mem(va, entry.size) {
+            // Walk the 16 length-prefixed records.
+            let mut pos = 0usize;
+            for i in 0..=sub {
+                if pos + 2 > bytes.len() {
+                    break;
+                }
+                let len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                pos += 2;
+                if i == sub {
+                    let end = (pos + len * 2).min(bytes.len());
+                    for w in (pos..end).step_by(2) {
+                        wide.push(u16::from_le_bytes([bytes[w], bytes[w + 1]]));
+                    }
+                    break;
+                }
+                pos += len * 2;
+            }
+        }
+    }
+
+    if buf != 0 && cch > 0 {
+        // Always at least NUL-terminate so the caller's buffer is
+        // safe even when the string is missing or truncated.
+        let copy = wide.len().min(cch.saturating_sub(1));
+        let mut out = Vec::with_capacity((copy + 1) * 2);
+        for &w in &wide[..copy] {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out.extend_from_slice(&0u16.to_le_bytes());
+        ctx.cpu.write_mem(buf, &out)?;
+        log::trace!(
+            "LoadStringW(id={id}) -> {} chars from block {}",
+            copy,
+            block_id
+        );
+        return Ok(DispatchOutcome::ReturnedR0(copy as u32));
+    }
+    Ok(DispatchOutcome::ReturnedR0(wide.len() as u32))
+}
+
+/// `int GetObjectW(HGDIOBJ h, int cb, LPVOID p)` — write a `BITMAP`
+/// struct (24 bytes on Windows CE) describing the selected bitmap so
+/// that the game can compute the right dimensions before issuing a
+/// matching `BitBlt` / `CreateDIBSection`. We only support the bitmap
+/// flavour for now; everything else is no-op.
+fn get_object_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    let cb = ctx.arg_u32(1)?;
+    let p = ctx.arg_u32(2)?;
+    let (w, ht) = match ctx.kernel.gdi.bitmap(h) {
+        Some(b) => (b.width, b.height),
+        None => return Ok(DispatchOutcome::ReturnedR0(0)),
+    };
+    if p == 0 {
+        // Caller is asking for the size only.
+        return Ok(DispatchOutcome::ReturnedR0(24));
+    }
+    if cb < 24 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // BITMAP layout: bmType(LONG), bmWidth(LONG), bmHeight(LONG),
+    //                bmWidthBytes(LONG), bmPlanes(WORD), bmBitsPixel(WORD),
+    //                bmBits(LPVOID).
+    let mut buf = [0u8; 24];
+    buf[0..4].copy_from_slice(&0u32.to_le_bytes()); // bmType always 0
+    buf[4..8].copy_from_slice(&w.to_le_bytes());
+    buf[8..12].copy_from_slice(&ht.to_le_bytes());
+    buf[12..16].copy_from_slice(&(w * 2).to_le_bytes());
+    buf[16..18].copy_from_slice(&1u16.to_le_bytes()); // planes
+    buf[18..20].copy_from_slice(&16u16.to_le_bytes()); // RGB565
+    buf[20..24].copy_from_slice(&0u32.to_le_bytes()); // bmBits = NULL (managed host-side)
+    ctx.cpu.write_mem(p, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(24))
+}
+
+// ---------- additional window / message handlers ----------
+
+fn destroy_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn find_window_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Pocket PC games call FindWindowW on their own class to detect a
+    // prior instance of themselves. We always say "no prior instance"
+    // so the game proceeds with normal startup.
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `LONG SetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)` —
+/// returns the previous value (always `0` in our model). When
+/// `nIndex == GWL_WNDPROC` (`-4`), we also re-bind the captured
+/// guest `WndProc` so the synthetic message pump dispatches to the
+/// right entry point if the game subclasses its own window.
+fn set_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let n_index = ctx.arg_u32(1)? as i32;
+    let new_long = ctx.arg_u32(2)?;
+    if n_index == -4 {
+        // GWL_WNDPROC
+        log::info!("SetWindowLongW(GWL_WNDPROC) re-binding WndProc=0x{new_long:08x}");
+        ctx.kernel.wnd_proc = new_long;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `LONG GetWindowLongW(HWND hWnd, int nIndex)` — return `0` for
+/// every slot we don't track (the documented return when never set).
+fn get_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let n_index = ctx.arg_u32(1)? as i32;
+    let v = if n_index == -4 {
+        ctx.kernel.wnd_proc
+    } else {
+        0
+    };
+    Ok(DispatchOutcome::ReturnedR0(v))
+}
+
+const OSVERSIONINFOW_BYTES: u32 = 4 + 4 * 4 + 128 * 2;
+
+/// `BOOL GetVersionExW(LPOSVERSIONINFOW lpVersionInformation)`.
+/// Reports Windows CE 4.20 (Pocket PC 2003 / PPC2003), which is
+/// what every Pocket PC 2002–2003 game we target was built for.
+fn get_version_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let header = ctx.cpu.read_mem(p, 4)?;
+    let cb = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    // We accept any reasonable `cb` — Pocket PC games sometimes set
+    // it to `sizeof(OSVERSIONINFOW)` (276), sometimes to the smaller
+    // `OSVERSIONINFOEXW` ANSI shape, and sometimes to 0 (lazy init).
+    // Real Windows would reject `cb == 0`, but here we'd rather fill
+    // what we can and return success so the guest doesn't take a
+    // failure-only code path.
+    let want = if cb >= OSVERSIONINFOW_BYTES {
+        OSVERSIONINFOW_BYTES
+    } else {
+        cb.max(20)
+    };
+    let mut buf = vec![0u8; want as usize];
+    buf[0..4].copy_from_slice(&want.to_le_bytes());
+    buf[4..8].copy_from_slice(&4u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&20u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&1081u32.to_le_bytes());
+    buf[16..20].copy_from_slice(&3u32.to_le_bytes());
+    ctx.cpu.write_mem(p, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `DWORD GetVersion()` — packed legacy form. Hi word = major.minor
+/// (0x0414 == 4.20), low word = build (1081).
+fn get_version(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0x0439_1404))
+}
+
+fn invalidate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // We don't model dirty rects yet, but bumping the framebuffer
+    // dirty counter means hosts (PPM dump, minifb display) re-upload.
+    ctx.kernel.framebuffer.mark_dirty();
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn write_rect(ctx: &mut CallCtx<'_>, rect_ptr: u32, w: i32, h: i32) -> Result<(), KernelError> {
+    if rect_ptr == 0 {
+        return Ok(());
+    }
+    let mut buf = [0u8; 16];
+    buf[0..4].copy_from_slice(&0i32.to_le_bytes()); // left
+    buf[4..8].copy_from_slice(&0i32.to_le_bytes()); // top
+    buf[8..12].copy_from_slice(&w.to_le_bytes()); // right
+    buf[12..16].copy_from_slice(&h.to_le_bytes()); // bottom
+    ctx.cpu.write_mem(rect_ptr, &buf)?;
+    Ok(())
+}
+
+fn get_client_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // GetClientRect(hWnd, lpRect) -> BOOL.
+    let _hwnd = ctx.arg_u32(0)?;
+    let lp_rect = ctx.arg_u32(1)?;
+    write_rect(ctx, lp_rect, FB_WIDTH as i32, FB_HEIGHT as i32)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn get_window_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let lp_rect = ctx.arg_u32(1)?;
+    write_rect(ctx, lp_rect, FB_WIDTH as i32, FB_HEIGHT as i32)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+const FAKE_ICON: u32 = 0xDEAD_1C01;
+const FAKE_ACCEL: u32 = 0xDEAD_AC01;
+const FAKE_TIMER_BASE: u32 = 0xDEAD_7100;
+
+fn load_icon_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_ICON))
+}
+
+fn load_accelerators_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_ACCEL))
+}
+
+fn dialog_box_indirect_param_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Treat any modal dialog as immediately cancelled. Real games use
+    // these for splash / about screens; cancelling is harmless.
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn message_box_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // IDOK = 1
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn set_timer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let id = ctx.arg_u32(1)?;
+    let final_id = if id == 0 { FAKE_TIMER_BASE } else { id };
+    ctx.kernel.synthetic_timer_id = final_id;
+    Ok(DispatchOutcome::ReturnedR0(final_id))
+}
+
+fn create_event_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0xDEAD_E001))
+}
+
+fn create_thread(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // We don't model threading; pretend the thread was created and
+    // immediately joined.
+    Ok(DispatchOutcome::ReturnedR0(0xDEAD_7C00))
+}
+
+fn get_current_thread_id(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+// ---------- additional GDI handlers ----------
+
+/// `HBITMAP CreateDIBSection(HDC hdc, const BITMAPINFO *pbmi,
+///   UINT usage, void **ppvBits, HANDLE hSection, DWORD dwOffset)`
+///
+/// We allocate guest-visible memory for the pixel buffer, write the
+/// pointer back through `ppvBits`, and register a [`Bitmap`] whose
+/// pixel storage lives at that VA. Subsequent `BitBlt` reads are
+/// served by re-decoding the guest's pixel store on demand.
+fn create_dib_section(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hdc = ctx.arg_u32(0)?;
+    let pbmi = ctx.arg_u32(1)?;
+    let _usage = ctx.arg_u32(2)?;
+    let pp_bits = ctx.arg_u32(3)?;
+    if pbmi == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // BITMAPINFOHEADER is 40 bytes.
+    let hdr = ctx.cpu.read_mem(pbmi, 40)?;
+    let bi_size = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    if bi_size < 40 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bi_width = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    let bi_height = i32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    let bi_bpp = u16::from_le_bytes([hdr[14], hdr[15]]);
+    let bi_compression = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]);
+    let bi_colors_used = u32::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35]]);
+    if bi_width <= 0 || bi_height == 0 || bi_compression != 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let width = bi_width as u32;
+    let bottom_up = bi_height > 0;
+    let height = bi_height.unsigned_abs();
+    let row_bytes = match bi_bpp {
+        1 => width.div_ceil(8),
+        4 => width.div_ceil(2),
+        8 => width,
+        16 => width * 2,
+        24 => width * 3,
+        32 => width * 4,
+        _ => return Ok(DispatchOutcome::ReturnedR0(0)),
+    };
+    let row_stride = (row_bytes + 3) & !3;
+    let pixel_size = row_stride.saturating_mul(height);
+
+    let palette_entries = match bi_bpp {
+        1 | 4 | 8 => {
+            if bi_colors_used == 0 {
+                1u32 << bi_bpp
+            } else {
+                bi_colors_used
+            }
+        }
+        _ => 0,
+    };
+    let palette_off = bi_size as usize;
+    let mut palette_565 = Vec::with_capacity(palette_entries as usize);
+    if palette_entries > 0 {
+        let pal_bytes = ctx
+            .cpu
+            .read_mem(pbmi + palette_off as u32, palette_entries * 4)?;
+        for i in 0..palette_entries as usize {
+            let p = i * 4;
+            palette_565.push(pocket_kernel::framebuffer::pack_rgb565(
+                pal_bytes[p + 2],
+                pal_bytes[p + 1],
+                pal_bytes[p],
+            ));
+        }
+    }
+
+    let bits_va = match ctx.kernel.heap.alloc(pixel_size.max(1)) {
+        Some(p) => p,
+        None => {
+            log::warn!("CreateDIBSection: heap exhausted (need {pixel_size} bytes)");
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+    };
+    // Zero-fill so the buffer is well-defined before the game paints
+    // into it.
+    let zeros = vec![0u8; pixel_size as usize];
+    ctx.cpu.write_mem(bits_va, &zeros)?;
+    if pp_bits != 0 {
+        ctx.cpu.write_mem(pp_bits, &bits_va.to_le_bytes())?;
+    }
+
+    let bm = pocket_kernel::gdi::Bitmap::new_dib(
+        width,
+        height,
+        bi_bpp,
+        bits_va,
+        row_stride,
+        bottom_up,
+        palette_565,
+    );
+    let handle = ctx.kernel.gdi.register_dib(bm);
+    log::debug!(
+        "CreateDIBSection({}x{}, {}bpp, {}-up) -> 0x{:08x} bits=0x{:08x}",
+        width,
+        height,
+        bi_bpp,
+        if bottom_up { "bottom" } else { "top" },
+        handle,
+        bits_va
+    );
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+fn create_bitmap(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let w = ctx.arg_u32(0)?;
+    let h = ctx.arg_u32(1)?;
+    let _planes = ctx.arg_u32(2)?;
+    let _bpp = ctx.arg_u32(3)?;
+    let _bits = ctx.arg_u32(4)?;
+    let handle = ctx.kernel.gdi.create_compatible_bitmap(w, h);
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+fn ellipse(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Approximate Ellipse with a fill+stroke rect for now — Pocket PC
+    // games use this primarily as a focus indicator.
+    rectangle(ctx)
+}
+
+fn pat_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    let w = ctx.arg_u32(3)? as i32;
+    let h = ctx.arg_u32(4)? as i32;
+    let _rop = ctx.arg_u32(5)?;
+    let dc_meta = match ctx.kernel.gdi.dc(hdc).cloned() {
+        Some(d) => d,
+        None => return Ok(DispatchOutcome::ReturnedR0(0)),
+    };
+    let rgb = colorref_to_rgb565(dc_meta.brush_color);
+    if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
+        surf.fill_rect(x, y, w, h, rgb);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn stretch_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Treat StretchBlt as BitBlt for now — destination and source
+    // sizes match in practice for the JumpyBall sprite path.
+    let hdc_dst = ctx.arg_u32(0)?;
+    let dx = ctx.arg_u32(1)? as i32;
+    let dy = ctx.arg_u32(2)? as i32;
+    let dw = ctx.arg_u32(3)? as i32;
+    let dh = ctx.arg_u32(4)? as i32;
+    let hdc_src = ctx.arg_u32(5)?;
+    let sx = ctx.arg_u32(6)? as i32;
+    let sy = ctx.arg_u32(7)? as i32;
+    let _sw = ctx.arg_u32(8)? as i32;
+    let _sh = ctx.arg_u32(9)? as i32;
+    let _rop = ctx.arg_u32(10)?;
+    bit_blt_inner(ctx, hdc_dst, dx, dy, dw, dh, hdc_src, sx, sy)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `int DrawTextW(HDC hdc, LPCWSTR text, int n, LPRECT rc, UINT fmt)`
+/// — render the supplied UTF-16 string into the destination DC's
+/// surface using a built-in 6×8 ASCII font. `n` may be `-1`, in which
+/// case the string is NUL-terminated.
+fn draw_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let text_p = ctx.arg_u32(1)?;
+    let n = ctx.arg_u32(2)? as i32;
+    let rc_p = ctx.arg_u32(3)?;
+    let dc_meta = match ctx.kernel.gdi.dc(hdc).cloned() {
+        Some(d) => d,
+        None => return Ok(DispatchOutcome::ReturnedR0(0)),
+    };
+    let mut chars = Vec::new();
+    if text_p != 0 {
+        let max = if n < 0 { 1024 } else { (n as u32).min(1024) };
+        let raw = ctx.cpu.read_mem(text_p, max * 2)?;
+        for i in (0..raw.len()).step_by(2) {
+            if i + 1 >= raw.len() {
+                break;
+            }
+            let u = u16::from_le_bytes([raw[i], raw[i + 1]]);
+            if n < 0 && u == 0 {
+                break;
+            }
+            chars.push(u);
+        }
+    }
+    let (rl, rt, rr, rb) = if rc_p != 0 {
+        let r = ctx.cpu.read_mem(rc_p, 16)?;
+        (
+            i32::from_le_bytes([r[0], r[1], r[2], r[3]]),
+            i32::from_le_bytes([r[4], r[5], r[6], r[7]]),
+            i32::from_le_bytes([r[8], r[9], r[10], r[11]]),
+            i32::from_le_bytes([r[12], r[13], r[14], r[15]]),
+        )
+    } else {
+        (0, 0, FB_WIDTH as i32, FB_HEIGHT as i32)
+    };
+    let color = colorref_to_rgb565(dc_meta.text_color);
+    let bk_color = colorref_to_rgb565(dc_meta.bk_color);
+    let glyph_w = pocket_kernel::font::GLYPH_W;
+    let glyph_h = pocket_kernel::font::GLYPH_H;
+    // DT_CENTER = 1, DT_VCENTER = 4, DT_SINGLELINE = 0x20.
+    let fmt = ctx.arg_u32(4).unwrap_or(0);
+    let pixel_w = chars.len() as i32 * glyph_w;
+    let x = if fmt & 0x1 != 0 {
+        rl + ((rr - rl) - pixel_w).max(0) / 2
+    } else {
+        rl
+    };
+    let y = if fmt & 0x4 != 0 {
+        rt + ((rb - rt) - glyph_h).max(0) / 2
+    } else {
+        rt
+    };
+    if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
+        if !dc_meta.bk_transparent {
+            surf.fill_rect(x, y, pixel_w, glyph_h, bk_color);
+        }
+        pocket_kernel::font::draw_str_u16(&mut surf, x, y, &chars, color);
+        surf.mark_dirty();
+    }
+    Ok(DispatchOutcome::ReturnedR0(glyph_h as u32))
+}
+
+/// `BOOL TextOutW(HDC, int x, int y, LPCWSTR text, int len)` — render a
+/// short UTF-16 string at the given pixel coordinates using the same
+/// 6×8 font as `DrawTextW`.
+fn text_out_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    let text_p = ctx.arg_u32(3)?;
+    let len = ctx.arg_u32(4)? as i32;
+    blit_text_at(ctx, hdc, x, y, text_p, len)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL ExtTextOutW(HDC, int x, int y, UINT options, RECT* rc,
+///                   LPCWSTR text, UINT len, INT* dx)`
+fn ext_text_out_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    let _opts = ctx.arg_u32(3)?;
+    // The 5th and 6th args go on the stack; arg_u32(4)/(5) handle that.
+    let _rc = ctx.arg_u32(4).unwrap_or(0);
+    let text_p = ctx.arg_u32(5).unwrap_or(0);
+    let len = ctx.arg_u32(6).unwrap_or(0) as i32;
+    blit_text_at(ctx, hdc, x, y, text_p, len)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn blit_text_at(
+    ctx: &mut CallCtx<'_>,
+    hdc: u32,
+    x: i32,
+    y: i32,
+    text_p: u32,
+    len: i32,
+) -> Result<(), KernelError> {
+    let dc_meta = match ctx.kernel.gdi.dc(hdc).cloned() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+    let mut chars = Vec::new();
+    if text_p != 0 {
+        let max = if len < 0 {
+            1024
+        } else {
+            (len as u32).min(1024)
+        };
+        let raw = ctx.cpu.read_mem(text_p, max * 2)?;
+        for i in (0..raw.len()).step_by(2) {
+            if i + 1 >= raw.len() {
+                break;
+            }
+            let u = u16::from_le_bytes([raw[i], raw[i + 1]]);
+            if len < 0 && u == 0 {
+                break;
+            }
+            chars.push(u);
+        }
+    }
+    let color = colorref_to_rgb565(dc_meta.text_color);
+    let bk_color = colorref_to_rgb565(dc_meta.bk_color);
+    let pixel_w = chars.len() as i32 * pocket_kernel::font::GLYPH_W;
+    if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
+        if !dc_meta.bk_transparent {
+            surf.fill_rect(x, y, pixel_w, pocket_kernel::font::GLYPH_H, bk_color);
+        }
+        pocket_kernel::font::draw_str_u16(&mut surf, x, y, &chars, color);
+        surf.mark_dirty();
+    }
+    Ok(())
+}
+
+fn ext_escape(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // ExtEscape is used to query device-specific capabilities
+    // (rotation hints, GAPI fast paths). Reporting "unsupported" (0)
+    // makes the game fall back to the default GDI path.
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn get_device_caps(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hdc = ctx.arg_u32(0)?;
+    let index = ctx.arg_u32(1)?;
+    let v = match index {
+        8 => FB_WIDTH,   // HORZRES
+        10 => FB_HEIGHT, // VERTRES
+        12 => 16,        // BITSPIXEL
+        14 => 1,         // PLANES
+        88 => 96,        // LOGPIXELSX
+        90 => 96,        // LOGPIXELSY
+        _ => 0,
+    };
+    Ok(DispatchOutcome::ReturnedR0(v))
+}
+
+// ---------- random / time ----------
+
+fn rand_handler(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEED: AtomicU32 = AtomicU32::new(0x1234_ABCD);
+    // 32-bit linear congruential generator (Numerical Recipes parameters).
+    let prev = SEED.load(Ordering::Relaxed);
+    let next = prev.wrapping_mul(1664525).wrapping_add(1013904223);
+    SEED.store(next, Ordering::Relaxed);
+    Ok(DispatchOutcome::ReturnedR0(next & 0x7FFF))
+}
+
+fn srand_handler(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn time_handler(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(now))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,9 +3372,20 @@ mod tests {
     use pocket_pe::ImportBinding;
 
     fn fresh_kernel() -> KernelState {
+        use pocket_kernel::{Framebuffer, GdiState};
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
+            framebuffer: Framebuffer::default(),
+            gdi: GdiState::new(),
+            resources: vec![],
+            image_base: 0,
+            fb_mapped: false,
+            synthetic_message_count: 0,
+            synthetic_message_budget: 240,
+            wnd_proc: 0,
+            synthetic_timer_id: 0,
+            synthetic_create_sent: false,
         }
     }
 
@@ -1123,5 +3559,165 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn get_file_attributes_w_null_pointer_is_invalid() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = get_file_attributes_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn get_file_attributes_w_unmounted_prefix_is_invalid() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let s: Vec<u8> = "\\Nope\\foo.txt\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = get_file_attributes_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn get_file_attributes_w_returns_normal_for_real_file() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let s: Vec<u8> = "\\App\\hello.txt\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = get_file_attributes_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(0x0000_0080));
+    }
+
+    #[test]
+    fn get_file_attributes_w_returns_directory_for_real_dir() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sounds")).unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let s: Vec<u8> = "\\App\\sounds\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = get_file_attributes_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(0x0000_0010));
+    }
+
+    #[test]
+    fn get_file_attributes_w_missing_file_is_invalid() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let s: Vec<u8> = "\\App\\does-not-exist.txt\0"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        cpu.write_mem(0x1000, &s).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = get_file_attributes_w(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(0xFFFF_FFFF));
+    }
+
+    // ---- GDI handler tests ----
+
+    #[test]
+    fn fill_rect_paints_into_framebuffer() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        // RECT { 5, 7, 25, 27 }
+        let mut rect = Vec::new();
+        rect.extend_from_slice(&5i32.to_le_bytes());
+        rect.extend_from_slice(&7i32.to_le_bytes());
+        rect.extend_from_slice(&25i32.to_le_bytes());
+        rect.extend_from_slice(&27i32.to_le_bytes());
+        cpu.write_mem(0x1000, &rect).unwrap();
+
+        // Allocate a brush.
+        cpu.write_reg(ArmReg::R0, 0x00ff0000).unwrap(); // COLORREF: red
+        let t = dummy_thunk();
+        let hbr = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            match create_solid_brush(&mut c).unwrap() {
+                DispatchOutcome::ReturnedR0(h) => h,
+                _ => panic!(),
+            }
+        };
+        // FillRect(GDI_SCREEN_DC, 0x1000, hbr).
+        cpu.write_reg(ArmReg::R0, GDI_SCREEN_DC).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x1000).unwrap();
+        cpu.write_reg(ArmReg::R2, hbr).unwrap();
+        let pre = kernel.framebuffer.frame_counter;
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        let r = fill_rect(&mut c).unwrap();
+        assert_eq!(r, DispatchOutcome::ReturnedR0(1));
+        assert!(kernel.framebuffer.frame_counter > pre);
+        // Pixel at (5,7) must now be non-zero (red 0xF800 in RGB565,
+        // little-endian on the wire).
+        let off = (7 * pocket_kernel::framebuffer::FB_WIDTH as usize + 5) * 2;
+        assert_ne!(kernel.framebuffer.pixels[off], 0);
     }
 }

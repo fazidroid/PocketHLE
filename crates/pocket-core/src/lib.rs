@@ -17,7 +17,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use pocket_cpu::{stub::StubCpu, Cpu};
-use pocket_kernel::{run_main_loop, Process};
+use pocket_kernel::{run_main_loop, run_main_loop_with_hook, FrameHook, Process};
 use pocket_winceapi::{resolve_ordinal, WinCeDispatcher};
 
 pub use pocket_cab as cab;
@@ -100,6 +100,24 @@ impl Emulator {
         .context("main emulator loop")
     }
 
+    /// Like [`Self::run`], but routes the framebuffer through
+    /// `frame_hook` once per dispatch slice.
+    pub fn run_with_hook(&mut self, frame_hook: &mut dyn FrameHook) -> Result<()> {
+        let process = self
+            .process
+            .as_mut()
+            .context("no PE loaded — call load_pe() first")?;
+        run_main_loop_with_hook(
+            self.cpu.as_mut(),
+            process,
+            &mut self.dispatcher,
+            self.instruction_budget_per_slice,
+            self.max_slices,
+            Some(frame_hook),
+        )
+        .context("main emulator loop")
+    }
+
     pub fn process(&self) -> Option<&Process> {
         self.process.as_ref()
     }
@@ -112,6 +130,23 @@ impl Emulator {
         &self.dispatcher
     }
 
+    /// Write raw bytes into emulated guest memory. Useful for patching
+    /// the loaded image (e.g. NOP'ing out a hostile static-init call)
+    /// before [`Self::run`] is invoked.
+    pub fn write_guest_memory(&mut self, addr: u32, bytes: &[u8]) -> Result<()> {
+        self.cpu
+            .write_mem(addr, bytes)
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Install an instruction-level code hook at the given guest VA.
+    /// Used by `--watch` for diagnostic breakpoints. When the CPU
+    /// reaches the address, the kernel run loop will dump registers
+    /// and halt cleanly.
+    pub fn add_code_hook(&mut self, va: u32) -> Result<()> {
+        self.cpu.add_code_hook(va).map_err(|e| anyhow::anyhow!(e))
+    }
+
     /// Mount a host directory at a guest WinCE path. Useful for
     /// satisfying `CreateFileW` requests once the PE is loaded.
     pub fn mount_dir(&mut self, guest_prefix: &str, host_dir: impl Into<std::path::PathBuf>) {
@@ -119,6 +154,16 @@ impl Emulator {
             p.state.vfs.mount(guest_prefix, host_dir);
         } else {
             log::warn!("mount_dir called before load_pe; ignored");
+        }
+    }
+
+    /// Override how many synthetic `WM_PAINT` messages the dispatcher
+    /// will hand out before posting `WM_QUIT`. Pass `0` for unlimited
+    /// (the message loop will keep running until another path halts
+    /// the emulator).
+    pub fn set_synthetic_message_budget(&mut self, budget: u64) {
+        if let Some(p) = self.process.as_mut() {
+            p.state.synthetic_message_budget = budget;
         }
     }
 }

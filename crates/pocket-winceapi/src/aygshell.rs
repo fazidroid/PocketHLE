@@ -9,10 +9,18 @@ pub fn register(d: &mut WinCeDispatcher) {
     for f in [
         "SHFullScreen",
         "SHCreateMenuBar",
+        "SHCreateMenuBarEx",
         "SHHandleWMActivate",
         "SHHandleWMSettingChange",
         "SHInitDialog",
         "SHSipPreference",
+        "SHRecognizeGesture",
+        "SHCloseApps",
+        "SHDoneButton",
+        "SHIdleTimerReset",
+        "SHEnableSoftkey",
+        "SHGetDocumentsFolder",
+        "SHSetAppKeyWndAssoc",
     ] {
         d.register_handler(dll, f, ok);
     }
