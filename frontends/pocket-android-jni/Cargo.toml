@@ -12,9 +12,15 @@ name = "pockethle_jni"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Default builds include the real ARM CPU (unicorn-engine). The stub
-# backend exists for tracing only and is not useful at runtime.
-default = ["unicorn"]
+# Default builds use the trace-only stub CPU. Real ARM CPU emulation
+# (unicorn-engine) currently does not cross-compile to
+# `aarch64-linux-android` / `armv7-linux-androideabi` because
+# unicorn-engine-sys 2.1.5 ships QEMU's autoconf-style `qemu/configure`
+# which detects the *build host's* CPU (x86_64) and compiles the
+# i386 TCG JIT backend, then NDK clang chokes on QEMU's `cpuid.h`.
+# The desktop and CLI frontends build fine with `--features unicorn`
+# because they target the same CPU as the build host.
+default = []
 unicorn = ["pocket-core/unicorn"]
 
 [dependencies]

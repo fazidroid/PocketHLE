@@ -158,15 +158,18 @@ jobs:
           add-to-path: true
       - name: install cargo-ndk
         run: cargo install cargo-ndk --locked
-      - name: install cmake (for unicorn-engine cross-compile)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential
-      - name: cross-compile native lib (with unicorn-engine)
+      - name: cross-compile native lib (stub CPU only)
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          # NOTE: pocket-android-jni currently does NOT enable the
+          # `unicorn` feature. unicorn-engine-sys 2.1.5 cannot
+          # cross-compile its bundled QEMU TCG JIT to
+          # aarch64-linux-android / armv7-linux-androideabi (it
+          # detects the build host's x86_64 and picks tcg/i386,
+          # which NDK clang can't compile). The Android APK
+          # therefore ships with the trace-only stub backend.
           cargo ndk \
             -t arm64-v8a \
             -t armeabi-v7a \
