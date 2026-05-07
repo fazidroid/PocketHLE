@@ -14,10 +14,12 @@ The first target ROM is a small physics game called **JumpyBall** (provided
 by the user, ARM PE32, Windows CE 5 GUI). All work is driven from the public
 APIs that this game uses.
 
-> **Status:** early — the ARM CPU runs, the loader works, system-DLL imports
-> are intercepted and traced, and a handful of `coredll` functions are
-> implemented (`memcpy`, `memset`, `GetTickCount`, ...). There is no rendering
-> backend yet. See [Roadmap](#roadmap).
+> **Status:** early but visibly working — the ARM CPU runs, the loader
+> works, system-DLL imports are intercepted, a software-rasterised
+> framebuffer is wired through GDI/GAPI, and JumpyBall reaches its
+> main menu and credits screen out of the box (`pockethle run
+> JumpyBallPPC.cab`). See [Roadmap](#roadmap) for what is still
+> stubbed.
 
 [Russian (Русский) version → `README.ru.md`](README.ru.md)
 
@@ -161,29 +163,52 @@ Double-clicking `pockethle-gui.exe` opens a small launcher window: import a
 
 ## Trying it on the JumpyBall test ROM
 
+The `run` subcommand accepts a Pocket PC `.exe`, a `.cab`, or a
+`.zip` directly — archives are auto-extracted into a temp dir and the
+largest ARM PE inside is launched. The default build of `pockethle`
+includes both the `unicorn` CPU and the `display` host-window
+features so a freshly-checked-out repo can render a game without
+extra flags.
+
 ```bash
-# Inspect a CAB without unpacking permanently
+# (a) Run from the original Microsoft cabinet — auto-extracts and
+#     auto-mounts the cabinet contents at the guest's `\Application\`
+#     so CreateFileW finds the bundled resources.
+pockethle run ~/JumpyBallPPC.cab
+
+# (b) Same, but pop a host window with the live framebuffer.
+pockethle run ~/JumpyBallPPC.cab --display
+
+# (c) Headless capture: dump every rendered frame as PPM and stop
+#     after eight frames — useful for CI / regression diffs.
+pockethle run ~/JumpyBallPPC.cab \
+    --dump-frames-to /tmp/jumpy_frames --max-frames 8
+
+# (d) The classic flow is still supported if you want to inspect
+#     things by hand:
 pockethle inspect-cab ~/JumpyBallPPC.cab
-
-# Or unpack manually first:
-pockethle unpack-cab ~/JumpyBallPPC.cab /tmp/jumpy
+pockethle unpack-cab  ~/JumpyBallPPC.cab /tmp/jumpy
 pockethle pe-info     /tmp/jumpy/JUMPYB~1.002
+pockethle run         /tmp/jumpy/JUMPYB~1.002
 
-# Run the game (CPU = unicorn). Without the feature flag, the run
-# subcommand still loads the PE and prints the import table, but does
-# not interpret any instructions.
-pockethle -v run /tmp/jumpy/JUMPYB~1.002 \
-    --cpu unicorn \
-    --max-slices 200 --instructions-per-slice 100000
+# (e) For trace-only analysis (no real CPU), pass `--cpu stub`. This
+#     does not require the Unicorn build.
+pockethle run ~/JumpyBallPPC.cab --cpu stub --max-slices 1
 ```
 
-The first time you run this, expect to see lines like:
+Real PPC2003 games typically need a few hundred thousand emulated
+slices to finish their CRT init, build their soft-float lookup
+tables and load bitmap resources before the first `WM_PAINT` is
+delivered. `pockethle run` therefore defaults to `--max-slices
+2_000_000`; pass a smaller value for fast smoke tests, or `0` for no
+upper bound.
+
+The first time you run an unfamiliar binary, expect to see lines
+like:
 
 ```
 [INFO  pocket_kernel] entering emulated main: entry=0x000247c8, stack_top=0x60000000
-[WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!__chkstk
 [WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!CreateDirectoryW
-[WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!Rectangle
 ...
 ```
 

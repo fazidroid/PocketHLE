@@ -7,6 +7,8 @@ use clap::{Parser, Subcommand};
 
 use pocket_core::Emulator;
 
+mod archive;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "pockethle",
@@ -45,19 +47,38 @@ enum Command {
         #[arg(short, long, default_value = "demo.ppm")]
         out: PathBuf,
     },
-    /// Run a PE file in the emulator. Without `--cpu unicorn` this
-    /// uses the trace-only stub CPU and only logs API requests.
+    /// Run a PE file in the emulator.
+    ///
+    /// `path` may be:
+    ///   * a Pocket PC `.exe` (PE32 ARM) — loaded directly,
+    ///   * a `.cab` — auto-extracted into a temp dir; the largest ARM
+    ///     PE inside is launched and the extracted dir is mounted as
+    ///     `\Application\` so the guest can `CreateFileW` its own
+    ///     resources,
+    ///   * a `.zip` — auto-extracted, first ARM PE is launched.
+    ///
+    /// With the default `unicorn` CPU backend the real ARM core runs
+    /// the guest. With `--cpu stub` PocketHLE only logs API requests
+    /// (useful for dry-run analysis).
     Run {
         path: PathBuf,
         /// CPU backend.
-        #[arg(long, default_value = "stub")]
+        #[arg(long, default_value = DEFAULT_CPU_BACKEND)]
         cpu: CpuBackend,
         /// Halt as soon as the guest calls an unimplemented API.
         #[arg(long, default_value_t = false)]
         halt_on_unimplemented: bool,
         /// Maximum number of host-resumed slices (each slice can
         /// run up to `--instructions-per-slice` instructions).
-        #[arg(long, default_value_t = 1024)]
+        ///
+        /// Real PPC2003 games typically need a few hundred thousand
+        /// slices to finish their CRT init, build their soft-float
+        /// lookup tables and load bitmap resources before the first
+        /// `WM_PAINT` is delivered, so the default is high enough
+        /// that `pockethle run game.cab` produces visible output
+        /// out of the box. Pass a smaller value for fast smoke
+        /// tests, or `0` for no upper bound.
+        #[arg(long, default_value_t = 2_000_000)]
         max_slices: u64,
         #[arg(long, default_value_t = 1_000_000)]
         instructions_per_slice: u64,
@@ -118,6 +139,15 @@ enum CpuBackend {
     #[cfg(feature = "unicorn")]
     Unicorn,
 }
+
+/// CPU backend used when `--cpu` is not specified. We pick `unicorn`
+/// when the binary is compiled with that feature so that the default
+/// `pockethle run …` invocation actually runs guest ARM code; the
+/// user can still pass `--cpu stub` for trace-only analysis.
+#[cfg(feature = "unicorn")]
+const DEFAULT_CPU_BACKEND: &str = "unicorn";
+#[cfg(not(feature = "unicorn"))]
+const DEFAULT_CPU_BACKEND: &str = "stub";
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -375,8 +405,16 @@ fn cmd_run(
         emu.set_trace_sink(Box::new(std::io::BufWriter::new(f)));
         println!("Tracing API calls to {} (JSON lines)", p.display());
     }
+
+    // Resolve `path` into the actual PE to load. For `.cab` / `.zip`
+    // archives this auto-extracts into a temp dir held alive by
+    // `_launcher` for the duration of cmd_run.
+    let _launcher = archive::prepare(path)
+        .with_context(|| format!("preparing {} for execution", path.display()))?;
+    println!("{}", _launcher.origin);
+
     let summary = {
-        let p = emu.load_pe(path)?;
+        let p = emu.load_pe(&_launcher.exe)?;
         format!(
             "Loaded {} ({} machine), {} sections, {} imports",
             p.image.source_path,
@@ -390,6 +428,13 @@ fn cmd_run(
         emu.mount_dir(rom_prefix, dir);
         println!(
             "Mounted host directory {} at guest prefix {:?}",
+            dir.display(),
+            rom_prefix
+        );
+    } else if let Some(dir) = _launcher.mount_dir.as_deref() {
+        emu.mount_dir(rom_prefix, dir);
+        println!(
+            "Auto-mounted extracted dir {} at guest prefix {:?}",
             dir.display(),
             rom_prefix
         );
