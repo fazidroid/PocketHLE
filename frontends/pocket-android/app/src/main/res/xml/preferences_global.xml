@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <ListPreference
+        android:key="default_cpu_backend"
+        android:title="@string/pref_default_backend_title"
+        android:summary="@string/pref_default_backend_summary"
+        android:entries="@array/cpu_backend_entries"
+        android:entryValues="@array/cpu_backend_values"
+        android:defaultValue="stub" />
+
+    <SeekBarPreference
+        android:key="verbosity"
+        android:title="@string/pref_verbosity_title"
+        android:summary="@string/pref_verbosity_summary"
+        android:max="3"
+        app:min="0"
+        app:showSeekBarValue="true"
+        android:defaultValue="1" />
+
+    <Preference
+        android:key="library_root"
+        android:title="@string/pref_library_root_title"
+        android:selectable="false" />
+
+</PreferenceScreen>

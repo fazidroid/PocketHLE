@@ -16,7 +16,11 @@ default = []
 unicorn = ["pocket-core/unicorn"]
 
 [dependencies]
+anyhow.workspace = true
 log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 android_logger = "0.13"
 jni = "0.21"
 pocket-core = { path = "../../crates/pocket-core" }
+pocket-library = { path = "../../crates/pocket-library" }
