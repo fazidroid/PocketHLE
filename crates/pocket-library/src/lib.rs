@@ -128,7 +128,16 @@ impl Default for GameSettings {
 }
 
 fn default_max_slices() -> u64 {
-    1024
+    // Real PPC2003 games typically need a few hundred thousand
+    // slices to finish their CRT init / soft-float lookup tables /
+    // bitmap loading before the first WM_PAINT is delivered, and
+    // millions more to clear the splash and reach gameplay.
+    // 1024 was effectively a smoke test, not a game launcher: a
+    // freshly imported game timed out long before the title
+    // screen and looked frozen in the GUI. 50 million is enough
+    // to land on the JumpyBall main menu in roughly ten seconds
+    // on a modern x86 machine.
+    50_000_000
 }
 
 fn default_instructions_per_slice() -> u64 {
@@ -215,11 +224,75 @@ impl Library {
 
         let library = read_or_default::<LibraryFile>(&root.join("library.json"))?;
         let config = read_or_default::<LauncherConfig>(&root.join("config.json"))?;
-        Ok(Self {
+        let mut this = Self {
             root,
             library,
             config,
-        })
+        };
+        this.migrate_legacy_entries();
+        Ok(this)
+    }
+
+    /// Upgrade game entries and global config persisted by older
+    /// versions of PocketHLE so they are usable under the current
+    /// defaults.
+    ///
+    /// * `cpu_backend = Stub` is bumped to `Unicorn`. Stub is
+    ///   trace-only — it never executes ARM instructions, so any
+    ///   pre-#8 game crashes with "guest jumped to unmapped address
+    ///   0x00000000" out of the box, which is exactly the failure
+    ///   mode users hit before this migration existed.
+    /// * `max_slices <= 1_048_576` is bumped to the current default
+    ///   (50M). The legacy 1024 default was effectively a smoke
+    ///   test and timed out long before the title screen.
+    /// * The global `default_cpu_backend` is also flipped from
+    ///   `Stub` to `Unicorn` so freshly imported games pick a
+    ///   backend that actually runs.
+    ///
+    /// Both the in-memory state and the on-disk `game.json` /
+    /// `library.json` / `config.json` are updated so subsequent
+    /// launches see the migrated values. Migration is silent when
+    /// no changes are needed.
+    fn migrate_legacy_entries(&mut self) {
+        let mut library_changed = false;
+        for game in self.library.games.iter_mut() {
+            let mut migrated = false;
+            if game.settings.cpu_backend == CpuBackendPref::Stub {
+                game.settings.cpu_backend = CpuBackendPref::Unicorn;
+                migrated = true;
+            }
+            if game.settings.max_slices <= 1_048_576 {
+                game.settings.max_slices = default_max_slices();
+                migrated = true;
+            }
+            if migrated {
+                library_changed = true;
+                let manifest = self.root.join("games").join(&game.id).join("game.json");
+                if let Err(e) = write_json(&manifest, game) {
+                    log::warn!("could not migrate {}: {e}", manifest.display());
+                }
+                log::info!(
+                    "migrated legacy game entry {}: backend=Unicorn, max_slices={}",
+                    game.id,
+                    game.settings.max_slices,
+                );
+            }
+        }
+        let mut config_changed = false;
+        if self.config.default_cpu_backend == CpuBackendPref::Stub {
+            self.config.default_cpu_backend = CpuBackendPref::Unicorn;
+            config_changed = true;
+        }
+        if library_changed {
+            if let Err(e) = write_json(&self.root.join("library.json"), &self.library) {
+                log::warn!("could not save migrated library.json: {e}");
+            }
+        }
+        if config_changed {
+            if let Err(e) = write_json(&self.root.join("config.json"), &self.config) {
+                log::warn!("could not save migrated config.json: {e}");
+            }
+        }
     }
 
     /// Library root directory.
@@ -505,5 +578,65 @@ mod tests {
     fn pretty_id_titlecases_words() {
         assert_eq!(pretty_id("jumpy_ball"), "Jumpy Ball");
         assert_eq!(pretty_id("foo-bar.baz"), "Foo Bar Baz");
+    }
+
+    #[test]
+    fn legacy_stub_entries_are_migrated_to_unicorn() {
+        let root = tmpdir("migrate");
+        fs::create_dir_all(root.join("games").join("legacy")).unwrap();
+        // Pre-#8 game.json shape: backend = stub, max_slices = 1024.
+        let legacy_json = serde_json::json!({
+            "id": "legacy",
+            "display_name": "Legacy Game",
+            "provider": null,
+            "executable": "extracted/LEGACY.exe",
+            "source_cab": "legacy.cab",
+            "imported_at": 0,
+            "settings": {
+                "cpu_backend": "stub",
+                "max_slices": 1024,
+                "instructions_per_slice": 1_000_000,
+                "halt_on_unimplemented": false,
+            },
+        });
+        fs::write(
+            root.join("games").join("legacy").join("game.json"),
+            serde_json::to_vec_pretty(&legacy_json).unwrap(),
+        )
+        .unwrap();
+        let library_file = serde_json::json!({
+            "schema_version": 1,
+            "games": [legacy_json],
+        });
+        fs::write(
+            root.join("library.json"),
+            serde_json::to_vec_pretty(&library_file).unwrap(),
+        )
+        .unwrap();
+        // Legacy global config that defaults new games to Stub.
+        let legacy_config = serde_json::json!({
+            "schema_version": 1,
+            "default_cpu_backend": "stub",
+            "verbosity": 1,
+            "last_import_dir": null,
+        });
+        fs::write(
+            root.join("config.json"),
+            serde_json::to_vec_pretty(&legacy_config).unwrap(),
+        )
+        .unwrap();
+
+        let lib = Library::open(&root).unwrap();
+        let game = lib.get("legacy").unwrap();
+        assert_eq!(game.settings.cpu_backend, CpuBackendPref::Unicorn);
+        assert_eq!(game.settings.max_slices, default_max_slices());
+        assert_eq!(lib.config().default_cpu_backend, CpuBackendPref::Unicorn);
+
+        // The migration must also be persisted to disk so the next
+        // open() doesn't have to redo the work.
+        let lib2 = Library::open(&root).unwrap();
+        let game2 = lib2.get("legacy").unwrap();
+        assert_eq!(game2.settings.cpu_backend, CpuBackendPref::Unicorn);
+        assert_eq!(game2.settings.max_slices, default_max_slices());
     }
 }
