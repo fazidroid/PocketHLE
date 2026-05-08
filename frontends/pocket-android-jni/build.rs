@@ -133,23 +133,18 @@ fn clang_rt_arch_for_target(target: &str) -> Option<&'static str> {
 }
 
 /// Best-effort host-tag for the NDK prebuilt directory. The CI runner and
-/// developer machines targeted here all use `linux-x86_64`; this matches
-/// other host shapes if a non-Linux dev clones the repo.
+/// developer machines targeted here all use `linux-x86_64`; this still
+/// produces sensible names for other dev hosts that may clone the repo.
 fn ndk_host_tag() -> String {
-    let os = env::consts::OS;
-    let arch = env::consts::ARCH;
-    let host_os = match os {
-        "linux" => "linux",
+    let host_os = match env::consts::OS {
         "macos" => "darwin",
-        "windows" => "windows",
+        // "linux" / "windows" / anything else maps to itself; the NDK uses
+        // the same names.
         other => other,
     };
-    let host_arch = match arch {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        other => other,
-    };
-    format!("{host_os}-{host_arch}")
+    // `env::consts::ARCH` already matches the suffixes the NDK uses
+    // (`x86_64` / `aarch64`), so no remap is needed.
+    format!("{host_os}-{}", env::consts::ARCH)
 }
 
 fn parse_version(name: &str) -> i64 {
