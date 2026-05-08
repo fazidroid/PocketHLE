@@ -440,11 +440,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // ---- Locale ----
     d.register_handler(dll, "GetUserDefaultLangID", get_user_default_lang_id);
     d.register_handler(dll, "GetUserDefaultLCID", get_user_default_lcid);
-    d.register_handler(
-        dll,
-        "GetSystemDefaultLangID",
-        get_system_default_lang_id,
-    );
+    d.register_handler(dll, "GetSystemDefaultLangID", get_system_default_lang_id);
     d.register_handler(dll, "GetThreadLocale", get_thread_locale);
 
     // ---- Codepage / dynamic loader ----
@@ -4183,7 +4179,11 @@ fn is_rect_empty(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
     let (l, t, r, b) = rect_load(ctx, p)?;
-    Ok(DispatchOutcome::ReturnedR0(if l >= r || t >= b { 1 } else { 0 }))
+    Ok(DispatchOutcome::ReturnedR0(if l >= r || t >= b {
+        1
+    } else {
+        0
+    }))
 }
 
 // ---------- Locale ----------
