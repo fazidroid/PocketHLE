@@ -95,6 +95,24 @@ pub trait Cpu {
     fn write_mem(&mut self, va: u32, data: &[u8]) -> Result<(), CpuError>;
     fn read_mem(&mut self, va: u32, len: u32) -> Result<Vec<u8>, CpuError>;
 
+    /// Like [`Cpu::read_mem`] but writes into a caller-provided
+    /// buffer. Hot paths (e.g. the per-frame GAPI flush which moves
+    /// 150 KiB of pixels every `GXEndDraw`) call this with a
+    /// pre-allocated `Vec<u8>` so we don't allocate a fresh
+    /// `Vec` per frame. The default implementation falls back to
+    /// `read_mem` so backends that don't care can stay simple.
+    fn read_mem_into(&mut self, va: u32, dst: &mut [u8]) -> Result<(), CpuError> {
+        let bytes = self.read_mem(va, dst.len() as u32)?;
+        if bytes.len() != dst.len() {
+            return Err(CpuError::BadMemory {
+                va,
+                size: dst.len() as u32,
+            });
+        }
+        dst.copy_from_slice(&bytes);
+        Ok(())
+    }
+
     fn read_reg(&mut self, reg: regs::ArmReg) -> Result<u32, CpuError>;
     fn write_reg(&mut self, reg: regs::ArmReg, value: u32) -> Result<(), CpuError>;
 

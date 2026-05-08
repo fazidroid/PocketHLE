@@ -3408,6 +3408,8 @@ mod tests {
             resources: vec![],
             image_base: 0,
             fb_mapped: false,
+            gx_readback_scratch: Vec::new(),
+            gx_last_pushed_counter: 0,
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,

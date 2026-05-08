@@ -90,18 +90,44 @@ fn gx_begin_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     ensure_fb_mapped(ctx)?;
     // Push the current host framebuffer state into the guest mapping
     // so the guest sees what was previously painted (e.g. a partial
-    // background).
-    ctx.cpu
-        .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
+    // background). Skip the 150 KiB write_mem when nothing on the
+    // host side has touched the framebuffer since our last EndDraw —
+    // i.e. the guest is the sole producer of pixels (the JumpyBall
+    // hot loop). `gx_last_pushed_counter` is bumped at end-of-frame;
+    // any GDI handler that paints into the host fb calls
+    // `mark_dirty()`, which advances `frame_counter`, so a mismatch
+    // here means somebody else dirtied the host fb and we have to
+    // re-prime the guest mapping.
+    let host_counter = ctx.kernel.framebuffer.frame_counter;
+    if host_counter != ctx.kernel.gx_last_pushed_counter {
+        ctx.cpu
+            .write_mem(SYNTHETIC_FB_BASE, &ctx.kernel.framebuffer.pixels)?;
+    }
     log::trace!("GXBeginDraw() -> 0x{:08x}", SYNTHETIC_FB_BASE);
     Ok(DispatchOutcome::ReturnedR0(SYNTHETIC_FB_BASE))
 }
 
 fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if ctx.kernel.fb_mapped {
-        let bytes = ctx.cpu.read_mem(SYNTHETIC_FB_BASE, FB_BYTES)?;
-        ctx.kernel.framebuffer.pixels.copy_from_slice(&bytes);
+        let fb_len = FB_BYTES as usize;
+        // Reuse a single host-side scratch buffer for the per-frame
+        // 150 KiB readback. Allocating a fresh `Vec<u8>` here every
+        // frame churned ~9 MiB/s during JumpyBall play and showed up
+        // as a measurable slice of the dispatcher's time budget.
+        if ctx.kernel.gx_readback_scratch.len() != fb_len {
+            ctx.kernel.gx_readback_scratch.resize(fb_len, 0);
+        }
+        ctx.cpu
+            .read_mem_into(SYNTHETIC_FB_BASE, &mut ctx.kernel.gx_readback_scratch)?;
+        ctx.kernel
+            .framebuffer
+            .pixels
+            .copy_from_slice(&ctx.kernel.gx_readback_scratch);
         ctx.kernel.framebuffer.mark_dirty();
+        // Snapshot the new counter *after* mark_dirty so the next
+        // BeginDraw can detect "nothing else touched the host fb in
+        // the meantime" and skip the redundant push.
+        ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
     }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -199,6 +225,8 @@ mod tests {
             resources: vec![],
             image_base: 0,
             fb_mapped: false,
+            gx_readback_scratch: Vec::new(),
+            gx_last_pushed_counter: 0,
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,

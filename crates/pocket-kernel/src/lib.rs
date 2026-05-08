@@ -162,6 +162,19 @@ pub struct KernelState {
     /// requires `&mut dyn Cpu`, which isn't available outside a call,
     /// so we let the GAPI handlers do it.
     pub fb_mapped: bool,
+    /// Pre-allocated scratch buffer the GAPI flush uses when copying
+    /// the guest-mapped framebuffer back into [`Framebuffer::pixels`].
+    /// Sized to `FB_BYTES` once on first use so there is no
+    /// allocation per `GXEndDraw` (which can fire 60+ times a
+    /// second).
+    pub gx_readback_scratch: Vec<u8>,
+    /// Frame counter snapshot taken the last time `GXEndDraw`
+    /// finished pushing pixels into the host framebuffer. If
+    /// `framebuffer.frame_counter` still equals this when the next
+    /// `GXBeginDraw` runs, we know no GDI handler has touched the
+    /// host fb in the meantime, and we can skip the
+    /// host-fb -> guest-fb copy that primes the back-buffer.
+    pub gx_last_pushed_counter: u64,
     /// Number of synthetic `WM_PAINT` / `WM_TIMER` messages already
     /// fed to the guest. Used by `GetMessageW` / `PeekMessageW` to
     /// terminate the message loop after a configurable number of
@@ -453,6 +466,8 @@ impl Process {
                 resources,
                 image_base: img_base,
                 fb_mapped: false,
+                gx_readback_scratch: Vec::new(),
+                gx_last_pushed_counter: 0,
                 synthetic_message_count: 0,
                 synthetic_message_budget: 240,
                 wnd_proc: 0,
@@ -467,6 +482,18 @@ impl Process {
     /// Look up the thunk by its hook address.
     pub fn find_thunk(&self, va: u32) -> Option<&Thunk> {
         self.thunk_by_va.get(&va).and_then(|i| self.thunks.get(*i))
+    }
+
+    /// Split-borrow helper used by [`run_main_loop_with_hook`]: returns
+    /// the [`Thunk`] for `va` together with `&mut state`, in a single
+    /// call so the borrow checker can see both fields are disjoint.
+    /// Avoids the per-call `Thunk::clone()` that would otherwise be
+    /// needed to release the immutable borrow on `self.thunks` before
+    /// taking a mutable borrow on `self.state`.
+    pub fn find_thunk_and_state(&mut self, va: u32) -> Option<(&Thunk, &mut KernelState)> {
+        let idx = *self.thunk_by_va.get(&va)?;
+        let thunk = self.thunks.get(idx)?;
+        Some((thunk, &mut self.state))
     }
 
     /// Group import symbols by DLL — useful for printing a summary.
@@ -594,8 +621,22 @@ pub fn run_main_loop_with_hook(
                 continue;
             }
             StopReason::Hook(addr) => {
-                let thunk = match process.find_thunk(addr) {
-                    Some(t) => t.clone(),
+                let outcome = match process.find_thunk_and_state(addr) {
+                    Some((thunk, state)) => {
+                        // Split borrow: `thunk` borrows
+                        // `process.thunks` immutably and `state`
+                        // borrows `process.state` mutably. No clone,
+                        // and no per-call heap allocation — that
+                        // matters because this branch fires on every
+                        // single emulated WinCE API call.
+                        let outcome = dispatcher.dispatch(cpu, thunk, state)?;
+                        if matches!(outcome, DispatchOutcome::Halt)
+                            && log::log_enabled!(log::Level::Info)
+                        {
+                            log::info!("dispatcher requested halt at {}", thunk.label());
+                        }
+                        outcome
+                    }
                     None => {
                         // A non-thunk code hook fired. The expected
                         // case is the WinCE kernel-trap region
@@ -630,10 +671,8 @@ pub fn run_main_loop_with_hook(
                         return Ok(());
                     }
                 };
-                let outcome = dispatcher.dispatch(cpu, &thunk, &mut process.state)?;
                 match outcome {
                     DispatchOutcome::Halt => {
-                        log::info!("dispatcher requested halt at {}", thunk.label());
                         return Ok(());
                     }
                     DispatchOutcome::ReturnedR0(v) => {
