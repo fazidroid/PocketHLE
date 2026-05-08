@@ -1,37 +1,75 @@
 package com.pockethle.app
 
+import android.annotation.SuppressLint
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.os.Bundle
-import android.util.Base64
+import android.os.Handler
+import android.os.Looper
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.json.JSONObject
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
- * Hosts the emulator output for one game. The current implementation
- * runs the emulator to completion on a background coroutine and then
- * paints the captured framebuffer into a [SurfaceView] (a real-time
- * loop will land in a follow-up PR once the renderer settles).
+ * Hosts the emulator output for one game.
+ *
+ * The implementation drives the emulator session-style (see
+ * `pocket-android-jni::runner`): a Rust worker thread runs the
+ * emulator and the activity polls the latest framebuffer on the UI
+ * thread roughly every 33 ms (~30 Hz), feeds touches and virtual
+ * gamepad presses straight back into the kernel, and asks the
+ * worker to stop on Back / `onDestroy`. The previous single-shot
+ * `NativeBridge.runGame` API blocked until the emulator exited and
+ * never streamed intermediate frames, which looked like an infinite
+ * loading spinner once the real Unicorn backend was wired up.
  */
 class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     private lateinit var surface: SurfaceView
     private lateinit var progress: ProgressBar
     private lateinit var status: TextView
-    private var pendingFrame: FrameSnapshot? = null
+
+    /** Cached handle from `nativeStartGame` (`0` once we've finished). */
+    @Volatile private var session: Long = 0
+
+    /** Most recent framebuffer the worker produced — held so we can
+     * repaint after `surfaceChanged` resizes the SurfaceView even if
+     * the worker has not produced a new frame yet. */
+    private var lastFrame: FrameSnapshot? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Polling tick. ~30 Hz keeps the SurfaceView smooth without
+     * burning the CPU on a phone. */
+    private val pollTick = object : Runnable {
+        override fun run() {
+            if (session == 0L) return
+            val raw = NativeBridge.nativePollFrame(session)
+            if (raw != null) {
+                decodeFrame(raw)?.let { frame ->
+                    lastFrame = frame
+                    paintFrame(frame)
+                }
+            }
+            if (NativeBridge.nativeIsRunning(session) == 0) {
+                // Worker exited on its own (game called ExitProcess
+                // / hit max_slices / errored out). Reap it so we
+                // surface the summary in the status panel.
+                finishSession()
+                return
+            }
+            mainHandler.postDelayed(this, POLL_INTERVAL_MS)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -47,21 +85,27 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         progress = findViewById(R.id.progress)
         status = findViewById(R.id.status)
 
+        wireSurfaceTouchInput()
+        wireVirtualGamepad()
+
         val id = intent.getStringExtra(EXTRA_GAME_ID)
         if (id == null) {
             status.text = getString(R.string.run_failed_no_id)
-            progress.visibility = android.view.View.GONE
+            progress.visibility = View.GONE
             return
         }
 
         val rootDir = LibraryPaths.root(this)
-        lifecycleScope.launch {
-            val raw = withContext(Dispatchers.IO) {
-                NativeBridge.runGame(rootDir, id)
-            }
-            progress.visibility = android.view.View.GONE
-            applyOutcome(raw)
+        val handle = NativeBridge.nativeStartGame(rootDir, id)
+        if (handle == 0L) {
+            progress.visibility = View.GONE
+            status.text = "Could not start emulator (see logcat)."
+            return
         }
+        session = handle
+        status.text = "Backend: Unicorn (ARM)\nRunning…"
+        // The spinner gets hidden the moment the first frame arrives.
+        mainHandler.postDelayed(pollTick, POLL_INTERVAL_MS)
     }
 
     override fun onSupportNavigateUp(): Boolean {
@@ -69,30 +113,68 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         return true
     }
 
-    private fun applyOutcome(raw: String) {
-        try {
-            val obj = JSONObject(raw)
-            val ok = obj.optBoolean("ok", true)
-            val summary = obj.optString("summary", "(no summary)")
-            val err = obj.optString("error", "")
-            status.text = if (ok) summary else "$summary\n$err"
-            val frameObj = obj.optJSONObject("frame") ?: return
-            val frame = FrameSnapshot(
-                width = frameObj.getInt("width"),
-                height = frameObj.getInt("height"),
-                rgba = Base64.decode(frameObj.getString("rgba_b64"), Base64.DEFAULT),
-            )
-            pendingFrame = frame
-            paintFrame(frame)
-        } catch (e: Exception) {
-            status.text = "Could not parse run result: ${e.message}\n$raw"
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        // Ask the emulator to wind down gracefully; the polling
+        // tick will notice the worker exited and call finishSession.
+        if (session != 0L) {
+            NativeBridge.nativeRequestStop(session)
         }
+        @Suppress("DEPRECATION")
+        super.onBackPressed()
+    }
+
+    override fun onDestroy() {
+        finishSession()
+        mainHandler.removeCallbacksAndMessages(null)
+        super.onDestroy()
+    }
+
+    /**
+     * Stop the emulator if it is still running, free the native
+     * session, and surface the textual summary in the status panel.
+     */
+    private fun finishSession() {
+        val handle = session
+        if (handle == 0L) return
+        session = 0
+        progress.visibility = View.GONE
+        // `nativeFinishGame` blocks on the worker thread join, so
+        // do it off the UI thread to keep the UI responsive — the
+        // join is usually fast (the Stop signal already fired) but
+        // a long emulator slice can drag it out a few hundred ms.
+        Thread {
+            NativeBridge.nativeRequestStop(handle)
+            val summary = NativeBridge.nativeFinishGame(handle)
+            mainHandler.post {
+                status.text = summary
+            }
+        }.start()
+    }
+
+    // -------------------------------------------------------------------
+    // Surface rendering
+    // -------------------------------------------------------------------
+
+    private fun decodeFrame(raw: ByteArray): FrameSnapshot? {
+        if (raw.size < 8) return null
+        val buf = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
+        val w = buf.int
+        val h = buf.int
+        if (w <= 0 || h <= 0) return null
+        val pixelBytes = w * h * 4
+        if (raw.size < 8 + pixelBytes) return null
+        val rgba = ByteArray(pixelBytes)
+        System.arraycopy(raw, 8, rgba, 0, pixelBytes)
+        return FrameSnapshot(w, h, rgba)
     }
 
     private fun paintFrame(frame: FrameSnapshot) {
         val holder = surface.holder
         val canvas = holder.lockCanvas() ?: return
         try {
+            // Hide the spinner the moment we have something to draw.
+            progress.visibility = View.GONE
             canvas.drawColor(Color.BLACK)
             val bitmap = Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.ARGB_8888)
             val pixelInts = IntArray(frame.width * frame.height)
@@ -125,17 +207,133 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         }
     }
 
-    // SurfaceHolder.Callback ------------------------------------------------
+    // -------------------------------------------------------------------
+    // SurfaceHolder.Callback
+    // -------------------------------------------------------------------
 
     override fun surfaceCreated(holder: SurfaceHolder) {
-        pendingFrame?.let { paintFrame(it) }
+        lastFrame?.let { paintFrame(it) }
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        pendingFrame?.let { paintFrame(it) }
+        lastFrame?.let { paintFrame(it) }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
+
+    // -------------------------------------------------------------------
+    // Input plumbing
+    // -------------------------------------------------------------------
+
+    /**
+     * Forward any touches on the framebuffer surface as
+     * `WM_LBUTTONDOWN` / `WM_LBUTTONUP` events with stylus
+     * coordinates in 240×320 game space — the same mapping the
+     * desktop GUI uses.
+     */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun wireSurfaceTouchInput() {
+        surface.setOnTouchListener { v, event ->
+            val handle = session
+            if (handle == 0L) return@setOnTouchListener false
+            val frame = lastFrame ?: return@setOnTouchListener true
+            val mapped = mapTouchToGame(v, event, frame) ?: return@setOnTouchListener true
+            val (gx, gy) = mapped
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    NativeBridge.nativeSendInput(
+                        handle,
+                        NativeBridge.INPUT_POINTER_DOWN,
+                        gx,
+                        gy,
+                    )
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    NativeBridge.nativeSendInput(
+                        handle,
+                        NativeBridge.INPUT_POINTER_UP,
+                        gx,
+                        gy,
+                    )
+                    v.performClick()
+                }
+            }
+            true
+        }
+    }
+
+    /**
+     * j2me-loader-inspired virtual gamepad: a D-pad on the left and
+     * three action / soft-key buttons on the right. The button views
+     * live in `activity_game.xml`. We listen for touch events
+     * directly so the WM_KEYDOWN/WM_KEYUP pair is fired as the user
+     * presses and releases the button — not just once per click.
+     */
+    private fun wireVirtualGamepad() {
+        bindVk(R.id.btn_up, VK_UP)
+        bindVk(R.id.btn_down, VK_DOWN)
+        bindVk(R.id.btn_left, VK_LEFT)
+        bindVk(R.id.btn_right, VK_RIGHT)
+        bindVk(R.id.btn_action, VK_RETURN)
+        bindVk(R.id.btn_soft1, VK_TSOFT1)
+        bindVk(R.id.btn_soft2, VK_TSOFT2)
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun bindVk(viewId: Int, vk: Int) {
+        val btn = findViewById<View?>(viewId) ?: return
+        btn.setOnTouchListener { v, event ->
+            val handle = session
+            if (handle == 0L) return@setOnTouchListener false
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    NativeBridge.nativeSendInput(
+                        handle,
+                        NativeBridge.INPUT_KEY_DOWN,
+                        vk,
+                        0,
+                    )
+                    v.isPressed = true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    NativeBridge.nativeSendInput(
+                        handle,
+                        NativeBridge.INPUT_KEY_UP,
+                        vk,
+                        0,
+                    )
+                    v.isPressed = false
+                    v.performClick()
+                }
+            }
+            true
+        }
+    }
+
+    /**
+     * Map a screen-space touch on the SurfaceView into the
+     * 240×320 game-space coordinates the kernel expects. Returns
+     * `null` if the touch landed in the letter-box around the
+     * scaled framebuffer.
+     */
+    private fun mapTouchToGame(
+        v: View,
+        event: MotionEvent,
+        frame: FrameSnapshot,
+    ): Pair<Int, Int>? {
+        val viewW = v.width.toFloat()
+        val viewH = v.height.toFloat()
+        if (viewW <= 0 || viewH <= 0) return null
+        val scale = minOf(viewW / frame.width, viewH / frame.height)
+        val drawnW = frame.width * scale
+        val drawnH = frame.height * scale
+        val dx = event.x - (viewW - drawnW) / 2f
+        val dy = event.y - (viewH - drawnH) / 2f
+        if (dx < 0f || dy < 0f || dx >= drawnW || dy >= drawnH) return null
+        val gx = (dx / scale).toInt().coerceIn(0, frame.width - 1)
+        val gy = (dy / scale).toInt().coerceIn(0, frame.height - 1)
+        return gx to gy
+    }
 
     private data class FrameSnapshot(
         val width: Int,
@@ -147,7 +345,16 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         const val EXTRA_GAME_ID = "com.pockethle.app.EXTRA_GAME_ID"
         const val EXTRA_GAME_NAME = "com.pockethle.app.EXTRA_GAME_NAME"
 
-        @Suppress("unused")
-        private fun ignore(@Suppress("UNUSED_PARAMETER") b: BitmapFactory) = Unit
+        // Win32 virtual-key codes — same set the desktop GUI uses.
+        private const val VK_UP = 0x26
+        private const val VK_DOWN = 0x28
+        private const val VK_LEFT = 0x25
+        private const val VK_RIGHT = 0x27
+        private const val VK_RETURN = 0x0D // Action / Start.
+        private const val VK_TSOFT1 = 0xC1
+        private const val VK_TSOFT2 = 0xC2
+
+        /** Polling cadence in ms. 33 ≈ 30 Hz. */
+        private const val POLL_INTERVAL_MS = 33L
     }
 }

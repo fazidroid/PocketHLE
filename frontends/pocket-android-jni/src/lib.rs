@@ -13,19 +13,32 @@
 //! * `writeConfig(libraryRoot, json)` — overwrite config with a JSON blob.
 //! * `readGameSettings(libraryRoot, id)` — JSON of per-game settings.
 //! * `writeGameSettings(libraryRoot, id, json)` — persist per-game settings.
-//! * `runGame(libraryRoot, id)` — emulate one round, returns JSON
-//!   `{summary, frame: {width, height, rgba_b64}|null}`.
+//! * `runGame(libraryRoot, id)` — legacy single-shot emulator run that
+//!   only ever returns the *final* framebuffer. Kept around for
+//!   compatibility but the GUI no longer drives it because it looks
+//!   like a hang to the user; see [`runner`].
+//! * `nativeStartGame` / `nativePollFrame` / `nativeSendInput` /
+//!   `nativeRequestStop` / `nativeFinishGame` — session-based
+//!   replacement that streams framebuffers to the UI as the guest
+//!   draws them, forwards touches and D-pad presses to the kernel,
+//!   and lets the user quit cleanly via Back. See [`runner`] for
+//!   the implementation rationale.
+
+mod runner;
 
 use std::path::Path;
 use std::path::PathBuf;
 
-use jni::objects::{JClass, JString};
-use jni::sys::jstring;
+use jni::objects::{JByteArray, JClass, JString};
+use jni::sys::{jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
+use pocket_core::kernel::InputEvent;
 use pocket_core::Emulator;
 use pocket_library::{CpuBackendPref, GameEntry, GameSettings, Library};
 use serde::Serialize;
+
+use crate::runner::{InputCommand, Session};
 
 #[no_mangle]
 pub extern "system" fn Java_com_pockethle_app_NativeBridge_banner<'local>(
@@ -423,6 +436,192 @@ fn init_logger() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Session-based emulator API
+//
+// `runGame` above is single-shot: it blocks until the emulator has run to
+// completion and only then returns the *final* framebuffer. With the trace
+// stub backend that is fast enough to look reasonable, but with the real
+// Unicorn backend the run lasts long enough that the user's UI sits on a
+// loading spinner for tens of seconds and they cannot push any input. The
+// methods below replace that with a streaming model:
+//
+//  * `nativeStartGame` returns an opaque `jlong` handle (a pointer to a
+//    boxed [`Session`]).
+//  * `nativePollFrame` returns the latest framebuffer that the worker has
+//    produced since the last poll, as a flat `byte[]` with an 8-byte
+//    little-endian header `(width: u32, height: u32)` followed by RGBA
+//    pixels. Returning `null` means "no new frame", returning a zero-length
+//    array means "session already ended".
+//  * `nativeSendInput` pushes a virtual-key or stylus event into the
+//    kernel's pending-input queue.
+//  * `nativeRequestStop` asks the worker to stop at the next slice
+//    boundary.
+//  * `nativeFinishGame` joins the worker and frees the session, returning
+//    a textual summary that the activity shows in its status panel.
+//
+// The pointer is opaque to Kotlin and is consumed exactly once by
+// `nativeFinishGame`. After that call the handle is invalid and Kotlin must
+// not pass it back into any of the methods above.
+
+/// `kind` ordinals exchanged with Kotlin. See `NativeBridge.kt`.
+const INPUT_KIND_KEY_DOWN: jint = 0;
+const INPUT_KIND_KEY_UP: jint = 1;
+const INPUT_KIND_POINTER_DOWN: jint = 2;
+const INPUT_KIND_POINTER_UP: jint = 3;
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeStartGame<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    library_root: JString<'local>,
+    id: JString<'local>,
+) -> jlong {
+    init_logger();
+    let root = match jstring_to_path(&mut env, library_root) {
+        Some(p) => p,
+        None => {
+            log::error!("nativeStartGame: missing library root");
+            return 0;
+        }
+    };
+    let id = match jstring_to_string(&mut env, id) {
+        Some(s) => s,
+        None => {
+            log::error!("nativeStartGame: missing game id");
+            return 0;
+        }
+    };
+    match runner::start(root, id) {
+        Ok(session) => Box::into_raw(Box::new(session)) as jlong,
+        Err(e) => {
+            log::error!("nativeStartGame: {e:#}");
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePollFrame<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyteArray {
+    let Some(session) = session_from_handle(handle) else {
+        return std::ptr::null_mut();
+    };
+    let Some(frame) = session.poll_frame() else {
+        // No new frame this tick — return null to let Kotlin keep
+        // showing the previous content of the SurfaceView.
+        return std::ptr::null_mut();
+    };
+    let mut bytes = Vec::with_capacity(8 + frame.rgba.len());
+    bytes.extend_from_slice(&frame.width.to_le_bytes());
+    bytes.extend_from_slice(&frame.height.to_le_bytes());
+    bytes.extend_from_slice(&frame.rgba);
+    new_jbyte_array(&env, &bytes)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeIsRunning<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jint {
+    match session_from_handle(handle) {
+        Some(session) if session.is_running() => 1,
+        _ => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeSendInput<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    kind: jint,
+    a: jint,
+    b: jint,
+) -> jint {
+    let Some(session) = session_from_handle(handle) else {
+        return 0;
+    };
+    let event = match kind {
+        INPUT_KIND_KEY_DOWN => InputEvent::KeyDown { vk: a as u16 },
+        INPUT_KIND_KEY_UP => InputEvent::KeyUp { vk: a as u16 },
+        INPUT_KIND_POINTER_DOWN => InputEvent::PointerDown {
+            x: clamp_u16(a),
+            y: clamp_u16(b),
+        },
+        INPUT_KIND_POINTER_UP => InputEvent::PointerUp {
+            x: clamp_u16(a),
+            y: clamp_u16(b),
+        },
+        other => {
+            log::warn!("nativeSendInput: unknown kind {other}");
+            return 0;
+        }
+    };
+    session.send_input(InputCommand::Input(event));
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeRequestStop<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    if let Some(session) = session_from_handle(handle) {
+        session.request_stop();
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeFinishGame<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jstring {
+    if handle == 0 {
+        return new_jstring(&env, "(no session)");
+    }
+    // Reclaim ownership and join. The handle is now invalid for
+    // any subsequent call from Kotlin.
+    let session = unsafe { Box::from_raw(handle as *mut Session) };
+    let summary = session.finish();
+    new_jstring(&env, summary)
+}
+
+/// Borrow the session pointer without consuming it.
+fn session_from_handle<'a>(handle: jlong) -> Option<&'a Session> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle was produced by `Box::into_raw` in
+    // `nativeStartGame` and is freed exactly once by
+    // `nativeFinishGame`. Kotlin guarantees the lifetime by treating
+    // the handle as opaque and never passing a freed value back in.
+    Some(unsafe { &*(handle as *const Session) })
+}
+
+fn clamp_u16(v: jint) -> u16 {
+    v.clamp(0, u16::MAX as jint) as u16
+}
+
+fn new_jbyte_array(env: &JNIEnv<'_>, bytes: &[u8]) -> jbyteArray {
+    match env.byte_array_from_slice(bytes) {
+        Ok(arr) => arr.into_raw(),
+        Err(e) => {
+            log::error!("could not allocate jbyteArray: {e}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn _unused_jbytearray_type_check(_a: JByteArray<'_>) {}
 
 #[cfg(test)]
 mod tests {
