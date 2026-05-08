@@ -389,6 +389,80 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "RegQueryValueExW", zero_returning);
     d.register_handler(dll, "RegSetValueExW", zero_returning);
     d.register_handler(dll, "RegCloseKey", zero_returning);
+
+    // ---- libm (soft-float, double-precision) ----
+    d.register_handler(dll, "sin", m_sin);
+    d.register_handler(dll, "cos", m_cos);
+    d.register_handler(dll, "tan", m_tan);
+    d.register_handler(dll, "asin", m_asin);
+    d.register_handler(dll, "acos", m_acos);
+    d.register_handler(dll, "atan", m_atan);
+    d.register_handler(dll, "sinh", m_sinh);
+    d.register_handler(dll, "cosh", m_cosh);
+    d.register_handler(dll, "tanh", m_tanh);
+    d.register_handler(dll, "exp", m_exp);
+    d.register_handler(dll, "log", m_log);
+    d.register_handler(dll, "log10", m_log10);
+    d.register_handler(dll, "sqrt", m_sqrt);
+    d.register_handler(dll, "floor", m_floor);
+    d.register_handler(dll, "ceil", m_ceil);
+    d.register_handler(dll, "fabs", m_fabs);
+    d.register_handler(dll, "atan2", m_atan2);
+    d.register_handler(dll, "pow", m_pow);
+    d.register_handler(dll, "fmod", m_fmod);
+    d.register_handler(dll, "_hypot", m_hypot);
+    d.register_handler(dll, "hypot", m_hypot);
+    d.register_handler(dll, "ldexp", m_ldexp);
+    d.register_handler(dll, "frexp", m_frexp);
+    d.register_handler(dll, "modf", m_modf);
+
+    // ---- lstr* string helpers ----
+    d.register_handler(dll, "lstrlenW", lstrlen_w);
+    d.register_handler(dll, "lstrlenA", lstrlen_a);
+    d.register_handler(dll, "lstrcpyW", lstrcpy_w);
+    d.register_handler(dll, "lstrcpyA", lstrcpy_a);
+    d.register_handler(dll, "lstrcatW", lstrcat_w);
+    d.register_handler(dll, "lstrcatA", lstrcat_a);
+    d.register_handler(dll, "lstrcmpW", lstrcmp_w);
+    d.register_handler(dll, "lstrcmpA", lstrcmp_a);
+    d.register_handler(dll, "lstrcmpiW", lstrcmpi_w);
+    d.register_handler(dll, "lstrcmpiA", lstrcmpi_a);
+
+    // ---- RECT helpers ----
+    d.register_handler(dll, "SetRect", set_rect);
+    d.register_handler(dll, "SetRectEmpty", set_rect_empty);
+    d.register_handler(dll, "CopyRect", copy_rect);
+    d.register_handler(dll, "InflateRect", inflate_rect);
+    d.register_handler(dll, "OffsetRect", offset_rect);
+    d.register_handler(dll, "PtInRect", pt_in_rect);
+    d.register_handler(dll, "IsRectEmpty", is_rect_empty);
+
+    // ---- Locale ----
+    d.register_handler(dll, "GetUserDefaultLangID", get_user_default_lang_id);
+    d.register_handler(dll, "GetUserDefaultLCID", get_user_default_lcid);
+    d.register_handler(
+        dll,
+        "GetSystemDefaultLangID",
+        get_system_default_lang_id,
+    );
+    d.register_handler(dll, "GetThreadLocale", get_thread_locale);
+
+    // ---- Codepage / dynamic loader ----
+    d.register_handler(dll, "MultiByteToWideChar", multi_byte_to_wide_char);
+    d.register_handler(dll, "WideCharToMultiByte", wide_char_to_multi_byte);
+    d.register_handler(dll, "GetProcAddressW", get_proc_address_w);
+
+    // ---- Clipboard (no-op) ----
+    d.register_handler(dll, "OpenClipboard", open_clipboard);
+    d.register_handler(dll, "CloseClipboard", close_clipboard);
+    d.register_handler(dll, "EmptyClipboard", empty_clipboard);
+    d.register_handler(
+        dll,
+        "IsClipboardFormatAvailable",
+        is_clipboard_format_available,
+    );
+    d.register_handler(dll, "GetClipboardData", get_clipboard_data);
+    d.register_handler(dll, "SetClipboardData", set_clipboard_data);
 }
 
 // ---------- generic helpers ----------
@@ -3683,6 +3757,665 @@ fn get_current_process(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
 /// `HANDLE GetCurrentThread(void)` — see `get_current_process`.
 fn get_current_thread(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(FAKE_CURRENT_THREAD_HANDLE))
+}
+
+// ---------- libm (soft-float, double-precision) ----------
+//
+// MS C compiler for ARM PocketPC emits these as imports against
+// `coredll.dll` (they live there alongside the CRT). The default
+// stub returning `r0=0` makes every `sin`/`cos`/`sqrt` evaluate to
+// `+0.0`, which kills any game that does any trigonometry —
+// e.g. Zuma's path / Asphalt 2's camera / Bejeweled gem swap
+// animation. We implement them in real f64 arithmetic on the host
+// and pack the result back into r0:r1.
+
+fn libm_unary_d<F: FnOnce(f64) -> f64>(
+    ctx: &mut CallCtx<'_>,
+    f: F,
+) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f64(f(read_f64(ctx, 0)?)))
+}
+
+fn libm_binary_d<F: FnOnce(f64, f64) -> f64>(
+    ctx: &mut CallCtx<'_>,
+    f: F,
+) -> Result<DispatchOutcome, KernelError> {
+    let a = read_f64(ctx, 0)?;
+    let b = read_f64(ctx, 2)?;
+    Ok(ret_f64(f(a, b)))
+}
+
+fn m_sin(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::sin)
+}
+fn m_cos(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::cos)
+}
+fn m_tan(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::tan)
+}
+fn m_asin(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::asin)
+}
+fn m_acos(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::acos)
+}
+fn m_atan(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::atan)
+}
+fn m_sinh(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::sinh)
+}
+fn m_cosh(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::cosh)
+}
+fn m_tanh(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::tanh)
+}
+fn m_exp(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::exp)
+}
+fn m_log(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::ln)
+}
+fn m_log10(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::log10)
+}
+fn m_sqrt(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::sqrt)
+}
+fn m_floor(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::floor)
+}
+fn m_ceil(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::ceil)
+}
+fn m_fabs(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_unary_d(c, f64::abs)
+}
+
+fn m_atan2(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_binary_d(c, f64::atan2)
+}
+fn m_pow(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_binary_d(c, f64::powf)
+}
+fn m_fmod(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_binary_d(c, |a, b| a % b)
+}
+fn m_hypot(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    libm_binary_d(c, f64::hypot)
+}
+
+/// `double ldexp(double x, int exp)` — only the second argument is
+/// integer-typed, so x is in r0:r1 and the exponent in r2.
+fn m_ldexp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let x = read_f64(ctx, 0)?;
+    let e = ctx.arg_u32(2)? as i32;
+    Ok(ret_f64(x * 2.0_f64.powi(e)))
+}
+
+/// `double frexp(double x, int *eptr)` — split into mantissa &
+/// binary exponent.
+fn m_frexp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let x = read_f64(ctx, 0)?;
+    let eptr = ctx.arg_u32(2)?;
+    let (mantissa, exp) = if x == 0.0 {
+        (0.0, 0i32)
+    } else {
+        let bits = x.to_bits();
+        let raw_exp = ((bits >> 52) & 0x7FF) as i32;
+        let e = raw_exp - 1022;
+        let m = f64::from_bits((bits & !(0x7FFu64 << 52)) | (1022u64 << 52));
+        (m, e)
+    };
+    if eptr != 0 {
+        ctx.cpu.write_mem(eptr, &exp.to_le_bytes())?;
+    }
+    Ok(ret_f64(mantissa))
+}
+
+/// `double modf(double x, double *iptr)` — split into integral and
+/// fractional parts.
+fn m_modf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let x = read_f64(ctx, 0)?;
+    let iptr = ctx.arg_u32(2)?;
+    let int_part = x.trunc();
+    let frac_part = x - int_part;
+    if iptr != 0 {
+        ctx.cpu.write_mem(iptr, &int_part.to_le_bytes())?;
+    }
+    Ok(ret_f64(frac_part))
+}
+
+// ---------- lstr* (16-bit Unicode and ANSI) ----------
+
+fn lstrlen_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let s = read_wstr(ctx, p, 0x10000)?;
+    Ok(DispatchOutcome::ReturnedR0(s.len() as u32))
+}
+
+fn lstrlen_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let s = read_cstr(ctx, p, 0x10000)?;
+    Ok(DispatchOutcome::ReturnedR0(s.len() as u32))
+}
+
+fn lstrcpy_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    if dst == 0 || src == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(dst));
+    }
+    let mut off = 0u32;
+    loop {
+        let b = ctx.cpu.read_mem(src + off, 2)?;
+        ctx.cpu.write_mem(dst + off, &b)?;
+        if b[0] == 0 && b[1] == 0 {
+            break;
+        }
+        off += 2;
+        if off > 0x40000 {
+            break;
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
+fn lstrcpy_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    if dst == 0 || src == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(dst));
+    }
+    let bytes = read_cstr(ctx, src, 0x10000)?;
+    let mut buf = bytes;
+    buf.push(0);
+    ctx.cpu.write_mem(dst, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
+fn lstrcat_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    if dst == 0 || src == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(dst));
+    }
+    // Find end of dst.
+    let mut end = dst;
+    loop {
+        let b = ctx.cpu.read_mem(end, 2)?;
+        if b[0] == 0 && b[1] == 0 {
+            break;
+        }
+        end += 2;
+        if end - dst > 0x40000 {
+            break;
+        }
+    }
+    // Copy src (incl. terminator) onto end.
+    let mut off = 0u32;
+    loop {
+        let b = ctx.cpu.read_mem(src + off, 2)?;
+        ctx.cpu.write_mem(end + off, &b)?;
+        if b[0] == 0 && b[1] == 0 {
+            break;
+        }
+        off += 2;
+        if off > 0x40000 {
+            break;
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
+fn lstrcat_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    if dst == 0 || src == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(dst));
+    }
+    let cur = read_cstr(ctx, dst, 0x10000)?;
+    let add = read_cstr(ctx, src, 0x10000)?;
+    let mut buf = cur;
+    buf.extend_from_slice(&add);
+    buf.push(0);
+    ctx.cpu.write_mem(dst, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
+fn cmp_to_winapi(o: std::cmp::Ordering) -> u32 {
+    match o {
+        std::cmp::Ordering::Less => (-1i32) as u32,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+fn lstrcmp_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let a = ctx.arg_u32(0)?;
+    let b = ctx.arg_u32(1)?;
+    let sa = if a == 0 {
+        Vec::new()
+    } else {
+        read_wstr(ctx, a, 0x10000)?
+    };
+    let sb = if b == 0 {
+        Vec::new()
+    } else {
+        read_wstr(ctx, b, 0x10000)?
+    };
+    Ok(DispatchOutcome::ReturnedR0(cmp_to_winapi(sa.cmp(&sb))))
+}
+
+fn lstrcmp_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let a = ctx.arg_u32(0)?;
+    let b = ctx.arg_u32(1)?;
+    let sa = if a == 0 {
+        Vec::new()
+    } else {
+        read_cstr(ctx, a, 0x10000)?
+    };
+    let sb = if b == 0 {
+        Vec::new()
+    } else {
+        read_cstr(ctx, b, 0x10000)?
+    };
+    Ok(DispatchOutcome::ReturnedR0(cmp_to_winapi(sa.cmp(&sb))))
+}
+
+fn lstrcmpi_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let a = ctx.arg_u32(0)?;
+    let b = ctx.arg_u32(1)?;
+    let to_lower = |v: Vec<u16>| -> Vec<u16> {
+        v.into_iter()
+            .map(|c| {
+                if (b'A' as u16..=b'Z' as u16).contains(&c) {
+                    c + 32
+                } else {
+                    c
+                }
+            })
+            .collect()
+    };
+    let sa = if a == 0 {
+        Vec::new()
+    } else {
+        to_lower(read_wstr(ctx, a, 0x10000)?)
+    };
+    let sb = if b == 0 {
+        Vec::new()
+    } else {
+        to_lower(read_wstr(ctx, b, 0x10000)?)
+    };
+    Ok(DispatchOutcome::ReturnedR0(cmp_to_winapi(sa.cmp(&sb))))
+}
+
+fn lstrcmpi_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let a = ctx.arg_u32(0)?;
+    let b = ctx.arg_u32(1)?;
+    let sa = if a == 0 {
+        Vec::new()
+    } else {
+        read_cstr(ctx, a, 0x10000)?
+            .into_iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<Vec<u8>>()
+    };
+    let sb = if b == 0 {
+        Vec::new()
+    } else {
+        read_cstr(ctx, b, 0x10000)?
+            .into_iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<Vec<u8>>()
+    };
+    Ok(DispatchOutcome::ReturnedR0(cmp_to_winapi(sa.cmp(&sb))))
+}
+
+// ---------- RECT helpers ----------
+
+fn rect_load(ctx: &mut CallCtx<'_>, p: u32) -> Result<(i32, i32, i32, i32), KernelError> {
+    let bytes = ctx.cpu.read_mem(p, 16)?;
+    let l = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let t = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let r = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let b = i32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    Ok((l, t, r, b))
+}
+
+fn rect_store(
+    ctx: &mut CallCtx<'_>,
+    p: u32,
+    l: i32,
+    t: i32,
+    r: i32,
+    b: i32,
+) -> Result<(), KernelError> {
+    let mut buf = [0u8; 16];
+    buf[0..4].copy_from_slice(&l.to_le_bytes());
+    buf[4..8].copy_from_slice(&t.to_le_bytes());
+    buf[8..12].copy_from_slice(&r.to_le_bytes());
+    buf[12..16].copy_from_slice(&b.to_le_bytes());
+    ctx.cpu.write_mem(p, &buf)?;
+    Ok(())
+}
+
+fn set_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let l = ctx.arg_u32(1)? as i32;
+    let t = ctx.arg_u32(2)? as i32;
+    let r = ctx.arg_u32(3)? as i32;
+    let b = ctx.arg_u32(4)? as i32;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    rect_store(ctx, p, l, t, r, b)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn set_rect_empty(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    rect_store(ctx, p, 0, 0, 0, 0)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn copy_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src = ctx.arg_u32(1)?;
+    if dst == 0 || src == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(src, 16)?;
+    ctx.cpu.write_mem(dst, &bytes)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn inflate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let dx = ctx.arg_u32(1)? as i32;
+    let dy = ctx.arg_u32(2)? as i32;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let (l, t, r, b) = rect_load(ctx, p)?;
+    rect_store(ctx, p, l - dx, t - dy, r + dx, b + dy)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn offset_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let dx = ctx.arg_u32(1)? as i32;
+    let dy = ctx.arg_u32(2)? as i32;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let (l, t, r, b) = rect_load(ctx, p)?;
+    rect_store(ctx, p, l + dx, t + dy, r + dx, b + dy)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn pt_in_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let (l, t, r, b) = rect_load(ctx, p)?;
+    let inside = (x >= l && x < r && y >= t && y < b) as u32;
+    Ok(DispatchOutcome::ReturnedR0(inside))
+}
+
+fn is_rect_empty(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let (l, t, r, b) = rect_load(ctx, p)?;
+    Ok(DispatchOutcome::ReturnedR0(if l >= r || t >= b { 1 } else { 0 }))
+}
+
+// ---------- Locale ----------
+
+fn get_user_default_lang_id(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // 0x0409 = English (US)
+    Ok(DispatchOutcome::ReturnedR0(0x0409))
+}
+
+fn get_user_default_lcid(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0x0409))
+}
+
+fn get_system_default_lang_id(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0x0409))
+}
+
+fn get_thread_locale(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0x0409))
+}
+
+// ---------- Codepage conversion ----------
+//
+// Most PPC games call `MultiByteToWideChar` / `WideCharToMultiByte`
+// with CP_ACP (0) or CP_UTF8 (65001). The default `r0=0` stub
+// makes the game think the conversion failed and frequently leads
+// to a NULL deref a few frames later when the resulting empty
+// string is treated as a valid pointer.
+
+const CP_UTF8: u32 = 65001;
+
+/// `int MultiByteToWideChar(UINT cp, DWORD flags, LPCSTR src,
+///     int cbSrc, LPWSTR dst, int cchDst)`
+fn multi_byte_to_wide_char(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let codepage = ctx.arg_u32(0)?;
+    let _flags = ctx.arg_u32(1)?;
+    let src = ctx.arg_u32(2)?;
+    let cb_src_signed = ctx.arg_u32(3)? as i32;
+    let dst = ctx.arg_u32(4)?;
+    let cch_dst = ctx.arg_u32(5)? as i32;
+
+    if src == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    // -1 means: src is null-terminated, include the null in the output.
+    let include_null = cb_src_signed < 0;
+    let cb_src = if cb_src_signed < 0 {
+        let mut n = 0u32;
+        loop {
+            let b = ctx.cpu.read_mem(src + n, 1)?;
+            n += 1;
+            if b[0] == 0 {
+                break;
+            }
+            if n > 0x40000 {
+                break;
+            }
+        }
+        n
+    } else {
+        cb_src_signed as u32
+    };
+
+    let raw = ctx.cpu.read_mem(src, cb_src)?;
+
+    let wides: Vec<u16> = match codepage {
+        CP_UTF8 => {
+            let s = String::from_utf8_lossy(if include_null && raw.last() == Some(&0) {
+                &raw[..raw.len() - 1]
+            } else {
+                &raw[..]
+            });
+            let mut v: Vec<u16> = s.encode_utf16().collect();
+            if include_null {
+                v.push(0);
+            }
+            v
+        }
+        _ => {
+            // CP_ACP / OEM / anything else -> treat as latin-1.
+            let body = if include_null && raw.last() == Some(&0) {
+                &raw[..raw.len() - 1]
+            } else {
+                &raw[..]
+            };
+            let mut v: Vec<u16> = body.iter().map(|&b| b as u16).collect();
+            if include_null {
+                v.push(0);
+            }
+            v
+        }
+    };
+
+    let needed = wides.len() as i32;
+    if cch_dst == 0 || dst == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(needed as u32));
+    }
+
+    let to_write = needed.min(cch_dst) as usize;
+    let mut buf = Vec::with_capacity(to_write * 2);
+    for w in &wides[..to_write] {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+    if !buf.is_empty() {
+        ctx.cpu.write_mem(dst, &buf)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(to_write as u32))
+}
+
+/// `int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR src,
+///     int cchSrc, LPSTR dst, int cbDst, LPCCH defChar,
+///     LPBOOL usedDefault)`
+fn wide_char_to_multi_byte(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let codepage = ctx.arg_u32(0)?;
+    let _flags = ctx.arg_u32(1)?;
+    let src = ctx.arg_u32(2)?;
+    let cch_src_signed = ctx.arg_u32(3)? as i32;
+    let dst = ctx.arg_u32(4)?;
+    let cb_dst = ctx.arg_u32(5)? as i32;
+    let _def_char = ctx.arg_u32(6)?;
+    let used_default = ctx.arg_u32(7)?;
+
+    if src == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    let include_null = cch_src_signed < 0;
+    let cch_src = if cch_src_signed < 0 {
+        let mut n = 0u32;
+        loop {
+            let b = ctx.cpu.read_mem(src + n * 2, 2)?;
+            n += 1;
+            if b[0] == 0 && b[1] == 0 {
+                break;
+            }
+            if n > 0x40000 {
+                break;
+            }
+        }
+        n
+    } else {
+        cch_src_signed as u32
+    };
+
+    let mut wides: Vec<u16> = Vec::with_capacity(cch_src as usize);
+    for i in 0..cch_src {
+        let b = ctx.cpu.read_mem(src + i * 2, 2)?;
+        wides.push(u16::from_le_bytes([b[0], b[1]]));
+    }
+    let body: &[u16] = if include_null && wides.last() == Some(&0) {
+        &wides[..wides.len() - 1]
+    } else {
+        &wides[..]
+    };
+
+    let mut hit_default = false;
+    let bytes: Vec<u8> = match codepage {
+        CP_UTF8 => {
+            let s = String::from_utf16_lossy(body);
+            let mut v: Vec<u8> = s.into_bytes();
+            if include_null {
+                v.push(0);
+            }
+            v
+        }
+        _ => {
+            // CP_ACP / OEM / anything else -> latin-1 (clamp >0xFF to '?').
+            let mut v: Vec<u8> = Vec::with_capacity(body.len() + 1);
+            for &w in body {
+                if w <= 0xFF {
+                    v.push(w as u8);
+                } else {
+                    v.push(b'?');
+                    hit_default = true;
+                }
+            }
+            if include_null {
+                v.push(0);
+            }
+            v
+        }
+    };
+
+    if used_default != 0 {
+        let flag = if hit_default { 1u32 } else { 0u32 };
+        ctx.cpu.write_mem(used_default, &flag.to_le_bytes())?;
+    }
+
+    let needed = bytes.len() as i32;
+    if cb_dst == 0 || dst == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(needed as u32));
+    }
+
+    let to_write = (needed.min(cb_dst)) as usize;
+    if to_write > 0 {
+        ctx.cpu.write_mem(dst, &bytes[..to_write])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(to_write as u32))
+}
+
+/// `FARPROC GetProcAddressW(HMODULE hModule, LPCWSTR lpProcName)`
+/// — we don't have any DLLs the game can dynamically load against,
+/// so always report failure (NULL). The game then has to fall back
+/// to its statically-imported path.
+fn get_proc_address_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+// ---------- Clipboard (no-op stubs) ----------
+//
+// PocketHLE doesn't model a system clipboard; it's safe to behave
+// as if we successfully opened an empty clipboard. The game just
+// won't be able to round-trip text through it.
+
+fn open_clipboard(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+fn close_clipboard(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+fn empty_clipboard(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+fn is_clipboard_format_available(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+fn get_clipboard_data(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+fn set_clipboard_data(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 #[cfg(test)]
