@@ -53,11 +53,19 @@
         android:orientation="horizontal"
         android:padding="8dp">
 
-        <!-- D-pad cluster. -->
+        <!--
+            D-pad cluster. The FrameLayout must be tall enough to fit
+            three rows of 48dp buttons (up at the top, left/right in
+            the middle, down at the bottom). `wrap_content` sizes to
+            the largest child (48dp) and collapses up/down on top of
+            left/right, hiding the up arrow — so we pin a 144dp
+            minimum height.
+        -->
         <FrameLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
+            android:minHeight="144dp"
             android:padding="4dp">
 
             <Button
