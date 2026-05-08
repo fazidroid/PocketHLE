@@ -24,6 +24,7 @@
 //! call into it from any thread without locking.
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,8 @@ pub enum LibraryError {
     Serde(#[from] serde_json::Error),
     #[error("cab error: {0}")]
     Cab(#[from] pocket_cab::CabError),
+    #[error("zip error: {0}")]
+    Zip(#[from] zip::result::ZipError),
     #[error("pe error: {0}")]
     Pe(String),
     #[error("game with id `{0}` not found")]
@@ -46,6 +49,8 @@ pub enum LibraryError {
     NoExecutable,
     #[error("invalid game id `{0}`")]
     InvalidId(String),
+    #[error("file `{0}` is not an ARM PE32 executable")]
+    NotArmPe(String),
 }
 
 fn default_schema_version() -> u32 {
@@ -400,6 +405,194 @@ impl Library {
             },
         };
 
+        self.commit_entry(&id, entry)
+    }
+
+    /// Import a standalone ARM PE32 `.exe` (or any extensionless PE)
+    /// into the library. The file is copied verbatim into
+    /// `<library_root>/games/<id>/extracted/<exe-basename>` so the
+    /// rest of the launcher pipeline can treat it identically to a
+    /// CAB-extracted game.
+    ///
+    /// The user-supplied .exe is checked for an ARM machine type
+    /// before being accepted; a mistakenly-imported x86 desktop
+    /// build returns [`LibraryError::NotArmPe`] rather than silently
+    /// crashing the emulator with "guest jumped to unmapped address"
+    /// later on.
+    pub fn import_exe(&mut self, exe_path: impl AsRef<Path>) -> Result<&GameEntry, LibraryError> {
+        let exe_path = exe_path.as_ref();
+        let source_name = exe_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown.exe".to_string());
+        let id = sanitize_id(exe_path.file_stem().map(|s| s.to_string_lossy()).as_deref());
+        if id.is_empty() {
+            return Err(LibraryError::InvalidId(source_name));
+        }
+        if !is_arm_pe(exe_path).unwrap_or(false) {
+            return Err(LibraryError::NotArmPe(source_name));
+        }
+
+        let game_dir = self.root.join("games").join(&id);
+        if game_dir.exists() {
+            fs::remove_dir_all(&game_dir)?;
+        }
+        let extracted_dir = game_dir.join("extracted");
+        fs::create_dir_all(&extracted_dir)?;
+        let dest_exe = extracted_dir.join(&source_name);
+        fs::copy(exe_path, &dest_exe)?;
+
+        let executable = dest_exe
+            .strip_prefix(&game_dir)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| dest_exe.clone());
+
+        let entry = GameEntry {
+            id: id.clone(),
+            display_name: pretty_id(&id),
+            provider: None,
+            executable,
+            source_cab: source_name,
+            imported_at: now_unix_seconds(),
+            settings: GameSettings {
+                cpu_backend: self.config.default_cpu_backend,
+                ..GameSettings::default()
+            },
+        };
+
+        self.commit_entry(&id, entry)
+    }
+
+    /// Import a `.zip` archive (typically a community repack of a
+    /// PocketPC game) into the library.
+    ///
+    /// Every entry is extracted into
+    /// `<library_root>/games/<id>/extracted/`. If the zip turns out
+    /// to contain a nested `.cab`, we transparently recurse via
+    /// [`Library::import_cab`] on the extracted CAB so the user gets
+    /// the proper `app_name` / `provider` from the cabinet header
+    /// rather than a stem-derived placeholder. Otherwise the largest
+    /// ARM PE32 inside the archive is picked as the entry point.
+    pub fn import_zip(&mut self, zip_path: impl AsRef<Path>) -> Result<&GameEntry, LibraryError> {
+        let zip_path = zip_path.as_ref();
+        let source_name = zip_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown.zip".to_string());
+        let id = sanitize_id(zip_path.file_stem().map(|s| s.to_string_lossy()).as_deref());
+        if id.is_empty() {
+            return Err(LibraryError::InvalidId(source_name));
+        }
+
+        let game_dir = self.root.join("games").join(&id);
+        if game_dir.exists() {
+            fs::remove_dir_all(&game_dir)?;
+        }
+        let extracted_dir = game_dir.join("extracted");
+        fs::create_dir_all(&extracted_dir)?;
+
+        // Extract every entry next to the would-be executable.
+        let f = fs::File::open(zip_path)?;
+        let mut archive = zip::ZipArchive::new(f)?;
+        let mut written: Vec<PathBuf> = Vec::with_capacity(archive.len());
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            let Some(rel) = entry.enclosed_name().map(Path::to_path_buf) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let dest = extracted_dir.join(&rel);
+            if entry.is_dir() {
+                fs::create_dir_all(&dest)?;
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut out = fs::File::create(&dest)?;
+            std::io::copy(&mut entry, &mut out)?;
+            written.push(dest);
+        }
+        if written.is_empty() {
+            return Err(LibraryError::NoExecutable);
+        }
+
+        // ZIPs that are really just installer wrappers around a CAB —
+        // recurse so we get the proper PocketPC display metadata
+        // instead of a stem-derived placeholder.
+        if let Some(nested_cab) = written
+            .iter()
+            .find(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("cab"))
+                    .unwrap_or(false)
+            })
+            .cloned()
+        {
+            log::info!(
+                "zip {} contains nested cab {}, recursing",
+                zip_path.display(),
+                nested_cab.display(),
+            );
+            // Wipe the partial extraction so the CAB import starts
+            // from a clean directory layout — the nested cab content
+            // is what we actually want as the per-game tree.
+            let nested_cab_temp = self.root.join("games").join(format!(".{id}-nested.cab"));
+            if let Some(parent) = nested_cab_temp.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&nested_cab, &nested_cab_temp)?;
+            fs::remove_dir_all(&game_dir)?;
+            let result = self.import_cab(&nested_cab_temp);
+            let _ = fs::remove_file(&nested_cab_temp);
+            return result;
+        }
+
+        // Find the largest ARM PE inside the extraction.
+        let mut best: Option<(PathBuf, u64)> = None;
+        for path in &written {
+            let Ok(meta) = fs::metadata(path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            if !is_arm_pe(path).unwrap_or(false) {
+                continue;
+            }
+            if best.as_ref().map(|(_, sz)| *sz).unwrap_or(0) < meta.len() {
+                best = Some((path.clone(), meta.len()));
+            }
+        }
+        let (exe_abs, _) = best.ok_or(LibraryError::NoExecutable)?;
+        let executable = exe_abs
+            .strip_prefix(&game_dir)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| exe_abs.clone());
+
+        let entry = GameEntry {
+            id: id.clone(),
+            display_name: pretty_id(&id),
+            provider: None,
+            executable,
+            source_cab: source_name,
+            imported_at: now_unix_seconds(),
+            settings: GameSettings {
+                cpu_backend: self.config.default_cpu_backend,
+                ..GameSettings::default()
+            },
+        };
+
+        self.commit_entry(&id, entry)
+    }
+
+    /// Persist `entry` and return a stable reference. Replaces any
+    /// existing game with the same id.
+    fn commit_entry(&mut self, id: &str, entry: GameEntry) -> Result<&GameEntry, LibraryError> {
+        let game_dir = self.root.join("games").join(id);
         // Persist a per-game manifest so the game directory is
         // self-describing.
         write_json(&game_dir.join("game.json"), &entry)?;
@@ -521,6 +714,46 @@ fn is_pe_file(path: &Path) -> bool {
         Ok(()) => &head == b"MZ",
         Err(_) => false,
     }
+}
+
+/// `IMAGE_FILE_MACHINE_*` constants from the PE/COFF spec. Mirrors
+/// the values in `pocket-cli`'s archive helper — we deliberately read
+/// the raw bytes here so the hot import-time scan doesn't have to
+/// fully parse every PE.
+const IMAGE_FILE_MACHINE_ARM: u16 = 0x01c0;
+const IMAGE_FILE_MACHINE_THUMB: u16 = 0x01c2;
+const IMAGE_FILE_MACHINE_ARMNT: u16 = 0x01c4;
+
+/// Cheap PE header sniff: is `path` an ARM PE32 (the only flavour
+/// PocketHLE can run)?
+///
+/// Returns `Ok(false)` for non-PE / short / non-ARM files so the
+/// caller can scan a whole directory without having to discriminate
+/// between "isn't an ARM PE" and "actually failed I/O".
+fn is_arm_pe(path: &Path) -> std::io::Result<bool> {
+    let mut f = fs::File::open(path)?;
+    let mut head = [0u8; 0x40];
+    let n = f.read(&mut head)?;
+    if n < 0x40 {
+        return Ok(false);
+    }
+    if &head[0..2] != b"MZ" {
+        return Ok(false);
+    }
+    let lfanew = u32::from_le_bytes(head[0x3c..0x40].try_into().unwrap()) as u64;
+    f.seek(SeekFrom::Start(lfanew))?;
+    let mut sig = [0u8; 6];
+    if f.read(&mut sig)? < 6 {
+        return Ok(false);
+    }
+    if &sig[0..4] != b"PE\0\0" {
+        return Ok(false);
+    }
+    let machine = u16::from_le_bytes([sig[4], sig[5]]);
+    Ok(matches!(
+        machine,
+        IMAGE_FILE_MACHINE_ARM | IMAGE_FILE_MACHINE_THUMB | IMAGE_FILE_MACHINE_ARMNT
+    ))
 }
 
 fn now_unix_seconds() -> i64 {
