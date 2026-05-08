@@ -27,7 +27,10 @@ use pocket_kernel::gdi::{
     Surface, GDI_SCREEN_DC, STOCK_BLACK_BRUSH, STOCK_BLACK_PEN, STOCK_NULL_BRUSH, STOCK_NULL_PEN,
     STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
 };
-use pocket_kernel::{DispatchOutcome, KernelError};
+use pocket_kernel::{
+    DispatchOutcome, KernelError, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE,
+    TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
+};
 use pocket_pe::ResourceKey;
 
 use crate::{CallCtx, WinCeDispatcher};
@@ -346,8 +349,39 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "LeaveCriticalSection", zero_returning);
     d.register_handler(dll, "GetCurrentThreadId", get_current_thread_id);
     d.register_handler(dll, "GetCurrentProcessId", get_current_thread_id);
-    d.register_handler(dll, "GetCurrentProcess", get_current_thread_id);
+    d.register_handler(dll, "GetCurrentProcess", get_current_process);
+    d.register_handler(dll, "GetCurrentThread", get_current_thread);
     d.register_handler(dll, "CreateThread", create_thread);
+
+    // ---- Thread-local storage ----
+    d.register_handler(dll, "TlsAlloc", tls_alloc);
+    d.register_handler(dll, "TlsFree", tls_free);
+    d.register_handler(dll, "TlsGetValue", tls_get_value);
+    d.register_handler(dll, "TlsSetValue", tls_set_value);
+
+    // ---- Interlocked ops (single-threaded HLE: just do the op) ----
+    d.register_handler(dll, "InterlockedIncrement", interlocked_increment);
+    d.register_handler(dll, "InterlockedDecrement", interlocked_decrement);
+    d.register_handler(dll, "InterlockedExchange", interlocked_exchange);
+    d.register_handler(dll, "InterlockedExchangeAdd", interlocked_exchange_add);
+    d.register_handler(
+        dll,
+        "InterlockedCompareExchange",
+        interlocked_compare_exchange,
+    );
+
+    // ---- Misc time / random ----
+    d.register_handler(dll, "GetSystemTime", get_system_time);
+    d.register_handler(dll, "GetLocalTime", get_system_time);
+    d.register_handler(dll, "GetSystemTimeAsFileTime", get_system_time_as_file_time);
+    d.register_handler(dll, "GetCurrentFT", get_system_time_as_file_time);
+    d.register_handler(dll, "CeGetRandomSeed", ce_get_random_seed);
+    d.register_handler(dll, "QueryPerformanceCounter", query_performance_counter);
+    d.register_handler(
+        dll,
+        "QueryPerformanceFrequency",
+        query_performance_frequency,
+    );
 
     // ---- Registry stubs ----
     d.register_handler(dll, "RegOpenKeyExW", invalid_handle_returning);
@@ -3391,6 +3425,266 @@ fn time_handler(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(now))
 }
 
+// ---------- TLS ----------
+
+/// `DWORD TlsAlloc(void)` — return the index of an unused slot, or
+/// `TLS_OUT_OF_INDEXES (0xFFFFFFFF)` if all slots are taken. We
+/// track the bitmap host-side and zero-init the slot's storage in
+/// guest memory so a subsequent `TlsGetValue` before any
+/// `TlsSetValue` returns the documented `0`.
+fn tls_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let used = ctx.kernel.tls_slots_used;
+    for slot in 0..TLS_SLOT_COUNT {
+        if used & (1u64 << slot) == 0 {
+            ctx.kernel.tls_slots_used |= 1u64 << slot;
+            // Zero the slot in the user kdata TLS array so the
+            // first TlsGetValue returns 0 as documented.
+            let slot_va = USER_KDATA_TLS_ARRAY_VA + slot * 4;
+            ctx.cpu.write_mem(slot_va, &[0u8; 4])?;
+            return Ok(DispatchOutcome::ReturnedR0(slot));
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(0xFFFF_FFFF))
+}
+
+/// `BOOL TlsFree(DWORD dwTlsIndex)` — clear the bookkeeping bit.
+fn tls_free(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let slot = ctx.arg_u32(0)?;
+    if slot >= TLS_SLOT_COUNT {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    ctx.kernel.tls_slots_used &= !(1u64 << slot);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `LPVOID TlsGetValue(DWORD dwTlsIndex)` — read the slot value
+/// from the in-page TLS array.
+fn tls_get_value(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let slot = ctx.arg_u32(0)?;
+    if slot >= TLS_SLOT_COUNT {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(USER_KDATA_TLS_ARRAY_VA + slot * 4, 4)?;
+    let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    Ok(DispatchOutcome::ReturnedR0(v))
+}
+
+/// `BOOL TlsSetValue(DWORD dwTlsIndex, LPVOID lpTlsValue)` — write
+/// the slot value into the in-page TLS array.
+fn tls_set_value(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let slot = ctx.arg_u32(0)?;
+    let value = ctx.arg_u32(1)?;
+    if slot >= TLS_SLOT_COUNT {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    ctx.cpu
+        .write_mem(USER_KDATA_TLS_ARRAY_VA + slot * 4, &value.to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+// ---------- Interlocked / atomics ----------
+//
+// Single-threaded HLE: just perform the op on guest memory. Real
+// WinCE provides these as fast user-mode atomics through the kernel
+// trap page.
+
+fn interlocked_op<F: FnOnce(i32) -> i32>(
+    ctx: &mut CallCtx<'_>,
+    f: F,
+) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(p, 4)?;
+    let v = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let new = f(v);
+    ctx.cpu.write_mem(p, &new.to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(new as u32))
+}
+
+fn interlocked_increment(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    interlocked_op(ctx, |v| v.wrapping_add(1))
+}
+
+fn interlocked_decrement(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    interlocked_op(ctx, |v| v.wrapping_sub(1))
+}
+
+/// `LONG InterlockedExchange(LONG volatile *Target, LONG Value)`
+/// — write `Value` into `*Target`, return the previous value.
+fn interlocked_exchange(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let new = ctx.arg_u32(1)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(p, 4)?;
+    let old = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    ctx.cpu.write_mem(p, &new.to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(old))
+}
+
+/// `LONG InterlockedExchangeAdd(LONG volatile *Addend, LONG Value)`
+/// — atomically `*Addend += Value`, return the previous `*Addend`.
+fn interlocked_exchange_add(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let add = ctx.arg_u32(1)? as i32;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(p, 4)?;
+    let old = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let new = old.wrapping_add(add);
+    ctx.cpu.write_mem(p, &new.to_le_bytes())?;
+    Ok(DispatchOutcome::ReturnedR0(old as u32))
+}
+
+/// `LONG InterlockedCompareExchange(LONG volatile *Destination,
+///   LONG Exchange, LONG Comperand)` — if `*Destination ==
+/// Comperand`, replace with `Exchange`. Return the previous
+/// `*Destination`.
+fn interlocked_compare_exchange(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let exchange = ctx.arg_u32(1)?;
+    let comperand = ctx.arg_u32(2)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(p, 4)?;
+    let old = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if old == comperand {
+        ctx.cpu.write_mem(p, &exchange.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(old))
+}
+
+// ---------- Time / random extras ----------
+
+/// `void GetSystemTime(LPSYSTEMTIME lpSystemTime)` /
+/// `void GetLocalTime(LPSYSTEMTIME lpSystemTime)` — fill a
+/// `SYSTEMTIME` struct (16 bytes of `WORD`s):
+///   wYear, wMonth, wDayOfWeek, wDay, wHour, wMinute, wSecond, wMilli
+fn get_system_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let total_secs = now_ms / 1000;
+    let ms = (now_ms % 1000) as u16;
+    let secs = (total_secs % 60) as u16;
+    let mins = ((total_secs / 60) % 60) as u16;
+    let hours = ((total_secs / 3600) % 24) as u16;
+    // We don't bother with proper civil-calendar conversion: most
+    // games only care that the fields look plausible (non-zero year,
+    // month in 1..=12, day in 1..=31). 2026-01-01 is a fine fake.
+    let mut buf = [0u8; 16];
+    buf[0..2].copy_from_slice(&2026u16.to_le_bytes()); // wYear
+    buf[2..4].copy_from_slice(&1u16.to_le_bytes()); // wMonth
+    buf[4..6].copy_from_slice(&4u16.to_le_bytes()); // wDayOfWeek (Thu)
+    buf[6..8].copy_from_slice(&1u16.to_le_bytes()); // wDay
+    buf[8..10].copy_from_slice(&hours.to_le_bytes());
+    buf[10..12].copy_from_slice(&mins.to_le_bytes());
+    buf[12..14].copy_from_slice(&secs.to_le_bytes());
+    buf[14..16].copy_from_slice(&ms.to_le_bytes());
+    ctx.cpu.write_mem(p, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `void GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)`
+/// / `void GetCurrentFT(LPFILETIME)` — fill a `FILETIME`
+/// (`{ DWORD dwLowDateTime; DWORD dwHighDateTime; }`) with the
+/// number of 100-ns intervals since 1601-01-01 UTC. Real Windows
+/// games (and Pocket PC games) seed PRNGs from this value, and
+/// `GetCurrentFT` is the WinCE-specific ordinal-only export.
+fn get_system_time_as_file_time(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // 11644473600 seconds between 1601-01-01 and 1970-01-01.
+    const EPOCH_DIFF_100NS: u64 = 11_644_473_600 * 10_000_000;
+    let now_100ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_nanos() / 100) as u64)
+        .unwrap_or(0);
+    let ft = now_100ns.wrapping_add(EPOCH_DIFF_100NS);
+    let lo = (ft & 0xFFFF_FFFF) as u32;
+    let hi = (ft >> 32) as u32;
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&lo.to_le_bytes());
+    buf[4..8].copy_from_slice(&hi.to_le_bytes());
+    ctx.cpu.write_mem(p, &buf)?;
+    // `GetCurrentFT` is documented to also return its argument in
+    // the WinCE OAL implementation; harmless either way.
+    Ok(DispatchOutcome::ReturnedR0(p))
+}
+
+/// `DWORD CeGetRandomSeed(void)` — undocumented WinCE export
+/// (ordinal 1443 in older coredlls) used by a handful of games as
+/// a PRNG seed source.
+fn ce_get_random_seed(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEED: AtomicU32 = AtomicU32::new(0xC0DE_F00D);
+    let prev = SEED.load(Ordering::Relaxed);
+    let next = prev.wrapping_mul(1103515245).wrapping_add(12345);
+    SEED.store(next, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u32)
+        .unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(next ^ now))
+}
+
+/// `BOOL QueryPerformanceCounter(LARGE_INTEGER *count)` — fill the
+/// 8-byte counter with a monotonically-increasing tick value.
+fn query_performance_counter(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    let lo = (now & 0xFFFF_FFFF) as u32;
+    let hi = (now >> 32) as u32;
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&lo.to_le_bytes());
+    buf[4..8].copy_from_slice(&hi.to_le_bytes());
+    ctx.cpu.write_mem(p, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL QueryPerformanceFrequency(LARGE_INTEGER *freq)` — we use
+/// microseconds in the counter, so report `1_000_000`.
+fn query_performance_frequency(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&1_000_000u32.to_le_bytes());
+    ctx.cpu.write_mem(p, &buf)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `HANDLE GetCurrentProcess(void)` — return the kdata-page-backed
+/// pseudo-handle, matching what the user-kdata `ahSys[SH_CURPROC]`
+/// short-cut returns.
+fn get_current_process(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_CURRENT_PROCESS_HANDLE))
+}
+
+/// `HANDLE GetCurrentThread(void)` — see `get_current_process`.
+fn get_current_thread(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(FAKE_CURRENT_THREAD_HANDLE))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3417,6 +3711,7 @@ mod tests {
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
             should_stop: false,
+            tls_slots_used: 0,
         }
     }
 

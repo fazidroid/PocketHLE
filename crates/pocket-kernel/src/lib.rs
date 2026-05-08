@@ -57,6 +57,40 @@ pub const DEFAULT_STACK_TOP: u32 = 0x6000_0000;
 pub const KERNEL_TRAP_BASE: u32 = 0xF000_0000;
 pub const KERNEL_TRAP_SIZE: u32 = 0x0001_0000;
 
+/// Base of the WinCE user-mode shared kernel data page. Real Pocket
+/// PC kernels publish a per-process read-only view of the
+/// `KDataStruct` at `USER_KPAGE = 0xFFFF_C800`. coredll itself, the
+/// MS C runtime, and a lot of inline-assembly inside Pocket PC games
+/// read this struct directly: `lpvTls` (offset 0x000) is a pointer
+/// to the per-thread TLS slot array, and `ahSys[1..2]` (offsets
+/// 0x008 / 0x00C) hold the current-thread / current-process
+/// pseudo-handles. Without this page mapped, any game that touches
+/// TLS or queries its own process handle through the user kdata
+/// short-cut crashes with `READ_UNMAPPED` long before it reaches
+/// `WinMain` (Bejeweled, Zuma, Bejeweled 2 — all do this).
+///
+/// We map a single 4 KiB page covering 0xFFFF_C000..0xFFFF_D000.
+/// That's enough room for the entire `KDataStruct` (the largest
+/// documented field — `aInfo[]` — ends well before 0x300) plus a
+/// 256-byte TLS array which we host inside the same page and point
+/// `lpvTls` at.
+pub const USER_KDATA_PAGE_BASE: u32 = 0xFFFF_C000;
+pub const USER_KDATA_PAGE_SIZE: u32 = 0x0000_1000;
+/// Address of the `KDataStruct` itself.
+pub const USER_KDATA_STRUCT_VA: u32 = 0xFFFF_C800;
+/// Address of the in-page TLS slot array (`lpvTls` value). We pick
+/// 0xFFFFCB00 — well past the `KDataStruct` so we don't collide
+/// with documented fields.
+pub const USER_KDATA_TLS_ARRAY_VA: u32 = 0xFFFF_CB00;
+/// Number of TLS slots we expose. The real WinCE limit is 64
+/// (`TLS_MINIMUM_AVAILABLE`), and slots are 4 bytes each, so the
+/// array fits in 256 bytes.
+pub const TLS_SLOT_COUNT: u32 = 64;
+/// Fake (non-zero) handle stored at `ahSys[SH_CURTHREAD]`.
+pub const FAKE_CURRENT_THREAD_HANDLE: u32 = 0xC0DE_0001;
+/// Fake (non-zero) handle stored at `ahSys[SH_CURPROC]`.
+pub const FAKE_CURRENT_PROCESS_HANDLE: u32 = 0xC0DE_0002;
+
 /// Base of the guest-side heap region. 16 MiB is plenty for the
 /// little games we target and still leaves headroom for the stack.
 pub const HEAP_BASE: u32 = 0x5000_0000;
@@ -207,6 +241,14 @@ pub struct KernelState {
     /// at the next slice boundary. Used by the desktop GUI's "Back to
     /// library" button so the user can interrupt a running game.
     pub should_stop: bool,
+    /// Bitset of TLS slots that have been handed out by `TlsAlloc`.
+    /// Bit `i` set means slot `i` is currently in use. Real WinCE
+    /// would track this in the per-process kdata `aTlsSlotsUsed`
+    /// bitmap; we mirror it here so `TlsAlloc` / `TlsFree` are well
+    /// defined. Storage for the slot *values* lives in guest memory
+    /// at [`USER_KDATA_TLS_ARRAY_VA`] so the guest can reach them
+    /// through the `lpvTls` pointer in the user kdata page.
+    pub tls_slots_used: u64,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -450,6 +492,39 @@ impl Process {
             cpu.add_code_hook(exit_va)?;
         }
 
+        // 6. Map the WinCE user-mode kernel data page. Pocket PC
+        //    games and the MS C runtime read directly from this
+        //    page (`KDataStruct` at `USER_KPAGE = 0xFFFF_C800`) to
+        //    look up `lpvTls`, `ahSys[SH_CURTHREAD]`, and
+        //    `ahSys[SH_CURPROC]`. Without this mapping any access
+        //    crashes the game instantly with `READ_UNMAPPED`.
+        cpu.map_region(
+            USER_KDATA_PAGE_BASE,
+            USER_KDATA_PAGE_SIZE,
+            Prot::READ | Prot::WRITE,
+        )?;
+        let mut kdata_page = vec![0u8; USER_KDATA_PAGE_SIZE as usize];
+        // The struct lives at offset 0x800 within the page.
+        let struct_off = (USER_KDATA_STRUCT_VA - USER_KDATA_PAGE_BASE) as usize;
+        // Field layout at the top of `KDataStruct`:
+        //   +0x000  LPVOID lpvTls;          // per-thread TLS array
+        //   +0x004  HANDLE ahSys[0];        // SH_WIN32 (unused here)
+        //   +0x008  HANDLE ahSys[1];        // SH_CURTHREAD
+        //   +0x00C  HANDLE ahSys[2];        // SH_CURPROC
+        LittleEndian::write_u32(
+            &mut kdata_page[struct_off..struct_off + 4],
+            USER_KDATA_TLS_ARRAY_VA,
+        );
+        LittleEndian::write_u32(
+            &mut kdata_page[struct_off + 8..struct_off + 12],
+            FAKE_CURRENT_THREAD_HANDLE,
+        );
+        LittleEndian::write_u32(
+            &mut kdata_page[struct_off + 12..struct_off + 16],
+            FAKE_CURRENT_PROCESS_HANDLE,
+        );
+        cpu.write_mem(USER_KDATA_PAGE_BASE, &kdata_page)?;
+
         let resources = image.resources.clone();
         let img_base = image.image_base;
         Ok(Process {
@@ -475,6 +550,7 @@ impl Process {
                 synthetic_create_sent: false,
                 pending_input: VecDeque::new(),
                 should_stop: false,
+                tls_slots_used: 0,
             },
         })
     }

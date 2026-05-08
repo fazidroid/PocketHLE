@@ -234,6 +234,7 @@ mod tests {
             synthetic_create_sent: false,
             pending_input: std::collections::VecDeque::new(),
             should_stop: false,
+            tls_slots_used: 0,
         }
     }
 
