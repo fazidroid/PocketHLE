@@ -125,9 +125,45 @@ fn gx_get_default_keys(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     // (with 2 bytes of padding before the 4-aligned POINT) for a
     // total of `0x60` bytes. Writing past that is exactly what was
     // smashing Expresso's saved LR on the way out of GXOpenInput.
+    //
+    // Real Pocket PC devices fill this with the standard hardware
+    // mapping: D-pad up/down/left/right + the central "action"
+    // button + three soft keys. Returning all-zero (i.e. "vk = 0")
+    // tells games every key is unmapped, which is why JumpyBall and
+    // similar PPC titles never advance past the title screen under
+    // PocketHLE — their menu logic short-circuits when the key list
+    // is degenerate. We return the canonical Windows Mobile defaults
+    // matching the PPC2003 SDK header `gx.h` order:
+    //   vkUp, vkDown, vkLeft, vkRight, vkA (action), vkB, vkC, vkStart.
     let sret = ctx.arg_u32(0)?;
-    let zero = vec![0u8; 0x60];
-    ctx.cpu.write_mem(sret, &zero)?;
+    // Win32 virtual-key codes — documented in winuser.h.
+    const VK_UP: u16 = 0x26;
+    const VK_DOWN: u16 = 0x28;
+    const VK_LEFT: u16 = 0x25;
+    const VK_RIGHT: u16 = 0x27;
+    const VK_RETURN: u16 = 0x0D; // Action / center button.
+    const VK_TSOFT1: u16 = 0xC1; // App1
+    const VK_TSOFT2: u16 = 0xC2; // App2
+    const VK_ESCAPE: u16 = 0x1B; // Back / start.
+    let mut buf = Vec::with_capacity(0x60);
+    let entries: [(u16, u32, u32); 8] = [
+        (VK_UP, 120, 80),
+        (VK_DOWN, 120, 240),
+        (VK_LEFT, 60, 160),
+        (VK_RIGHT, 180, 160),
+        (VK_RETURN, 120, 160),
+        (VK_TSOFT1, 60, 280),
+        (VK_TSOFT2, 180, 280),
+        (VK_ESCAPE, 30, 30),
+    ];
+    for (vk, x, y) in entries {
+        buf.extend_from_slice(&vk.to_le_bytes()); // 2 bytes
+        buf.extend_from_slice(&[0u8, 0u8]); // 2 bytes padding
+        buf.extend_from_slice(&x.to_le_bytes()); // 4 bytes (POINT.x)
+        buf.extend_from_slice(&y.to_le_bytes()); // 4 bytes (POINT.y)
+    }
+    debug_assert_eq!(buf.len(), 0x60);
+    ctx.cpu.write_mem(sret, &buf)?;
     Ok(DispatchOutcome::ReturnedR0(sret))
 }
 
@@ -168,6 +204,8 @@ mod tests {
             wnd_proc: 0,
             synthetic_timer_id: 0,
             synthetic_create_sent: false,
+            pending_input: std::collections::VecDeque::new(),
+            should_stop: false,
         }
     }
 

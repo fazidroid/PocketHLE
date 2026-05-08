@@ -1,4 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Layout for the in-game screen: framebuffer on top (with a
+    progress spinner overlay until the first frame arrives), a
+    j2me-loader-inspired virtual gamepad in the middle (D-pad on
+    the left, action / soft-key cluster on the right), and a thin
+    status panel at the bottom that shows the textual summary the
+    Rust runner emits when the emulator exits. The button IDs
+    referenced here are wired up in `GameActivity.wireVirtualGamepad`.
+-->
 <LinearLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -30,6 +39,106 @@
             android:layout_height="wrap_content"
             android:layout_gravity="center" />
     </FrameLayout>
+
+    <!--
+        Virtual gamepad. Layout mirrors the j2me-loader phone-style
+        skin: D-pad on the left half, action + soft buttons on the
+        right half. The buttons are plain text Buttons styled with
+        a circular background to keep the APK small (no PNG assets
+        required).
+    -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="8dp">
+
+        <!-- D-pad cluster. -->
+        <FrameLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:padding="4dp">
+
+            <Button
+                android:id="@+id/btn_up"
+                style="?android:attr/buttonStyleSmall"
+                android:layout_width="56dp"
+                android:layout_height="48dp"
+                android:layout_gravity="center_horizontal|top"
+                android:contentDescription="@string/dpad_up"
+                android:text="@string/dpad_up_glyph" />
+
+            <Button
+                android:id="@+id/btn_down"
+                style="?android:attr/buttonStyleSmall"
+                android:layout_width="56dp"
+                android:layout_height="48dp"
+                android:layout_gravity="center_horizontal|bottom"
+                android:contentDescription="@string/dpad_down"
+                android:text="@string/dpad_down_glyph" />
+
+            <Button
+                android:id="@+id/btn_left"
+                style="?android:attr/buttonStyleSmall"
+                android:layout_width="56dp"
+                android:layout_height="48dp"
+                android:layout_gravity="start|center_vertical"
+                android:contentDescription="@string/dpad_left"
+                android:text="@string/dpad_left_glyph" />
+
+            <Button
+                android:id="@+id/btn_right"
+                style="?android:attr/buttonStyleSmall"
+                android:layout_width="56dp"
+                android:layout_height="48dp"
+                android:layout_gravity="end|center_vertical"
+                android:contentDescription="@string/dpad_right"
+                android:text="@string/dpad_right_glyph" />
+        </FrameLayout>
+
+        <!-- Action / soft-key cluster. -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="4dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_soft1"
+                    style="?android:attr/buttonStyleSmall"
+                    android:layout_width="64dp"
+                    android:layout_height="40dp"
+                    android:layout_marginEnd="8dp"
+                    android:text="@string/soft1_label" />
+
+                <Button
+                    android:id="@+id/btn_soft2"
+                    style="?android:attr/buttonStyleSmall"
+                    android:layout_width="64dp"
+                    android:layout_height="40dp"
+                    android:layout_marginStart="8dp"
+                    android:text="@string/soft2_label" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btn_action"
+                style="?android:attr/buttonStyleSmall"
+                android:layout_width="80dp"
+                android:layout_height="56dp"
+                android:layout_marginTop="4dp"
+                android:contentDescription="@string/action_button"
+                android:text="@string/action_button_glyph" />
+        </LinearLayout>
+    </LinearLayout>
 
     <TextView
         android:id="@+id/status"

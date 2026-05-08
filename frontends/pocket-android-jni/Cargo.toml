@@ -12,8 +12,13 @@ name = "pockethle_jni"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Default builds include the real ARM CPU (unicorn-engine). The stub
-# backend exists for tracing only and is not useful at runtime.
+# Default builds include the real ARM CPU (unicorn-engine). The Android
+# cross-compile from an x86_64 Linux host to aarch64-linux-android /
+# armv7-linux-androideabi works only when `cargo ndk` is invoked with
+# `ANDROID_NDK_HOME` set; the toolchain glue lives in
+# `.cargo/config.toml` (`CMAKE_TOOLCHAIN_FILE_<target>`) and points at
+# the per-ABI wrappers in `build-support/cmake/`. Pass
+# `--no-default-features` to fall back to the trace-only stub backend.
 default = ["unicorn"]
 unicorn = ["pocket-core/unicorn"]
 

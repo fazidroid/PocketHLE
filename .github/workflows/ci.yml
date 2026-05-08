@@ -158,10 +158,10 @@ jobs:
           add-to-path: true
       - name: install cargo-ndk
         run: cargo install cargo-ndk --locked
-      - name: install cmake (for unicorn-engine cross-compile)
+      - name: install cmake + ninja for unicorn-engine cross-compile
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential
+          sudo apt-get install -y cmake ninja-build build-essential pkg-config libclang-dev
       - name: cross-compile native lib (with unicorn-engine)
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}

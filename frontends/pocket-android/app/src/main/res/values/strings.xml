@@ -22,6 +22,21 @@
     <string name="menu_settings">Settings</string>
     <string name="menu_about">About</string>
 
+    <!-- Virtual gamepad. Glyphs are short text labels (Unicode arrows
+         / circle / 1 / 2) so the APK ships no bitmap assets. -->
+    <string name="dpad_up">D-pad up</string>
+    <string name="dpad_down">D-pad down</string>
+    <string name="dpad_left">D-pad left</string>
+    <string name="dpad_right">D-pad right</string>
+    <string name="dpad_up_glyph">▲</string>
+    <string name="dpad_down_glyph">▼</string>
+    <string name="dpad_left_glyph">◀</string>
+    <string name="dpad_right_glyph">▶</string>
+    <string name="action_button">Action</string>
+    <string name="action_button_glyph">●</string>
+    <string name="soft1_label">1</string>
+    <string name="soft2_label">2</string>
+
     <!-- Preferences -->
     <string name="pref_default_backend_title">Default CPU backend</string>
     <string name="pref_default_backend_summary">Used for new games. Stub is safe; Unicorn requires the unicorn build.</string>

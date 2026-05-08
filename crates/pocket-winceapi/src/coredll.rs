@@ -1948,48 +1948,72 @@ fn write_synthetic_msg(
     Ok(())
 }
 
+// Win32 window-message constants used by the message pump.
+const WM_CREATE: u32 = 0x0001;
+const WM_QUIT: u32 = 0x0012;
+const WM_PAINT: u32 = 0x000F;
+const WM_TIMER: u32 = 0x0113;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_KEYUP: u32 = 0x0101;
+const MK_LBUTTON: u32 = 0x0001;
+
+/// Convert a host-driven [`pocket_kernel::InputEvent`] into the
+/// `(msg, wParam, lParam)` triple a real Win32 window message
+/// would carry. Returns `None` for events we don't currently model.
+fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
+    match ev {
+        pocket_kernel::InputEvent::PointerDown { x, y } => {
+            let lparam = ((y as u32) << 16) | (x as u32);
+            Some((WM_LBUTTONDOWN, MK_LBUTTON, lparam))
+        }
+        pocket_kernel::InputEvent::PointerUp { x, y } => {
+            let lparam = ((y as u32) << 16) | (x as u32);
+            Some((WM_LBUTTONUP, 0, lparam))
+        }
+        pocket_kernel::InputEvent::KeyDown { vk } => Some((WM_KEYDOWN, vk as u32, 0)),
+        pocket_kernel::InputEvent::KeyUp { vk } => Some((WM_KEYUP, vk as u32, 0)),
+    }
+}
+
 /// Pick which fake message to deliver next given the current count
 /// and the timer the guest has registered (if any).
 ///
-/// This injects the kind of input traffic a real Pocket PC sees so
-/// games can advance past splash screens that need a tap or key press
-/// to dismiss, and so that timer-driven game loops (the typical
-/// PPC2003 pattern: `WM_CREATE` installs a `~5 ms` timer, `WM_TIMER`
-/// runs the per-frame logic) actually tick.
-fn synthetic_message_for(count: u64, timer_id: u32) -> (u32, u32, u32) {
-    const WM_PAINT: u32 = 0x000F;
-    const WM_TIMER: u32 = 0x0113;
-    const WM_LBUTTONDOWN: u32 = 0x0201;
-    const WM_LBUTTONUP: u32 = 0x0202;
-    const WM_KEYDOWN: u32 = 0x0100;
-    const WM_KEYUP: u32 = 0x0101;
-    const VK_RETURN: u32 = 0x0D;
-
-    // First few ticks: paint, so the window is on screen before we
-    // inject anything else.
-    if count < 4 {
-        return (WM_PAINT, 0, 0);
-    }
-    // Every 32 ticks we synthesise a tap and a `VK_RETURN`. Real
-    // games consume these to advance through splash screens and
-    // menus.
-    let phase = (count - 4) % 32;
-    let centre_lparam = (160u32 << 16) | 120; // y << 16 | x
-    match phase {
-        4 => return (WM_LBUTTONDOWN, 1, centre_lparam),
-        5 => return (WM_LBUTTONUP, 0, centre_lparam),
-        9 => return (WM_KEYDOWN, VK_RETURN, 0),
-        10 => return (WM_KEYUP, VK_RETURN, 0),
-        _ => {}
-    }
-    // If the guest has registered a timer, alternate `WM_TIMER` and
-    // `WM_PAINT` so the game tick runs frequently. Without a real
-    // wall-clock the exact ratio doesn't matter; what matters is
-    // that `WM_TIMER` is delivered at all.
-    if timer_id != 0 && count.is_multiple_of(2) {
+/// This only fabricates *idle* traffic so the run loop never sits
+/// silent — `WM_PAINT` to drive redraws and `WM_TIMER` to drive
+/// timer-based game ticks (the typical PPC2003 pattern: `WM_CREATE`
+/// installs a `~5 ms` timer, `WM_TIMER` runs the per-frame logic).
+///
+/// Real user input — taps and key presses — is exclusively the
+/// frontend's responsibility via [`KernelState::pending_input`]; we
+/// never synthesise user input here. Doing so would mean the game
+/// "presses buttons by itself" between real presses, which is exactly
+/// the user-visible bug we want to avoid.
+fn synthetic_message_for(_count: u64, timer_id: u32) -> (u32, u32, u32) {
+    // Alternate `WM_TIMER` and `WM_PAINT` when a timer is registered
+    // so the game's per-frame logic ticks; otherwise paint-only.
+    if timer_id != 0 && _count.is_multiple_of(2) {
         return (WM_TIMER, timer_id, 0);
     }
     (WM_PAINT, 0, 0)
+}
+
+/// Pop the next message to deliver. Real user input from the host
+/// frontend drains [`KernelState::pending_input`] first so that taps
+/// and D-pad presses always win over the synthetic pump; once the
+/// queue is empty we fall back to fabricated traffic so games never
+/// see an idle window.
+fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
+    if let Some(ev) = ctx.kernel.pending_input.pop_front() {
+        if let Some(triple) = input_to_message(ev) {
+            return triple;
+        }
+    }
+    synthetic_message_for(
+        ctx.kernel.synthetic_message_count,
+        ctx.kernel.synthetic_timer_id,
+    )
 }
 
 /// `BOOL GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)`
@@ -1998,14 +2022,16 @@ fn synthetic_message_for(count: u64, timer_id: u32) -> (u32, u32, u32) {
 /// to actually paint, we fabricate a series of `WM_PAINT` messages
 /// interspersed with synthetic taps and key presses (up to
 /// `synthetic_message_budget`), then signal `WM_QUIT` with a `0`
-/// return so the loop tears down cleanly.
+/// return so the loop tears down cleanly. Real user input from the
+/// host frontend (mouse / D-pad / keyboard) is delivered before any
+/// synthetic message; see [`next_message`].
 fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let lp_msg = ctx.arg_u32(0)?;
     let count = ctx.kernel.synthetic_message_count;
     let budget = ctx.kernel.synthetic_message_budget;
     let exhausted = budget > 0 && count >= budget;
     if exhausted {
-        write_synthetic_msg(ctx.cpu, lp_msg, 0x0012, 0, 0)?; // WM_QUIT
+        write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     if !ctx.kernel.synthetic_create_sent {
@@ -2013,20 +2039,21 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         // WM_CREATE — gives the guest's WndProc a chance to run its
         // window-init code (typically registers a timer that drives
         // the game tick).
-        write_synthetic_msg(ctx.cpu, lp_msg, 0x0001, 0, 0)?;
+        write_synthetic_msg(ctx.cpu, lp_msg, WM_CREATE, 0, 0)?;
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let (msg, wp, lp) = synthetic_message_for(count, ctx.kernel.synthetic_timer_id);
+    let (msg, wp, lp) = next_message(ctx);
     write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
-    ctx.kernel.synthetic_message_count = count + 1;
+    ctx.kernel.synthetic_message_count += 1;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 /// `BOOL PeekMessageW(LPMSG, HWND, UINT, UINT, UINT removeMode)` —
 /// returns 1 with the next synthetic message until our budget is
 /// exhausted, then 0. This is what most GAPI-based games actually
-/// poll on.
+/// poll on. Like [`get_message_w`], real user input is drained before
+/// the synthetic pump.
 fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let lp_msg = ctx.arg_u32(0)?;
     let count = ctx.kernel.synthetic_message_count;
@@ -2036,18 +2063,18 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         // of spinning on PeekMessageW returning 0 forever (which is
         // what happens with `MsgWaitForMultipleObjectsEx` style
         // pumps).
-        write_synthetic_msg(ctx.cpu, lp_msg, 0x0012, 0, 0)?;
+        write_synthetic_msg(ctx.cpu, lp_msg, WM_QUIT, 0, 0)?;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
     if !ctx.kernel.synthetic_create_sent {
         ctx.kernel.synthetic_create_sent = true;
-        write_synthetic_msg(ctx.cpu, lp_msg, 0x0001, 0, 0)?;
+        write_synthetic_msg(ctx.cpu, lp_msg, WM_CREATE, 0, 0)?;
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let (msg, wp, lp) = synthetic_message_for(count, ctx.kernel.synthetic_timer_id);
+    let (msg, wp, lp) = next_message(ctx);
     write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
-    ctx.kernel.synthetic_message_count = count + 1;
+    ctx.kernel.synthetic_message_count += 1;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -3386,6 +3413,8 @@ mod tests {
             wnd_proc: 0,
             synthetic_timer_id: 0,
             synthetic_create_sent: false,
+            pending_input: std::collections::VecDeque::new(),
+            should_stop: false,
         }
     }
 
