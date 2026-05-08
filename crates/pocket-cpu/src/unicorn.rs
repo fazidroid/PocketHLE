@@ -91,6 +91,15 @@ impl Cpu for UnicornCpu {
         Ok(out)
     }
 
+    fn read_mem_into(&mut self, va: u32, dst: &mut [u8]) -> Result<(), CpuError> {
+        // Bypass the default `read_mem` -> Vec allocation: feed
+        // unicorn's `mem_read` the caller's buffer directly. Used by
+        // the per-frame GAPI flush (~150 KiB).
+        self.uc
+            .mem_read(va as u64, dst)
+            .map_err(|e| CpuError::Backend(format!("mem_read: {e:?}")))
+    }
+
     fn read_reg(&mut self, reg: ArmReg) -> Result<u32, CpuError> {
         self.uc
             .reg_read(map_reg(reg))

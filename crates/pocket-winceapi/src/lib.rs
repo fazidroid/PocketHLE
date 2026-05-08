@@ -66,8 +66,16 @@ pub type Handler = fn(&mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>;
 pub struct WinCeDispatcher {
     /// Key is `(dll_lowercased, friendly_name)`.
     by_name: HashMap<(String, String), Handler>,
-    /// Tracks how many times each thunk has been called for stats.
-    call_counts: HashMap<u32, u64>,
+    /// Per-thunk lookup cache populated lazily on the first dispatch
+    /// for that thunk. The hot path (which can fire ~10k times a
+    /// second during a JumpyBall frame) used to recompute the
+    /// lowercased DLL string and a `(String, String)` key on every
+    /// call; now it just hashes a `u32`.
+    ///
+    /// `None` means the name was looked up but no handler was
+    /// registered — we cache the negative result too so we don't pay
+    /// the string-allocation cost on every unimplemented call either.
+    by_thunk_va: HashMap<u32, Option<Handler>>,
     /// If `true`, an unimplemented call halts the emulator instead of
     /// returning 0. Useful for the Linux CLI tracing run.
     pub halt_on_unimplemented: bool,
@@ -85,7 +93,7 @@ impl WinCeDispatcher {
     pub fn new() -> Self {
         let mut d = Self {
             by_name: HashMap::new(),
-            call_counts: HashMap::new(),
+            by_thunk_va: HashMap::new(),
             halt_on_unimplemented: false,
             trace_sink: None,
         };
@@ -99,6 +107,11 @@ impl WinCeDispatcher {
     pub fn register_handler(&mut self, dll: &str, name: &str, handler: Handler) {
         self.by_name
             .insert((dll.to_ascii_lowercase(), name.to_string()), handler);
+        // Names are registered up-front, before any thunk has fired,
+        // so the per-thunk cache is always empty here. Clearing it
+        // anyway keeps the invariant honest if a future caller decides
+        // to register handlers post-warmup.
+        self.by_thunk_va.clear();
     }
 
     pub fn registered_count(&self) -> usize {
@@ -116,6 +129,32 @@ impl WinCeDispatcher {
     pub fn set_trace_sink(&mut self, sink: Box<dyn Write + Send>) {
         self.trace_sink = Some(sink);
     }
+
+    /// Resolve `thunk` to a handler, populating [`Self::by_thunk_va`]
+    /// on the first call. Subsequent calls for the same `thunk_va`
+    /// hit the cache and pay only one `u32` hash.
+    fn resolve_handler(&mut self, thunk: &Thunk) -> Option<Handler> {
+        if let Some(cached) = self.by_thunk_va.get(&thunk.thunk_va) {
+            return *cached;
+        }
+        let dll_key = thunk.dll.to_ascii_lowercase();
+        let name_owned;
+        let name: &str = match (&thunk.binding, &thunk.friendly_name) {
+            (_, Some(n)) => n.as_str(),
+            (ImportBinding::Name(n), _) => n.as_str(),
+            (ImportBinding::Ordinal(o), _) => {
+                name_owned = format!("ord:{o}");
+                &name_owned
+            }
+        };
+        // The HashMap key is `(String, String)`, so we still have to
+        // build owned strings for the lookup itself — but we only do
+        // it once per unique thunk_va, not once per call.
+        let key = (dll_key, name.to_string());
+        let resolved = self.by_name.get(&key).copied();
+        self.by_thunk_va.insert(thunk.thunk_va, resolved);
+        resolved
+    }
 }
 
 impl Dispatcher for WinCeDispatcher {
@@ -125,15 +164,11 @@ impl Dispatcher for WinCeDispatcher {
         thunk: &Thunk,
         kernel: &mut KernelState,
     ) -> Result<DispatchOutcome, KernelError> {
-        *self.call_counts.entry(thunk.thunk_va).or_default() += 1;
-        let dll_key = thunk.dll.to_ascii_lowercase();
-        let name = match (&thunk.binding, &thunk.friendly_name) {
-            (_, Some(n)) => n.clone(),
-            (ImportBinding::Name(n), _) => n.clone(),
-            (ImportBinding::Ordinal(o), _) => format!("ord:{o}"),
-        };
+        let handler_opt = self.resolve_handler(thunk);
 
-        // Capture args before the handler may mutate them.
+        // Capture args before the handler may mutate them. Skip the
+        // four register reads entirely when nothing is going to log
+        // them — these reads aren't free in the unicorn backend.
         let args = if self.trace_sink.is_some() {
             [
                 cpu.read_reg(ArmReg::R0).unwrap_or(0),
@@ -145,9 +180,10 @@ impl Dispatcher for WinCeDispatcher {
             [0; 4]
         };
 
-        let key = (dll_key.clone(), name.clone());
-        let outcome = if let Some(handler) = self.by_name.get(&key) {
-            log::trace!("call {}", thunk.label());
+        let outcome = if let Some(handler) = handler_opt {
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!("call {}", thunk.label());
+            }
             let mut ctx = CallCtx { cpu, thunk, kernel };
             match handler(&mut ctx) {
                 Ok(o) => Ok(o),
@@ -171,6 +207,14 @@ impl Dispatcher for WinCeDispatcher {
         };
 
         if let Some(sink) = self.trace_sink.as_mut() {
+            // Trace path is cold-ish (only on `--trace`), so it's
+            // fine to pay the formatting cost here.
+            let dll_key = thunk.dll.to_ascii_lowercase();
+            let name = match (&thunk.binding, &thunk.friendly_name) {
+                (_, Some(n)) => n.clone(),
+                (ImportBinding::Name(n), _) => n.clone(),
+                (ImportBinding::Ordinal(o), _) => format!("ord:{o}"),
+            };
             let (ret, status) = match &outcome {
                 Ok(DispatchOutcome::ReturnedR0(v)) => (*v, "ok"),
                 Ok(DispatchOutcome::ReturnedR0R1(v, _)) => (*v, "ok"),

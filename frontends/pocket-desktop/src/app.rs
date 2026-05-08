@@ -564,8 +564,18 @@ impl PocketLauncher {
         let tx = self.events_tx.clone();
         std::thread::spawn(move || {
             let mut dialog = rfd::FileDialog::new()
-                .set_title("Import Pocket PC .CAB")
-                .add_filter("Cabinet archive", &["cab", "CAB"]);
+                .set_title("Import Pocket PC game")
+                // A single "Pocket PC game" filter that matches every
+                // shape we know how to import keeps the dialog UX
+                // simple — the user picks a file and we pick the
+                // right loader from the extension below.
+                .add_filter(
+                    "Pocket PC game (.cab / .zip / .exe)",
+                    &["cab", "CAB", "zip", "ZIP", "exe", "EXE"],
+                )
+                .add_filter("Cabinet archive", &["cab", "CAB"])
+                .add_filter("Zip archive", &["zip", "ZIP"])
+                .add_filter("ARM PE executable", &["exe", "EXE"]);
             if let Some(d) = last_dir {
                 dialog = dialog.set_directory(d);
             }
@@ -581,7 +591,20 @@ impl PocketLauncher {
                     .unwrap_or(library_root.clone());
                 lib.config_mut().last_import_dir = Some(parent);
                 lib.save().map_err(|e| e.to_string())?;
-                let entry = lib.import_cab(&path).map_err(|e| e.to_string())?;
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_ascii_lowercase);
+                let entry = match ext.as_deref() {
+                    Some("cab") => lib.import_cab(&path),
+                    Some("zip") => lib.import_zip(&path),
+                    // Treat anything else (`.exe`, no extension, …)
+                    // as a raw ARM PE32. `import_exe` rejects it
+                    // with a clear error if the machine type is
+                    // wrong.
+                    _ => lib.import_exe(&path),
+                }
+                .map_err(|e| e.to_string())?;
                 Ok(entry.display_name.clone())
             })();
             let _ = tx.send(UiEvent::ImportFinished(result));
@@ -634,6 +657,18 @@ impl eframe::App for PocketLauncher {
             Screen::GameSettings => self.ui_game_settings(ui),
             Screen::Run => self.ui_run(ui),
         });
-        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        // While a game is running we want to drain the live frame
+        // channel as fast as the runner produces frames; the original
+        // 250 ms cadence capped the launcher at 4 fps, which is most
+        // of what users perceived as "lag" in JumpyBall on the
+        // desktop. ~16 ms (60 fps) matches the runner's per-slice
+        // hook and keeps idle-frame redraws cheap because egui only
+        // actually re-uploads textures when something changed.
+        let repaint_after = if matches!(self.screen, Screen::Run) || self.frame_rx.is_some() {
+            std::time::Duration::from_millis(16)
+        } else {
+            std::time::Duration::from_millis(250)
+        };
+        ctx.request_repaint_after(repaint_after);
     }
 }
