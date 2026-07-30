@@ -6280,7 +6280,6 @@ fn play_sound_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     const SND_NOSTOP: u32 = 0x0010;
     const SND_PURGE: u32 = 0x0040;
     const SND_RESOURCE: u32 = 0x0004_0004;
-    const SND_FILENAME: u32 = 0x0002_0000;
     const SND_MEMORY: u32 = 0x0004;
 
     let sound = ctx.arg_u32(0)?;
@@ -6329,11 +6328,7 @@ fn play_sound_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             ctx.cpu.read_mem(sound, size)?
         }
     } else {
-        let path = if flags & SND_FILENAME != 0 {
-            read_wstr(ctx, sound, 260).unwrap_or_default()
-        } else {
-            read_wstr(ctx, sound, 260).unwrap_or_default()
-        };
+        let path = read_wstr(ctx, sound, 260).unwrap_or_default();
         let path = String::from_utf16_lossy(&path);
         read_guest_file(ctx, &path).unwrap_or_default()
     };
