@@ -187,17 +187,14 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
             var track: AudioTrack? = null
             try {
                 var packed = 0L
-                var ready = false
-                repeat(250) {
+                for (attempt in 0 until 250) {
                     if (!audioRunning || session != handle) return@Thread
                     packed = NativeBridge.nativeAudioFormat(handle)
-                    if (packed != 0L && NativeBridge.nativeAudioReady(handle) != 0) {
-                        ready = true
-                        return@repeat
-                    }
+                    if (packed != 0L) break
+                    if (attempt == 249) return@Thread
                     Thread.sleep(20)
                 }
-                if (!ready) return@Thread
+                if (packed == 0L) return@Thread
                 val rate = (packed ushr 16).toInt().coerceIn(8000, 48000)
                 val channels = (packed and 0xffff).toInt().coerceIn(1, 2)
                 val channelMask = if (channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
@@ -221,14 +218,9 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 while (audioRunning && session == handle) {
                     val pcm = NativeBridge.nativePollAudio(handle, 4096)
                     if (pcm != null && pcm.isNotEmpty()) {
-                        var offset = 0
-                        while (offset < pcm.size && audioRunning && session == handle) {
-                            val written = track.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
-                            if (written <= 0) break
-                            offset += written
-                        }
+                        writeAudio(track, pcm)
                     } else {
-                        Thread.sleep(8)
+                        writeSilence(track, 2048)
                     }
                 }
             } catch (error: Throwable) {
@@ -249,6 +241,19 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         audioThread?.interrupt()
         audioThread = null
         audioTrack = null
+    }
+
+    private fun writeAudio(track: AudioTrack, pcm: ShortArray) {
+        var offset = 0
+        while (offset < pcm.size && audioRunning) {
+            val written = track.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
+            if (written <= 0) return
+            offset += written
+        }
+    }
+
+    private fun writeSilence(track: AudioTrack, samples: Int) {
+        writeAudio(track, ShortArray(samples))
     }
 
     // -------------------------------------------------------------------
