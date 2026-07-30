@@ -81,6 +81,20 @@ object NativeBridge {
      */
     @JvmStatic external fun nativePollFrame(handle: Long): ByteArray?
 
+    /**
+     * Guest audio format packed as `(sampleRate << 16) | channels`.
+     * Returns `0` while the worker is still starting up, i.e. before
+     * the game has opened its `waveOut` device.
+     */
+    @JvmStatic external fun nativeAudioFormat(handle: Long): Long
+
+    /**
+     * Pull up to [maxSamples] interleaved signed 16-bit PCM samples
+     * from the guest mixer, ready to hand to an `AudioTrack`. Returns
+     * `null` while the guest is between sound buffers.
+     */
+    @JvmStatic external fun nativePollAudio(handle: Long, maxSamples: Int): ShortArray?
+
     /** `1` while the worker is still running, `0` once it has exited. */
     @JvmStatic external fun nativeIsRunning(handle: Long): Int
 

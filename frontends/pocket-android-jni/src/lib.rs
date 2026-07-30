@@ -30,7 +30,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use jni::objects::{JByteArray, JClass, JString};
-use jni::sys::{jbyteArray, jint, jlong, jstring};
+use jni::sys::{jbyteArray, jint, jlong, jshortArray, jstring};
 use jni::JNIEnv;
 
 use pocket_core::kernel::InputEvent;
@@ -554,6 +554,53 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePollFrame<'loca
     bytes.extend_from_slice(&frame.height.to_le_bytes());
     bytes.extend_from_slice(&frame.rgba);
     new_jbyte_array(&env, &bytes)
+}
+
+/// `nativeAudioFormat` — the guest PCM format packed as
+/// `(sample_rate << 16) | channels`, or `0` while the game has not
+/// opened its `waveOut` device yet. Kotlin needs this to size its
+/// `AudioTrack` before it starts pulling samples.
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeAudioFormat<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    let Some(session) = session_from_handle(handle) else {
+        return 0;
+    };
+    match session.audio_format() {
+        Some((rate, channels)) => ((rate as jlong) << 16) | channels as jlong,
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePollAudio<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_samples: jint,
+) -> jshortArray {
+    let Some(session) = session_from_handle(handle) else {
+        return std::ptr::null_mut();
+    };
+    let count = (max_samples as usize).clamp(1, 16384);
+    let mut samples = vec![0i16; count];
+    let n = session.poll_audio(&mut samples);
+    if n == 0 {
+        return std::ptr::null_mut();
+    }
+    let Ok(array) = env.new_short_array(n as i32) else {
+        return std::ptr::null_mut();
+    };
+    if env
+        .set_short_array_region(&array, 0, &samples[..n])
+        .is_err()
+    {
+        return std::ptr::null_mut();
+    }
+    array.into_raw()
 }
 
 #[no_mangle]

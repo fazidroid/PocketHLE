@@ -6,6 +6,9 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Typeface
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -57,6 +60,9 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
      * disabled the overlay is skipped entirely so it costs nothing.
      */
     private val fpsCounter = FpsCounter()
+    @Volatile private var audioRunning = false
+    private var audioThread: Thread? = null
+    private var audioTrack: AudioTrack? = null
 
     /** Mirrors `LauncherConfig::show_fps`. Read once at activity
      * start; toggling the global preference mid-game does not
@@ -123,6 +129,7 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
             return
         }
         session = handle
+        startAudio(handle)
         status.text = "Backend: Unicorn (ARM)\nRunning…"
         // The spinner gets hidden the moment the first frame arrives.
         mainHandler.postDelayed(pollTick, POLL_INTERVAL_MS)
@@ -158,6 +165,7 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         val handle = session
         if (handle == 0L) return
         session = 0
+        stopAudio()
         progress.visibility = View.GONE
         // `nativeFinishGame` blocks on the worker thread join, so
         // do it off the UI thread to keep the UI responsive — the
@@ -170,6 +178,68 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 status.text = summary
             }
         }.start()
+    }
+
+    private fun startAudio(handle: Long) {
+        stopAudio()
+        audioRunning = true
+        audioThread = Thread({
+            var track: AudioTrack? = null
+            try {
+                var rate = 22050
+                var channels = 1
+                repeat(100) {
+                    val packed = NativeBridge.nativeAudioFormat(handle)
+                    if (packed != 0L) {
+                        rate = (packed ushr 16).toInt().coerceIn(8000, 48000)
+                        channels = (packed and 0xffff).toInt().coerceIn(1, 2)
+                        return@repeat
+                    }
+                    Thread.sleep(20)
+                }
+                val channelMask = if (channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
+                val minBuffer = AudioTrack.getMinBufferSize(rate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
+                if (minBuffer <= 0) return@Thread
+                track = AudioTrack.Builder()
+                    .setAudioAttributes(AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_GAME)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build())
+                    .setAudioFormat(AudioFormat.Builder()
+                        .setSampleRate(rate)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setChannelMask(channelMask)
+                        .build())
+                    .setBufferSizeInBytes((minBuffer * 2).coerceAtLeast(4096))
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
+                audioTrack = track
+                track.play()
+                while (audioRunning && session == handle) {
+                    val pcm = NativeBridge.nativePollAudio(handle, 4096)
+                    if (pcm != null && pcm.isNotEmpty()) {
+                        track.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
+                    } else {
+                        Thread.sleep(8)
+                    }
+                }
+            } catch (_: Throwable) {
+            } finally {
+                try { track?.stop() } catch (_: Throwable) {}
+                try { track?.release() } catch (_: Throwable) {}
+                if (audioTrack === track) audioTrack = null
+            }
+        }, "pockethle-audio")
+        audioThread?.start()
+    }
+
+    private fun stopAudio() {
+        audioRunning = false
+        audioTrack?.pause()
+        audioTrack?.flush()
+        audioThread?.interrupt()
+        audioThread = null
+        audioTrack = null
     }
 
     // -------------------------------------------------------------------

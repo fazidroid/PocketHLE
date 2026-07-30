@@ -105,6 +105,11 @@ struct SessionState {
     /// Final summary string. Populated by the worker right before
     /// it exits; read by [`finish`] after the join.
     summary: Mutex<Option<String>>,
+    /// Pull handle on the guest's mixed PCM, published by the worker
+    /// once the emulator exists. Android has no cpal device, so the
+    /// Kotlin side drains this from an `AudioTrack` feeder thread
+    /// instead of the kernel pushing to a host stream.
+    audio: Mutex<Option<pocket_core::kernel::AudioTap>>,
 }
 
 impl SessionState {
@@ -113,6 +118,7 @@ impl SessionState {
             latest_frame: Mutex::new(None),
             running: Mutex::new(true),
             summary: Mutex::new(None),
+            audio: Mutex::new(None),
         }
     }
 }
@@ -132,6 +138,28 @@ impl Session {
             .lock()
             .ok()
             .and_then(|mut g| g.take())
+    }
+
+    /// Copy up to `dst.len()` interleaved 16-bit samples out of the
+    /// guest's mixer queue, returning how many were written. Returns
+    /// 0 before the emulator has started or when the guest is silent,
+    /// which the feeder thread pads with silence.
+    pub fn poll_audio(&self, dst: &mut [i16]) -> usize {
+        let guard = match self.state.audio.lock() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        guard.as_ref().map_or(0, |tap| tap.drain_into(dst))
+    }
+
+    /// `(sample_rate, channels)` the guest opened its output with, or
+    /// `None` while the emulator is still starting up. Kotlin sizes
+    /// its `AudioTrack` from this.
+    pub fn audio_format(&self) -> Option<(u32, u16)> {
+        let guard = self.state.audio.lock().ok()?;
+        let tap = guard.as_ref()?;
+        let fmt = tap.guest_format();
+        Some((fmt.sample_rate, fmt.channels))
     }
 
     pub fn send_input(&self, cmd: InputCommand) {
@@ -255,6 +283,11 @@ fn run_game_to_completion(
     if let Err(e) = emu.load_pe(&exe) {
         summary_lines.push(format!("load_pe failed: {e:#}"));
         return summary_lines.join("\n");
+    }
+    // The tap has to be published before the guest runs: the Kotlin
+    // feeder thread starts polling as soon as the surface is up.
+    if let Ok(mut slot) = state.audio.lock() {
+        *slot = emu.audio_tap();
     }
     let (screen_width, screen_height) = entry.settings.screen.size();
     emu.set_screen_size(screen_width, screen_height);
