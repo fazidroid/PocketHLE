@@ -24,8 +24,16 @@ fn main() -> Result<()> {
     log::info!("Using library root: {}", library_root.display());
     let library = Library::open(&library_root).context("opening PocketHLE library")?;
 
+    let icon = image::load_from_memory(include_bytes!("../assets/pockethle_logo.png"))
+        .context("decoding PocketHLE logo")?
+        .to_rgba8();
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_icon(std::sync::Arc::new(eframe::egui::IconData {
+                width: icon.width(),
+                height: icon.height(),
+                rgba: icon.into_raw(),
+            }))
             .with_inner_size([960.0, 600.0])
             .with_min_inner_size([640.0, 420.0])
             .with_title("PocketHLE"),
