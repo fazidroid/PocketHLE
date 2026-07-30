@@ -124,6 +124,10 @@ impl Vfs {
     }
 
     pub fn mount_save_dir(&mut self, guest_prefix: &str, host_dir: impl Into<PathBuf>) {
+        let host_dir = host_dir.into();
+        if let Err(error) = std::fs::create_dir_all(&host_dir) {
+            log::warn!("vfs.mount_save_dir({host_dir:?}) could not create directory: {error}");
+        }
         self.mount_with_options(guest_prefix, host_dir, false);
     }
 
