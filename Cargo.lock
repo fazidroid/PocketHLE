@@ -2731,6 +2731,7 @@ dependencies = [
  "anyhow",
  "directories",
  "log",
+ "png 0.17.16",
  "pocket-cab",
  "pocket-pe",
  "serde",

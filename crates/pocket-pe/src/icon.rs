@@ -46,7 +46,10 @@ pub fn extract_icon(bytes: &[u8], pe: &PE) -> Option<IconImage> {
     // several same-sized RT_ICONs is the colour version.
     let mut wanted: Option<u32> = None;
     let mut best_group_score = 0u64;
-    for entry in entries.iter().filter(|e| e.ty == ResourceKey::Id(RT_GROUP_ICON)) {
+    for entry in entries
+        .iter()
+        .filter(|e| e.ty == ResourceKey::Id(RT_GROUP_ICON))
+    {
         let data = resource_bytes(bytes, pe, entry.data_rva, entry.size)?;
         if data.len() < 6 {
             continue;
@@ -91,9 +94,7 @@ pub fn extract_icon(bytes: &[u8], pe: &PE) -> Option<IconImage> {
             continue;
         };
         let better = match &best {
-            Some(current) => {
-                image.width * image.height > current.width * current.height
-            }
+            Some(current) => image.width * image.height > current.width * current.height,
             None => true,
         };
         if better {
@@ -315,7 +316,7 @@ fn decode_dib_icon(data: &[u8]) -> Option<IconImage> {
 /// DIB rows are padded to a 4-byte boundary.
 fn row_stride(width: u32, bit_count: u32) -> Option<usize> {
     let bits = (width as usize).checked_mul(bit_count as usize)?;
-    Some((bits + 31) / 32 * 4)
+    Some(bits.div_ceil(32) * 4)
 }
 
 fn palette_index(row: &[u8], x: usize, bit_count: u32) -> Option<u8> {
@@ -326,7 +327,11 @@ fn palette_index(row: &[u8], x: usize, bit_count: u32) -> Option<u8> {
         }
         4 => {
             let byte = row.get(x / 2).copied()?;
-            Some(if x % 2 == 0 { byte >> 4 } else { byte & 0x0f })
+            Some(if x.is_multiple_of(2) {
+                byte >> 4
+            } else {
+                byte & 0x0f
+            })
         }
         8 => row.get(x).copied(),
         _ => None,
@@ -361,10 +366,10 @@ mod tests {
         out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
         out.extend_from_slice(&[0x00, 0x00, 0xff, 0x00]); // palette[0] = red
         out.extend_from_slice(&[0xff, 0x00, 0x00, 0x00]); // palette[1] = blue
-        // Colour rows, bottom-up, padded to 4 bytes.
+                                                          // Colour rows, bottom-up, padded to 4 bytes.
         out.extend_from_slice(&[1, 1, 0, 0]); // bottom row: blue, blue
         out.extend_from_slice(&[0, 1, 0, 0]); // top row: red, blue
-        // AND mask rows, bottom-up.
+                                              // AND mask rows, bottom-up.
         out.extend_from_slice(&[0b0000_0000, 0, 0, 0]);
         out.extend_from_slice(&[0b1000_0000, 0, 0, 0]);
         out

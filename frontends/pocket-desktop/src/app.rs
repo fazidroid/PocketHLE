@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Rect, RichText, ScrollArea, Sense, Vec2};
+use egui_extras::image::load_image_bytes;
 
 use pocket_core::kernel::{InputEvent, FB_HEIGHT, FB_WIDTH};
 use pocket_library::{
@@ -30,6 +31,7 @@ const VK_ESCAPE: u16 = 0x1B;
 
 /// Top-level egui app.
 pub struct PocketLauncher {
+    icon_cache: std::collections::HashMap<String, egui::TextureHandle>,
     library: Library,
     selected_game: Option<String>,
     screen: Screen,
@@ -146,6 +148,7 @@ impl PocketLauncher {
         let (tx, rx) = mpsc::channel();
         Self {
             library,
+            icon_cache: std::collections::HashMap::new(),
             selected_game: None,
             screen: Screen::Library,
             runner: Runner::new(),
@@ -297,8 +300,31 @@ impl PocketLauncher {
             ui.set_width(width);
             ui.set_min_height(120.0);
             ui.horizontal(|ui| {
-                let icon = RichText::new("\u{1F4F1}").size(32.0);
-                ui.label(icon);
+                let icon_path = game.icon_path(self.library.root());
+                if let Some(path) = icon_path {
+                    if let Ok(bytes) = std::fs::read(path) {
+                        if let Ok(image) = load_image_bytes(&bytes) {
+                            let texture =
+                                self.icon_cache.entry(game.id.clone()).or_insert_with(|| {
+                                    ui.ctx().load_texture(
+                                        format!("icon-{}", game.id),
+                                        image,
+                                        egui::TextureOptions::LINEAR,
+                                    )
+                                });
+                            ui.add(
+                                egui::Image::from_texture(&*texture)
+                                    .fit_to_exact_size(Vec2::splat(48.0)),
+                            );
+                        } else {
+                            ui.label(RichText::new("📱").size(32.0));
+                        }
+                    } else {
+                        ui.label(RichText::new("📱").size(32.0));
+                    }
+                } else {
+                    ui.label(RichText::new("📱").size(32.0));
+                }
                 ui.vertical(|ui| {
                     ui.label(RichText::new(&game.display_name).strong().size(16.0));
                     if let Some(p) = &game.provider {

@@ -85,12 +85,25 @@ pub struct GameEntry {
     /// Per-game runtime settings.
     #[serde(default)]
     pub settings: GameSettings,
+    /// Launcher icon extracted from the executable's `RT_GROUP_ICON`
+    /// resource, stored as a PNG relative to
+    /// `<library_root>/games/<id>/`. `None` when the binary ships no
+    /// icon, in which case frontends fall back to a placeholder.
+    #[serde(default)]
+    pub icon: Option<PathBuf>,
 }
 
 impl GameEntry {
     /// Path to this game's directory, relative to the library root.
     pub fn relative_dir(&self) -> PathBuf {
         PathBuf::from("games").join(&self.id)
+    }
+
+    /// Absolute path of the extracted launcher icon, if the executable
+    /// carried one.
+    pub fn icon_path(&self, library_root: &Path) -> Option<PathBuf> {
+        let icon = self.icon.as_ref()?;
+        Some(library_root.join(self.relative_dir()).join(icon))
     }
 
     /// Absolute path to the directory holding the extracted cab.
@@ -539,6 +552,7 @@ impl Library {
                 screen: guess_screen(&exe_abs, &files),
                 ..GameSettings::default()
             },
+            icon: extract_icon_png(&game_dir, &exe_abs),
         };
 
         self.commit_entry(&id, entry)
@@ -595,6 +609,7 @@ impl Library {
                 cpu_backend: self.config.default_cpu_backend,
                 ..GameSettings::default()
             },
+            icon: extract_icon_png(&game_dir, &dest_exe),
         };
 
         self.commit_entry(&id, entry)
@@ -722,6 +737,7 @@ impl Library {
                 cpu_backend: self.config.default_cpu_backend,
                 ..GameSettings::default()
             },
+            icon: extract_icon_png(&game_dir, &exe_abs),
         };
 
         self.commit_entry(&id, entry)
@@ -1038,6 +1054,36 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Extract the executable's Windows icon and store it next to the game
+/// as `icon.png`, returning the path relative to the game directory.
+///
+/// Every frontend can then show the game's real icon the way
+/// j2me-loader shows a MIDlet icon, instead of a generic placeholder.
+/// A missing or unreadable icon is not an import error - we return
+/// `None` and let the UI fall back.
+fn extract_icon_png(game_dir: &Path, exe_abs: &Path) -> Option<PathBuf> {
+    let bytes = fs::read(exe_abs).ok()?;
+    let icon = pocket_pe::icon_from_pe_bytes(&bytes).ok().flatten()?;
+    let path = game_dir.join("icon.png");
+    let file = fs::File::create(&path).ok()?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), icon.width, icon.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    if writer.write_image_data(&icon.rgba).is_err() {
+        let _ = fs::remove_file(&path);
+        return None;
+    }
+    drop(writer);
+    log::info!(
+        "extracted {}x{} icon from {}",
+        icon.width,
+        icon.height,
+        exe_abs.display()
+    );
+    Some(PathBuf::from("icon.png"))
+}
+
 /// Guess the display geometry a cabinet was built for.
 ///
 /// Windows Mobile games ship one build per handset and hard-code that
@@ -1113,6 +1159,7 @@ mod tests {
             install_dir: install_dir.map(str::to_string),
             imported_at: 0,
             settings: GameSettings::default(),
+            icon: None,
         }
     }
 

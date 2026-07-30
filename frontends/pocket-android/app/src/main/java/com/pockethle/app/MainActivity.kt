@@ -60,6 +60,7 @@ class MainActivity : AppCompatActivity() {
                 )
             },
             onRemove = { entry -> confirmRemove(entry) },
+            libraryRoot = rootDir,
         )
         recycler.layoutManager = LinearLayoutManager(this)
         recycler.adapter = adapter

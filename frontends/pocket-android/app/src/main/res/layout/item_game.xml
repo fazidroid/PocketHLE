@@ -17,6 +17,7 @@
         android:padding="12dp">
 
         <ImageView
+            android:id="@+id/game_icon"
             android:layout_width="48dp"
             android:layout_height="48dp"
             android:layout_gravity="center_vertical"

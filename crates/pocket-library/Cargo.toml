@@ -18,3 +18,4 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 pocket-cab = { path = "../pocket-cab" }
 pocket-pe = { path = "../pocket-pe" }
+png = "0.17"

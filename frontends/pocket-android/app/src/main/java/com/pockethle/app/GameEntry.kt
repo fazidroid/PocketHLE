@@ -14,6 +14,7 @@ data class GameEntry(
     val executable: String,
     val sourceCab: String,
     val importedAt: Long,
+    val icon: String?,
     val settings: GameSettings,
 ) {
     companion object {
