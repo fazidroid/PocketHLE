@@ -38,7 +38,7 @@ pub mod native_thunks;
 pub mod registry;
 pub mod vfs;
 
-pub use audio::{AudioEngine, GuestFormat};
+pub use audio::{AudioEngine, AudioTap, GuestFormat};
 pub use framebuffer::{Framebuffer, FB_BYTES, FB_HEIGHT, FB_WIDTH};
 pub use gdi::{GdiState, Surface};
 

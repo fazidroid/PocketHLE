@@ -173,7 +173,6 @@ impl Shared {
         }
     }
 
-    #[cfg(feature = "audio-cpal")]
     fn pop_one(&mut self) -> Option<i16> {
         if self.len == 0 {
             return None;
@@ -399,6 +398,24 @@ impl AudioEngine {
         self.shared.lock().map(|mut s| s.cursor()).unwrap_or(0)
     }
 
+    /// A cheap, clone-able handle that lets the *host* play the guest's
+    /// PCM itself instead of leaving it to cpal.
+    ///
+    /// Android needs this: cpal's Android backend goes through
+    /// `oboe-sys`, which needs an NDK C++ toolchain we do not ship, so
+    /// the `audio-cpal` feature is off there and the ring buffer would
+    /// otherwise just fill up and drop samples. The JNI layer pulls from
+    /// a tap and writes into a Java `AudioTrack` in streaming mode — the
+    /// same shape J2ME emulators such as J2ME Loader use for PCM output.
+    ///
+    /// The tap can be moved to another thread; it locks the same shared
+    /// state the guest pushes into.
+    pub fn tap(&self) -> AudioTap {
+        AudioTap {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     /// Tee every submitted sample into a 16-bit PCM WAV file. Used by
     /// `pockethle run --dump-audio-to` so a run on a machine with no
     /// sound card can still prove the game produced audio.
@@ -462,6 +479,63 @@ impl AudioEngine {
         }
         self.flush();
         self.init_attempted = false;
+    }
+}
+
+/// Host-side pull handle produced by [`AudioEngine::tap`].
+///
+/// Draining moves the playback cursor forward, so `waveOutGetPosition`
+/// and the `WHDR_DONE` notifications stay in step with what the host has
+/// actually played. While nothing drains the tap the engine keeps using
+/// its wall-clock estimate, so a frontend that never calls
+/// [`AudioTap::drain_into`] behaves exactly as it did before.
+#[derive(Clone)]
+pub struct AudioTap {
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl std::fmt::Debug for AudioTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioTap").finish_non_exhaustive()
+    }
+}
+
+impl AudioTap {
+    /// The format the guest is currently submitting samples in, so the
+    /// host can configure its own output device to match.
+    pub fn guest_format(&self) -> GuestFormat {
+        self.shared
+            .lock()
+            .map(|s| s.guest_format)
+            .unwrap_or_default()
+    }
+
+    /// Move up to `dst.len()` queued samples out of the ring into `dst`,
+    /// returning how many were written. Never blocks: a starved host
+    /// gets a short read and should pad the rest with silence.
+    pub fn drain_into(&self, dst: &mut [i16]) -> usize {
+        let Ok(mut s) = self.shared.lock() else {
+            return 0;
+        };
+        // Taking over playback means the wall-clock estimate must stop:
+        // from here on the cursor follows what the host really consumed.
+        s.device_active = true;
+        let mut n = 0;
+        while n < dst.len() {
+            match s.pop_one() {
+                Some(v) => {
+                    dst[n] = v;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        n
+    }
+
+    /// How many samples are queued and ready to be drained.
+    pub fn buffered_samples(&self) -> usize {
+        self.shared.lock().map(|s| s.len).unwrap_or(0)
     }
 }
 

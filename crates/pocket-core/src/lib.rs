@@ -238,6 +238,15 @@ impl Emulator {
         }
     }
 
+    /// A pull handle for hosts that play the guest's PCM themselves.
+    ///
+    /// The Android frontend uses this: it has no cpal backend, so the
+    /// JNI layer drains the tap on a helper thread and writes into a
+    /// Java `AudioTrack`. Returns `None` before `load_pe`.
+    pub fn audio_tap(&self) -> Option<pocket_kernel::AudioTap> {
+        self.process.as_ref().map(|p| p.state.audio.tap())
+    }
+
     /// Resize the emulated display. Must be called after
     /// [`Self::load_pe`] and before [`Self::run`], because the guest
     /// reads the geometry once during start-up (`GetSystemMetrics`,
