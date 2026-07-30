@@ -140,19 +140,8 @@ impl Session {
             .and_then(|mut g| g.take())
     }
 
-    /// Return true once the guest has submitted PCM to the tap.
-    pub fn audio_ready(&self) -> bool {
-        let guard = self.state.audio.lock().ok();
-        guard
-            .as_ref()
-            .and_then(|g| g.as_ref())
-            .is_some_and(|tap| tap.format_ready() && tap.buffered_samples() > 0)
-    }
-
     /// Copy up to `dst.len()` interleaved 16-bit samples out of the
-    /// guest's mixer queue, returning how many were written. Returns
-    /// 0 before the emulator has started or when the guest is silent,
-    /// which the feeder thread pads with silence.
+    /// guest's mixer queue.
     pub fn poll_audio(&self, dst: &mut [i16]) -> usize {
         let guard = match self.state.audio.lock() {
             Ok(g) => g,
@@ -161,17 +150,7 @@ impl Session {
         guard.as_ref().map_or(0, |tap| tap.drain_into(dst))
     }
 
-    pub fn peek_audio(&self, dst: &mut [i16]) -> usize {
-        let guard = match self.state.audio.lock() {
-            Ok(g) => g,
-            Err(_) => return 0,
-        };
-        guard.as_ref().map_or(0, |tap| tap.peek_into(dst))
-    }
-
-    /// `(sample_rate, channels)` the guest opened its output with, or
-    /// `None` while the emulator is still starting up. Kotlin sizes
-    /// its `AudioTrack` from this.
+    /// `(sample_rate, channels)` the guest opened its output with.
     pub fn audio_format(&self) -> Option<(u32, u16)> {
         let guard = self.state.audio.lock().ok()?;
         let tap = guard.as_ref()?;

@@ -187,19 +187,22 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
             var track: AudioTrack? = null
             try {
                 var packed = 0L
+                var firstPcm: ShortArray? = null
                 for (attempt in 0 until 250) {
                     if (!audioRunning || session != handle) return@Thread
                     packed = NativeBridge.nativeAudioFormat(handle)
-                    if (packed != 0L) break
-                    if (attempt == 249) return@Thread
+                    if (packed != 0L) {
+                        firstPcm = NativeBridge.nativePollAudio(handle, 4096)
+                        if (firstPcm != null) break
+                    }
                     Thread.sleep(20)
                 }
-                if (packed == 0L) return@Thread
+                if (!audioRunning || session != handle || packed == 0L) return@Thread
                 val rate = (packed ushr 16).toInt().coerceIn(8000, 48000)
                 val channels = (packed and 0xffff).toInt().coerceIn(1, 2)
                 val channelMask = if (channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
                 val minBuffer = AudioTrack.getMinBufferSize(rate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
-                if (minBuffer <= 0) return@Thread
+                val bufferSize = maxOf(minBuffer, rate * channels * 2 / 2)
                 track = AudioTrack.Builder()
                     .setAudioAttributes(AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_GAME)
@@ -210,23 +213,27 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                         .setChannelMask(channelMask)
                         .build())
-                    .setBufferSizeInBytes((minBuffer * 2).coerceAtLeast(4096))
+                    .setBufferSizeInBytes(bufferSize)
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build()
+                if (track?.state != AudioTrack.STATE_INITIALIZED) return@Thread
                 audioTrack = track
                 track.play()
+                firstPcm?.let { writeAudio(track, it) }
                 while (audioRunning && session == handle) {
                     val pcm = NativeBridge.nativePollAudio(handle, 4096)
-                    if (pcm != null && pcm.isNotEmpty()) {
+                    if (pcm != null) {
                         writeAudio(track, pcm)
                     } else {
-                        writeSilence(track, 2048)
+                        writeSilence(track, maxOf(channels * rate / 200, 256))
+                        Thread.sleep(5)
                     }
                 }
             } catch (error: Throwable) {
                 android.util.Log.e("PocketHLE", "AudioTrack playback failed", error)
             } finally {
-                try { track?.stop() } catch (_: Throwable) {}
+                try { track?.pause() } catch (_: Throwable) {}
+                try { track?.flush() } catch (_: Throwable) {}
                 try { track?.release() } catch (_: Throwable) {}
                 if (audioTrack === track) audioTrack = null
             }

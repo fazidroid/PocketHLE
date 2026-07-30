@@ -604,45 +604,6 @@ pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePollAudio<'loca
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeAudioReady<'local>(
-    _env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    handle: jlong,
-) -> jint {
-    session_from_handle(handle)
-        .map(|session| session.audio_ready() as jint)
-        .unwrap_or(0)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativePeekAudio<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    handle: jlong,
-    max_samples: jint,
-) -> jshortArray {
-    let Some(session) = session_from_handle(handle) else {
-        return std::ptr::null_mut();
-    };
-    let count = (max_samples as usize).clamp(1, 16384);
-    let mut samples = vec![0i16; count];
-    let n = session.peek_audio(&mut samples);
-    if n == 0 {
-        return std::ptr::null_mut();
-    }
-    let Ok(array) = env.new_short_array(n as i32) else {
-        return std::ptr::null_mut();
-    };
-    if env
-        .set_short_array_region(&array, 0, &samples[..n])
-        .is_err()
-    {
-        return std::ptr::null_mut();
-    }
-    array.into_raw()
-}
-
-#[no_mangle]
 pub extern "system" fn Java_com_pockethle_app_NativeBridge_nativeIsRunning<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
