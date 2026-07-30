@@ -88,6 +88,12 @@ object NativeBridge {
      */
     @JvmStatic external fun nativeAudioFormat(handle: Long): Long
 
+    /** Returns 1 after the guest has queued its first PCM samples. */
+    @JvmStatic external fun nativeAudioReady(handle: Long): Int
+
+    /** Peeks at queued PCM without consuming it. */
+    @JvmStatic external fun nativePeekAudio(handle: Long, maxSamples: Int): ShortArray?
+
     /**
      * Pull up to [maxSamples] interleaved signed 16-bit PCM samples
      * from the guest mixer, ready to hand to an `AudioTrack`. Returns

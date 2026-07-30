@@ -74,6 +74,9 @@ struct Shared {
     write: usize,
     /// Format the guest most recently requested.
     guest_format: GuestFormat,
+    /// Track whether the guest explicitly opened audio so Android does
+    /// not build AudioTrack from the fallback format.
+    guest_format_ready: bool,
     /// Sub-sample fraction for the nearest-neighbour resampler (in
     /// units of 1/65536). Carried across cpal callbacks so we don't
     /// lose pitch on long playbacks.
@@ -110,6 +113,7 @@ impl Shared {
             read: 0,
             write: 0,
             guest_format: GuestFormat::default(),
+            guest_format_ready: false,
             resampler_phase: 0,
             written: 0,
             consumed: 0,
@@ -332,6 +336,7 @@ impl AudioEngine {
     pub fn set_guest_format(&self, fmt: GuestFormat) {
         if let Ok(mut s) = self.shared.lock() {
             s.guest_format = fmt;
+            s.guest_format_ready = true;
             // Reset resampler phase on format change so the first
             // sample of a new wave plays from t=0.
             s.resampler_phase = 0;
@@ -510,6 +515,13 @@ impl AudioTap {
             .unwrap_or_default()
     }
 
+    pub fn format_ready(&self) -> bool {
+        self.shared
+            .lock()
+            .map(|s| s.guest_format_ready)
+            .unwrap_or(false)
+    }
+
     /// Move up to `dst.len()` queued samples out of the ring into `dst`,
     /// returning how many were written. Never blocks: a starved host
     /// gets a short read and should pad the rest with silence.
@@ -517,8 +529,6 @@ impl AudioTap {
         let Ok(mut s) = self.shared.lock() else {
             return 0;
         };
-        // Taking over playback means the wall-clock estimate must stop:
-        // from here on the cursor follows what the host really consumed.
         s.device_active = true;
         let mut n = 0;
         while n < dst.len() {
@@ -529,6 +539,26 @@ impl AudioTap {
                 }
                 None => break,
             }
+        }
+        n
+    }
+
+    /// Move up to `dst.len()` samples without taking ownership of the
+    /// playback cursor. This is used by Android while it is probing the
+    /// guest format; probing must not switch the engine to device-clock
+    /// mode before AudioTrack has actually started.
+    pub fn peek_into(&self, dst: &mut [i16]) -> usize {
+        let Ok(s) = self.shared.lock() else {
+            return 0;
+        };
+        let mut n = 0;
+        let mut index = s.read;
+        let mut remaining = s.len;
+        while n < dst.len() && remaining > 0 {
+            dst[n] = s.ring[index];
+            n += 1;
+            remaining -= 1;
+            index = (index + 1) % s.ring.len();
         }
         n
     }

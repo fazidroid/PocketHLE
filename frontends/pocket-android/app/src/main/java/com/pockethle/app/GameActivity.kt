@@ -186,17 +186,20 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         audioThread = Thread({
             var track: AudioTrack? = null
             try {
-                var rate = 22050
-                var channels = 1
-                repeat(100) {
-                    val packed = NativeBridge.nativeAudioFormat(handle)
-                    if (packed != 0L) {
-                        rate = (packed ushr 16).toInt().coerceIn(8000, 48000)
-                        channels = (packed and 0xffff).toInt().coerceIn(1, 2)
+                var packed = 0L
+                var ready = false
+                repeat(250) {
+                    if (!audioRunning || session != handle) return@Thread
+                    packed = NativeBridge.nativeAudioFormat(handle)
+                    if (packed != 0L && NativeBridge.nativeAudioReady(handle) != 0) {
+                        ready = true
                         return@repeat
                     }
                     Thread.sleep(20)
                 }
+                if (!ready) return@Thread
+                val rate = (packed ushr 16).toInt().coerceIn(8000, 48000)
+                val channels = (packed and 0xffff).toInt().coerceIn(1, 2)
                 val channelMask = if (channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
                 val minBuffer = AudioTrack.getMinBufferSize(rate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
                 if (minBuffer <= 0) return@Thread
@@ -218,12 +221,18 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 while (audioRunning && session == handle) {
                     val pcm = NativeBridge.nativePollAudio(handle, 4096)
                     if (pcm != null && pcm.isNotEmpty()) {
-                        track.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
+                        var offset = 0
+                        while (offset < pcm.size && audioRunning && session == handle) {
+                            val written = track.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
+                            if (written <= 0) break
+                            offset += written
+                        }
                     } else {
                         Thread.sleep(8)
                     }
                 }
-            } catch (_: Throwable) {
+            } catch (error: Throwable) {
+                android.util.Log.e("PocketHLE", "AudioTrack playback failed", error)
             } finally {
                 try { track?.stop() } catch (_: Throwable) {}
                 try { track?.release() } catch (_: Throwable) {}
