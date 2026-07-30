@@ -19,6 +19,9 @@ use goblin::pe::PE;
 use indexmap::IndexMap;
 use thiserror::Error;
 
+pub mod icon;
+pub use icon::{icon_from_pe_bytes, IconImage};
+
 pub mod resources;
 pub use resources::{collect_resources, ResourceEntry, ResourceKey};
 
