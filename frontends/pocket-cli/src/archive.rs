@@ -48,6 +48,9 @@ pub struct Launcher {
     /// looks up `HKLM\SOFTWARE\Apps\Astraware Bejeweled\SaveDir` and
     /// calls `ExitProcess(0x42)` when the value is missing.
     pub registry: Vec<pocket_core::cab::SetupRegistryValue>,
+    /// Guest directory used by the game for persistent data, when the
+    /// cabinet records a `SaveDir` registry value.
+    pub save_prefix: Option<String>,
     /// Hint about what we did, printed to the user.
     pub origin: String,
     /// Owns the temp directory; kept here so it is not removed until
@@ -75,6 +78,7 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
             extra_mounts: Vec::new(),
             guest_exe_path: None,
             registry: Vec::new(),
+            save_prefix: None,
             origin: format!("PE file {}", path.display()),
             _tempdir: None,
         }),
@@ -158,6 +162,10 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
         .as_ref()
         .map(|script| script.registry.clone())
         .unwrap_or_default();
+    let save_prefix = registry
+        .iter()
+        .find(|value| value.name.eq_ignore_ascii_case("SaveDir"))
+        .and_then(|value| value.string.clone());
 
     Ok(Launcher {
         exe: exe_path,
@@ -165,6 +173,7 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
         extra_mounts,
         guest_exe_path,
         registry,
+        save_prefix,
         origin,
         _tempdir: Some(tmp),
     })
@@ -553,6 +562,29 @@ fn derive_extra_mounts(
     out
 }
 
+pub fn save_id(path: &Path) -> String {
+    let raw = path
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '_' | '-' | '.') {
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('.').trim_matches('_').trim_matches('-');
+    if trimmed.is_empty() {
+        "game".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn prepare_zip(path: &Path) -> Result<Launcher> {
     let tmp = TempDir::with_prefix("pockethle-zip-")
         .with_context(|| format!("creating temp dir for {}", path.display()))?;
@@ -625,6 +657,7 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
         )],
         guest_exe_path: None,
         registry: Vec::new(),
+        save_prefix: None,
         origin,
         _tempdir: Some(tmp),
     })

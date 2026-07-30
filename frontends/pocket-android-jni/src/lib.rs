@@ -341,6 +341,16 @@ fn run_game(root: &Path, id: &str) -> RunOutcomeJson {
         emu.max_slices = entry.settings.max_slices;
         emu.instruction_budget_per_slice = entry.settings.instructions_per_slice;
         emu.load_pe(&exe)?;
+        for value in &entry.registry {
+            let registry_value = if let Some(text) = value.string.as_deref() {
+                pocket_core::kernel::registry::RegistryValue::Sz(text.to_string())
+            } else if let Some(number) = value.dword {
+                pocket_core::kernel::registry::RegistryValue::Dword(number)
+            } else {
+                continue;
+            };
+            emu.set_registry_value(&value.key, &value.name, registry_value);
+        }
         emu.mount_dir("\\Application\\", entry.extracted_dir(root));
         emu.mount_dir("\\Program Files\\", entry.extracted_dir(root));
         emu.mount_dir("\\Program Files\\Game\\", entry.extracted_dir(root));

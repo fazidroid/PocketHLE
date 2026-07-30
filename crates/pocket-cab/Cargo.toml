@@ -11,4 +11,5 @@ description = "Microsoft .CAB extractor wrapper for PocketHLE."
 anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
+serde.workspace = true
 cab.workspace = true

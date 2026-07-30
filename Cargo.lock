@@ -2646,6 +2646,7 @@ dependencies = [
  "anyhow",
  "cab",
  "log",
+ "serde",
  "thiserror 1.0.69",
 ]
 

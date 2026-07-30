@@ -405,7 +405,7 @@ pub struct WinCeSetupScript {
 }
 
 /// One value from the `Registry` section of `_setup.xml`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct SetupRegistryValue {
     /// Canonical key path, e.g. `HKLM\SOFTWARE\Apps\Astraware Bejeweled`.
     pub key: String,

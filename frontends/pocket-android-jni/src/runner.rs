@@ -283,6 +283,18 @@ fn run_game_to_completion(
         summary_lines.push(format!("load_pe failed: {e:#}"));
         return summary_lines.join("\n");
     }
+
+    for value in &entry.registry {
+        let registry_value = if let Some(text) = value.string.as_deref() {
+            pocket_core::kernel::registry::RegistryValue::Sz(text.to_string())
+        } else if let Some(number) = value.dword {
+            pocket_core::kernel::registry::RegistryValue::Dword(number)
+        } else {
+            continue;
+        };
+        emu.set_registry_value(&value.key, &value.name, registry_value);
+    }
+
     // The tap has to be published before the guest runs: the Kotlin
     // feeder thread starts polling as soon as the surface is up.
     if let Ok(mut slot) = state.audio.lock() {

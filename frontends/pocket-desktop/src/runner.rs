@@ -105,6 +105,17 @@ impl Runner {
             };
         }
 
+        for value in &game.registry {
+            let registry_value = if let Some(text) = value.string.as_deref() {
+                pocket_core::kernel::registry::RegistryValue::Sz(text.to_string())
+            } else if let Some(number) = value.dword {
+                pocket_core::kernel::registry::RegistryValue::Dword(number)
+            } else {
+                continue;
+            };
+            emu.set_registry_value(&value.key, &value.name, registry_value);
+        }
+
         let extracted = game.extracted_dir(&library_root);
         emu.mount_read_only_dir("\\Application\\", &extracted);
         emu.mount_read_only_dir("\\Program Files\\", &extracted);

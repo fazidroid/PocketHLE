@@ -84,6 +84,9 @@ pub struct GameEntry {
     /// WinCE directory used by the game for save data, if the CAB records one.
     #[serde(default)]
     pub save_prefix: Option<String>,
+    /// Registry values installed by the CAB before the first launch.
+    #[serde(default)]
+    pub registry: Vec<pocket_cab::SetupRegistryValue>,
     /// Best-effort UNIX timestamp of when the game was imported.
     #[serde(default)]
     pub imported_at: i64,
@@ -562,6 +565,7 @@ impl Library {
                 .or_else(|| header.as_ref().and_then(|h| h.install_dir.clone()))
                 .or_else(|| infer_install_dir(&files)),
             save_prefix: setup_save_dir(&files),
+            registry: setup_registry(&files),
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -621,6 +625,7 @@ impl Library {
             source_cab: source_name,
             install_dir: None,
             save_prefix: None,
+            registry: Vec::new(),
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -750,6 +755,7 @@ impl Library {
             source_cab: source_name,
             install_dir: None,
             save_prefix: None,
+            registry: Vec::new(),
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -914,6 +920,19 @@ fn setup_save_dir(files: &[pocket_cab::CabFile]) -> Option<String> {
             }
             path
         })
+}
+
+fn setup_registry(files: &[pocket_cab::CabFile]) -> Vec<pocket_cab::SetupRegistryValue> {
+    let Some(setup) = files
+        .iter()
+        .find(|f| f.short_name.eq_ignore_ascii_case("_setup.xml"))
+    else {
+        return Vec::new();
+    };
+    fs::read(&setup.extracted_path)
+        .ok()
+        .map(|data| pocket_cab::WinCeSetupScript::parse_bytes(&data).registry)
+        .unwrap_or_default()
 }
 
 fn setup_install_dir(files: &[pocket_cab::CabFile]) -> Option<String> {
@@ -1198,6 +1217,7 @@ mod tests {
             source_cab: "spore.cab".to_string(),
             install_dir: install_dir.map(str::to_string),
             save_prefix: None,
+            registry: Vec::new(),
             imported_at: 0,
             settings: GameSettings::default(),
             icon: None,

@@ -561,6 +561,17 @@ fn cmd_run(
             prefix
         );
     }
+    if let Some(save_prefix) = &_launcher.save_prefix {
+        let save_dir = pocket_library::save_data::save_dir_for(
+            &pocket_library::default_library_root(),
+            &archive::save_id(path),
+        );
+        emu.mount_dir(save_prefix, &save_dir);
+        println!(
+            "Persistent save data: {} -> {save_prefix:?}",
+            save_dir.display()
+        );
+    }
     let effective_module_path = module_path.or(_launcher.guest_exe_path.as_deref());
     if let Some(path) = effective_module_path {
         emu.set_module_path(path);
