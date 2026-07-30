@@ -575,6 +575,8 @@ pub struct KernelState {
     /// handed to the guest by `GetMessageW` / `PeekMessageW`.
     /// `(hwnd, msg, wparam, lparam)`.
     pub posted_messages: VecDeque<(u32, u32, u32, u32)>,
+    pub msg_queues: HashMap<u32, MsgQueue>,
+    pub next_msg_queue_handle: u32,
     /// Per-menu table of `(item_id -> flags)`. We track the flags so
     /// that `CheckMenuItem`/`GetMenuState` round-trip the previously
     /// set state instead of always returning the same constant —
@@ -594,7 +596,7 @@ pub struct KernelState {
 }
 
 /// Saved register context for one cooperative guest thread.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GuestThread {
     pub entry: u32,
     pub parameter: u32,
@@ -603,6 +605,15 @@ pub struct GuestThread {
     pub exit_va: u32,
     pub resume_pc: u32,
     pub handle: u32,
+    /// Synthetic `GetCurrentThreadId` value. `PostThreadMessageW`
+    /// targets a thread by this id, so it has to be stable and
+    /// non-zero for the whole life of the thread.
+    pub id: u32,
+    /// Messages posted to *this thread* rather than to a window.
+    /// `GetMessageW` running on the thread drains this queue; the
+    /// window queue (`KernelState::posted_messages`) belongs to the
+    /// main thread only.
+    pub messages: std::collections::VecDeque<(u32, u32, u32)>,
     pub saved_regs: [u32; 17],
     pub worker_regs: [u32; 17],
     pub worker_saved: bool,
@@ -629,6 +640,8 @@ impl GuestThread {
             exit_va,
             resume_pc,
             handle,
+            id: 0,
+            messages: std::collections::VecDeque::new(),
             saved_regs,
             worker_regs: [0; 17],
             worker_saved: false,
@@ -1212,6 +1225,8 @@ impl Process {
                 wave_out_format: GuestFormat::default(),
                 wave_out: Default::default(),
                 posted_messages: Default::default(),
+                msg_queues: HashMap::new(),
+                next_msg_queue_handle: 0xDEAD_E500,
                 menus: HashMap::new(),
                 next_menu_handle: 0xDEAD_2000,
                 sub_menus: HashMap::new(),
@@ -1424,8 +1439,8 @@ pub fn run_main_loop_with_hook(
         };
         match stop {
             StopReason::InstructionLimit => {
-                log::trace!("instruction slice exhausted; resuming");
                 pc = cpu.read_reg(ArmReg::Pc)?;
+                log::trace!("instruction slice exhausted; resuming at 0x{pc:08x}");
                 continue;
             }
             StopReason::Hook(addr) => {
@@ -1449,7 +1464,7 @@ pub fn run_main_loop_with_hook(
                     .iter()
                     .position(|thread| thread.exit_va == addr && !thread.finished)
                 {
-                    let thread = process.state.threads[thread_index];
+                    let thread = process.state.threads[thread_index].clone();
                     if thread.worker_saved {
                         for (index, value) in thread.saved_regs.iter().enumerate() {
                             cpu.write_reg(
@@ -1694,4 +1709,12 @@ mod tests {
             .read_mem(PROCESS_EXIT_TRAMPOLINE_VA, 4)
             .expect("kernel trap page must be mapped");
     }
+}
+
+#[derive(Debug, Default)]
+pub struct MsgQueue {
+    pub max_messages: u32,
+    pub max_message_size: u32,
+    pub read_access: bool,
+    pub messages: VecDeque<Vec<u8>>,
 }
