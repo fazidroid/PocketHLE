@@ -123,6 +123,10 @@ impl Vfs {
         self.mount_with_options(guest_prefix, host_dir, true);
     }
 
+    pub fn mount_save_dir(&mut self, guest_prefix: &str, host_dir: impl Into<PathBuf>) {
+        self.mount_with_options(guest_prefix, host_dir, false);
+    }
+
     fn mount_with_options(
         &mut self,
         guest_prefix: &str,
@@ -157,38 +161,32 @@ impl Vfs {
             .collect()
     }
 
-    fn matching_mount(&self, guest_path: &str) -> Option<&Mount> {
-        let guest_path = &self.absolute(guest_path);
-        let mut normalised = guest_path.replace('\\', "/").to_ascii_lowercase();
+    fn normalise_guest_path(&self, guest_path: &str) -> String {
+        let absolute = self.absolute(guest_path);
+        let mut normalised = absolute.replace('\\', "/").to_ascii_lowercase();
         while normalised.contains("//") {
             normalised = normalised.replace("//", "/");
         }
-        let with_leading = if normalised.starts_with('/') {
+        if normalised.starts_with('/') {
             normalised
         } else {
             format!("/{normalised}")
-        };
-        self.mounts
-            .iter()
-            .filter(|mount| with_leading.starts_with(&mount.prefix))
-            .max_by_key(|mount| mount.prefix.len())
+        }
     }
 
-    /// Translate a guest path to a host path. Returns `None` if no
-    /// mount matches or the path tries to escape the mount root.
-    pub fn resolve(&self, guest_path: &str) -> Option<PathBuf> {
-        let guest_path = &self.absolute(guest_path);
-        let mut normalised = guest_path.replace('\\', "/").to_ascii_lowercase();
-        while normalised.contains("//") {
-            normalised = normalised.replace("//", "/");
-        }
-        let with_leading = if normalised.starts_with('/') {
-            normalised
-        } else {
-            format!("/{normalised}")
-        };
-        let mount = self.matching_mount(&with_leading)?;
-        let rel = &with_leading[mount.prefix.len()..];
+    fn matching_mounts<'a>(&'a self, guest_path: &str) -> Vec<&'a Mount> {
+        let normalised = self.normalise_guest_path(guest_path);
+        let mut mounts: Vec<_> = self
+            .mounts
+            .iter()
+            .filter(|mount| normalised.starts_with(&mount.prefix))
+            .collect();
+        mounts.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        mounts
+    }
+
+    fn host_path_for_mount(&self, mount: &Mount, normalised: &str) -> Option<PathBuf> {
+        let rel = &normalised[mount.prefix.len()..];
         let mut p = mount.host_dir.clone();
         for comp in Path::new(rel).components() {
             match comp {
@@ -214,12 +212,31 @@ impl Vfs {
                 }
                 Component::CurDir => {}
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    log::warn!("vfs.resolve: refusing escape via {guest_path:?}");
+                    log::warn!("vfs.resolve: refusing escape via {normalised:?}");
                     return None;
                 }
             }
         }
         Some(p)
+    }
+
+    /// Translate a guest path to a host path. Existing files fall back
+    /// through broader mounts, allowing a writable save overlay to sit
+    /// above a read-only extracted game directory.
+    pub fn resolve(&self, guest_path: &str) -> Option<PathBuf> {
+        let normalised = self.normalise_guest_path(guest_path);
+        let mounts = self.matching_mounts(&normalised);
+        let mut fallback = None;
+        for mount in mounts {
+            let path = self.host_path_for_mount(mount, &normalised)?;
+            if fallback.is_none() {
+                fallback = Some(path.clone());
+            }
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        fallback
     }
 
     /// List a guest directory. Returns `(name, size, is_dir)` for
@@ -230,28 +247,40 @@ impl Vfs {
     /// use to discover their own data files (Astraware titles enumerate
     /// `*.pdb` resource databases next to the executable).
     pub fn list_dir(&self, guest_dir: &str) -> Option<Vec<(String, u64, bool)>> {
-        let host = self.resolve(guest_dir)?;
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&host).ok()?.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            out.push((
-                entry.file_name().to_string_lossy().to_string(),
-                meta.len(),
-                meta.is_dir(),
-            ));
+        let normalised = self.normalise_guest_path(guest_dir);
+        let mut merged = std::collections::BTreeMap::new();
+        for mount in self.matching_mounts(&normalised) {
+            let Some(host) = self.host_path_for_mount(mount, &normalised) else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(host) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                let name = entry.file_name().to_string_lossy().to_string();
+                merged.entry(name.to_ascii_lowercase()).or_insert((
+                    name,
+                    meta.len(),
+                    meta.is_dir(),
+                ));
+            }
         }
-        out.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
-        Some(out)
+        (!merged.is_empty()).then(|| merged.into_values().collect())
     }
 
     /// Open a host file behind a guest path. Returns the handle id.
     pub fn open(&mut self, guest_path: &str, access: Access, create: bool) -> Option<u32> {
-        let mount = self.matching_mount(guest_path)?;
-        if mount.read_only && !matches!(access, Access::Read) {
-            log::debug!("vfs.open: refusing write to read-only mount {guest_path:?}");
-            return None;
-        }
-        let host_path = self.resolve(guest_path)?;
+        let normalised = self.normalise_guest_path(guest_path);
+        let host_path = if matches!(access, Access::Read) {
+            self.resolve(guest_path)?
+        } else {
+            let mount = self
+                .matching_mounts(&normalised)
+                .into_iter()
+                .find(|mount| !mount.read_only)?;
+            self.host_path_for_mount(mount, &normalised)?
+        };
         let mut opts = OpenOptions::new();
         match access {
             Access::Read => {

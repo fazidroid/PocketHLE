@@ -292,16 +292,24 @@ fn run_game_to_completion(
     emu.set_screen_size(screen_width, screen_height);
     summary_lines.push(format!("Screen: {screen_width}x{screen_height}"));
     let extracted = entry.extracted_dir(library_root);
-    emu.mount_dir("\\Application\\", &extracted);
-    emu.mount_dir("\\Program Files\\", &extracted);
-    emu.mount_dir("\\Program Files\\Game\\", &extracted);
+    emu.mount_read_only_dir("\\Application\\", &extracted);
+    emu.mount_read_only_dir("\\Program Files\\", &extracted);
+    emu.mount_read_only_dir("\\Program Files\\Game\\", &extracted);
     if let Some(prefix) = entry.guest_install_prefix() {
-        emu.mount_dir(&prefix, &extracted);
+        emu.mount_read_only_dir(&prefix, &extracted);
         // Report the installed path so a game that builds absolute
         // asset paths off its own module name finds its archive.
         if let Some(guest_exe) = entry.guest_exe_path() {
             emu.set_module_path(&guest_exe);
             emu.set_default_dir(&prefix);
+        }
+        if let Some(save_prefix) = entry.guest_save_prefix() {
+            let save_dir = entry.save_dir(library_root);
+            emu.mount_save_dir(&save_prefix, &save_dir);
+            summary_lines.push(format!(
+                "Save data: {} -> {save_prefix:?}",
+                save_dir.display()
+            ));
         }
     }
     // Match the desktop GUI: a real user is in the loop, so don't

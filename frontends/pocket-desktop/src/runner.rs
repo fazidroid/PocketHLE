@@ -106,9 +106,9 @@ impl Runner {
         }
 
         let extracted = game.extracted_dir(&library_root);
-        emu.mount_dir("\\Application\\", &extracted);
-        emu.mount_dir("\\Program Files\\", &extracted);
-        emu.mount_dir("\\Program Files\\Game\\", &extracted);
+        emu.mount_read_only_dir("\\Application\\", &extracted);
+        emu.mount_read_only_dir("\\Program Files\\", &extracted);
+        emu.mount_read_only_dir("\\Program Files\\Game\\", &extracted);
         // A game that keeps its assets in one archive opens it by
         // absolute path built from its own module path -- Spore Origins
         // asks for `\Program Files\EA\Spore v1.0.4\data.vfs`. Mount the
@@ -118,12 +118,20 @@ impl Runner {
         // archive never opens and the game calls through a pointer it
         // never stored, which surfaces as READ_UNMAPPED at 0x2.
         if let Some(prefix) = game.guest_install_prefix() {
-            emu.mount_dir(&prefix, &extracted);
+            emu.mount_read_only_dir(&prefix, &extracted);
             summary_lines.push(format!("Mounted {} at {prefix:?}", extracted.display()));
             if let Some(guest_exe) = game.guest_exe_path() {
                 emu.set_module_path(&guest_exe);
                 emu.set_default_dir(&prefix);
                 summary_lines.push(format!("Module path: {guest_exe}"));
+            }
+            if let Some(save_prefix) = game.guest_save_prefix() {
+                let save_dir = game.save_dir(&library_root);
+                emu.mount_save_dir(&save_prefix, &save_dir);
+                summary_lines.push(format!(
+                    "Save data: {} -> {save_prefix:?}",
+                    save_dir.display()
+                ));
             }
         }
         // GUI users actually play the game, so don't auto-fire

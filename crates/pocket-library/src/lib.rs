@@ -30,6 +30,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod save_data;
+
 /// Errors returned by [`Library`] operations.
 #[derive(Debug, Error)]
 pub enum LibraryError {
@@ -79,6 +81,9 @@ pub struct GameEntry {
     /// WinCE installation directory recorded by the CAB, if available.
     #[serde(default)]
     pub install_dir: Option<String>,
+    /// WinCE directory used by the game for save data, if the CAB records one.
+    #[serde(default)]
+    pub save_prefix: Option<String>,
     /// Best-effort UNIX timestamp of when the game was imported.
     #[serde(default)]
     pub imported_at: i64,
@@ -109,6 +114,10 @@ impl GameEntry {
     /// Absolute path to the directory holding the extracted cab.
     pub fn extracted_dir(&self, library_root: &Path) -> PathBuf {
         library_root.join(self.relative_dir()).join("extracted")
+    }
+
+    pub fn save_dir(&self, library_root: &Path) -> PathBuf {
+        save_data::save_dir_for(library_root, &self.id)
     }
 
     /// Absolute path to the main executable.
@@ -143,6 +152,12 @@ impl GameEntry {
         let prefix = self.guest_install_prefix()?;
         let name = self.executable.file_name()?.to_str()?;
         Some(format!("{prefix}{name}"))
+    }
+
+    pub fn guest_save_prefix(&self) -> Option<String> {
+        self.save_prefix
+            .clone()
+            .or_else(|| self.guest_install_prefix())
     }
 }
 
@@ -546,6 +561,7 @@ impl Library {
             install_dir: setup_install_dir(&files)
                 .or_else(|| header.as_ref().and_then(|h| h.install_dir.clone()))
                 .or_else(|| infer_install_dir(&files)),
+            save_prefix: setup_save_dir(&files),
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -604,6 +620,7 @@ impl Library {
             executable,
             source_cab: source_name,
             install_dir: None,
+            save_prefix: None,
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -732,6 +749,7 @@ impl Library {
             executable,
             source_cab: source_name,
             install_dir: None,
+            save_prefix: None,
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
@@ -876,6 +894,28 @@ fn materialise_legacy_assets(root: &Path, files: &[pocket_cab::CabFile], app_nam
 /// the path the game hard-codes. This mirrors how `pockethle run <cab>`
 /// resolves the same cabinet, so a title behaves identically whether it
 /// is launched from a file or from the library.
+fn setup_save_dir(files: &[pocket_cab::CabFile]) -> Option<String> {
+    let setup = files
+        .iter()
+        .find(|f| f.short_name.eq_ignore_ascii_case("_setup.xml"))?;
+    let data = fs::read(&setup.extracted_path).ok()?;
+    pocket_cab::WinCeSetupScript::parse_bytes(&data)
+        .registry
+        .into_iter()
+        .find(|value| value.name.eq_ignore_ascii_case("SaveDir"))
+        .and_then(|value| value.string)
+        .map(|value| {
+            let mut path = value.replace('/', "\\");
+            if !path.starts_with('\\') {
+                path.insert(0, '\\');
+            }
+            if !path.ends_with('\\') {
+                path.push('\\');
+            }
+            path
+        })
+}
+
 fn setup_install_dir(files: &[pocket_cab::CabFile]) -> Option<String> {
     let setup = files
         .iter()
@@ -1157,6 +1197,7 @@ mod tests {
             executable: PathBuf::from("extracted/spore.exe"),
             source_cab: "spore.cab".to_string(),
             install_dir: install_dir.map(str::to_string),
+            save_prefix: None,
             imported_at: 0,
             settings: GameSettings::default(),
             icon: None,
