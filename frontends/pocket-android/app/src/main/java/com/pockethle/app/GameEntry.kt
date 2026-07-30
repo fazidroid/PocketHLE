@@ -27,6 +27,7 @@ data class GameEntry(
                 executable = obj.getString("executable"),
                 sourceCab = obj.getString("source_cab"),
                 importedAt = obj.optLong("imported_at"),
+                icon = obj.optString("icon").takeIf { !obj.isNull("icon") && it.isNotEmpty() },
                 settings = GameSettings.fromJson(settingsObj),
             )
         }
