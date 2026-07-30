@@ -6268,28 +6268,166 @@ fn get_window_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-/// `BOOL PlaySoundW(LPCWSTR pszSound, HMODULE hmod, DWORD fdwSound)` —
-/// the Pocket PC sound effects helper. We don't have an audio backend
-/// yet, so this is a successful no-op. Logging the requested sound
-/// asset name is helpful when debugging asset-loading paths.
+/// `BOOL PlaySoundW(LPCWSTR pszSound, HMODULE hmod, DWORD fdwSound)`.
+///
+/// WinCE exposes PlaySound as a small WAV convenience API. `pszSound` is
+/// either a guest path, an in-image resource name/ID, or NULL (stop). The
+/// old implementation returned TRUE without decoding anything, which made
+/// every resource-backed effect silently disappear.
 fn play_sound_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let p = ctx.arg_u32(0)?;
+    const SND_ASYNC: u32 = 0x0001;
+    const SND_LOOP: u32 = 0x0008;
+    const SND_NOSTOP: u32 = 0x0010;
+    const SND_PURGE: u32 = 0x0040;
+    const SND_RESOURCE: u32 = 0x0004_0004;
+    const SND_FILENAME: u32 = 0x0002_0000;
+    const SND_MEMORY: u32 = 0x0004;
+
+    let sound = ctx.arg_u32(0)?;
     let _hmod = ctx.arg_u32(1)?;
     let flags = ctx.arg_u32(2)?;
-    // SND_RESOURCE = 0x00040004 → pszSound is a MAKEINTRESOURCE id.
-    // SND_ASYNC = 0x0001, SND_LOOP = 0x0008, etc. We ignore them.
-    if p != 0 && (flags & 0x0004) == 0 {
-        let chars = read_wstr(ctx, p, 256).unwrap_or_default();
-        let s: String = chars
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8 as char)
-            .collect();
-        log::debug!("PlaySoundW({s:?}, flags=0x{flags:08x}) -> stub OK");
-    } else {
-        log::debug!("PlaySoundW(0x{p:08x}, flags=0x{flags:08x}) -> stub OK");
+    if sound == 0 {
+        if flags & SND_PURGE != 0 || flags == 0 {
+            ctx.kernel.audio.flush();
+            log::debug!("PlaySoundW(NULL, flags=0x{flags:08x}) -> stopped");
+        }
+        return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    Ok(DispatchOutcome::ReturnedR0(1))
+    if flags & SND_RESOURCE != 0 {
+        let name = read_wide_resource_key(ctx, sound)?;
+        if let Some(resource) = ctx
+            .kernel
+            .resources
+            .iter()
+            .find(|e| e.ty == ResourceKey::Id(10) && e.name == name)
+        {
+            let va = ctx.kernel.image_base.wrapping_add(resource.data_rva);
+            let bytes = ctx.cpu.read_mem(va, resource.size)?;
+            let ok = submit_wave_bytes(ctx, &bytes, flags, "resource")?;
+            log::debug!(
+                "PlaySoundW(resource={name:?}, bytes={}, async={}, loop={}) -> {ok}",
+                bytes.len(),
+                flags & SND_ASYNC != 0,
+                flags & SND_LOOP != 0
+            );
+            return Ok(DispatchOutcome::ReturnedR0(ok as u32));
+        }
+        log::debug!("PlaySoundW(resource={name:?}) -> missing");
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = if flags & SND_MEMORY != 0 {
+        let size = ctx
+            .kernel
+            .resources
+            .iter()
+            .find(|e| e.ty == ResourceKey::Id(10))
+            .map(|e| e.size)
+            .unwrap_or(0);
+        if size == 0 {
+            Vec::new()
+        } else {
+            ctx.cpu.read_mem(sound, size)?
+        }
+    } else {
+        let path = if flags & SND_FILENAME != 0 {
+            read_wstr(ctx, sound, 260).unwrap_or_default()
+        } else {
+            read_wstr(ctx, sound, 260).unwrap_or_default()
+        };
+        let path = String::from_utf16_lossy(&path);
+        read_guest_file(ctx, &path).unwrap_or_default()
+    };
+    let ok = if bytes.is_empty() {
+        false
+    } else {
+        submit_wave_bytes(ctx, &bytes, flags, "file")?
+    };
+    log::debug!(
+        "PlaySoundW(sound=0x{sound:08x}, bytes={}, async={}, loop={}, nostop={}) -> {ok}",
+        bytes.len(),
+        flags & SND_ASYNC != 0,
+        flags & SND_LOOP != 0,
+        flags & SND_NOSTOP != 0
+    );
+    Ok(DispatchOutcome::ReturnedR0(ok as u32))
+}
+
+fn read_guest_file(ctx: &mut CallCtx<'_>, path: &str) -> Option<Vec<u8>> {
+    use pocket_kernel::vfs::Access;
+    let handle = ctx.kernel.vfs.open(path, Access::Read, false)?;
+    let size = ctx.kernel.vfs.size(handle)? as usize;
+    let mut bytes = vec![0u8; size];
+    let n = ctx.kernel.vfs.read(handle, &mut bytes)?;
+    let _ = ctx.kernel.vfs.close(handle);
+    bytes.truncate(n);
+    Some(bytes)
+}
+
+fn submit_wave_bytes(
+    ctx: &mut CallCtx<'_>,
+    bytes: &[u8],
+    flags: u32,
+    source: &str,
+) -> Result<bool, KernelError> {
+    let Some((fmt, data)) = parse_pcm_wave(bytes) else {
+        log::debug!(
+            "PlaySoundW {source}: unsupported/non-PCM WAV ({} bytes)",
+            bytes.len()
+        );
+        return Ok(false);
+    };
+    ctx.kernel.wave_out_format = fmt;
+    ctx.kernel.audio.set_guest_format(fmt);
+    if flags & 0x0040 != 0 {
+        ctx.kernel.audio.flush();
+    }
+    match fmt.bits_per_sample {
+        8 => {
+            ctx.kernel.audio.push_samples_u8(data);
+        }
+        16 => {
+            let mut samples = Vec::with_capacity(data.len() / 2);
+            for chunk in data.chunks_exact(2) {
+                samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+            ctx.kernel.audio.push_samples(&samples);
+        }
+        _ => return Ok(false),
+    }
+    ctx.kernel.audio.start();
+    Ok(true)
+}
+
+fn parse_pcm_wave(bytes: &[u8]) -> Option<(pocket_kernel::audio::GuestFormat, &[u8])> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut p = 12usize;
+    let mut fmt = None;
+    let mut data = None;
+    while p + 8 <= bytes.len() {
+        let id = &bytes[p..p + 4];
+        let size = u32::from_le_bytes(bytes[p + 4..p + 8].try_into().ok()?) as usize;
+        let end = p.checked_add(8)?.checked_add(size)?.min(bytes.len());
+        if id == b"fmt " && size >= 16 && p + 24 <= bytes.len() {
+            let tag = u16::from_le_bytes(bytes[p + 8..p + 10].try_into().ok()?);
+            let channels = u16::from_le_bytes(bytes[p + 10..p + 12].try_into().ok()?);
+            let rate = u32::from_le_bytes(bytes[p + 12..p + 16].try_into().ok()?);
+            let bits = u16::from_le_bytes(bytes[p + 22..p + 24].try_into().ok()?);
+            if tag != 1 || channels == 0 || rate == 0 || !matches!(bits, 8 | 16) {
+                return None;
+            }
+            fmt = Some(pocket_kernel::audio::GuestFormat {
+                sample_rate: rate,
+                channels,
+                bits_per_sample: bits,
+            });
+        } else if id == b"data" {
+            data = Some(&bytes[p + 8..end]);
+        }
+        p = p + 8 + size + (size & 1);
+    }
+    Some((fmt?, data?))
 }
 
 const OSVERSIONINFOW_BYTES: u32 = 4 + 4 * 4 + 128 * 2;
