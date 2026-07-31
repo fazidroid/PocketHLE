@@ -341,6 +341,12 @@ fn run_game(root: &Path, id: &str) -> RunOutcomeJson {
         emu.max_slices = entry.settings.max_slices;
         emu.instruction_budget_per_slice = entry.settings.instructions_per_slice;
         emu.load_pe(&exe)?;
+        // Must follow `load_pe`, which creates the process that owns the
+        // framebuffer; before that the call is a no-op and the game runs
+        // at the 240x320 default whatever the user picked.
+        let (screen_w, screen_h) = entry.settings.screen.size();
+        emu.set_screen_size(screen_w, screen_h);
+        summary_lines.push(format!("Screen: {screen_w}x{screen_h}"));
         for value in &entry.registry {
             let registry_value = if let Some(text) = value.string.as_deref() {
                 pocket_core::kernel::registry::RegistryValue::Sz(text.to_string())

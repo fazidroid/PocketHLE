@@ -574,7 +574,8 @@ impl PocketLauncher {
 
     /// Render the live framebuffer (or placeholder) and forward any
     /// pointer presses on it as `WM_LBUTTONDOWN` / `WM_LBUTTONUP`
-    /// events with stylus coordinates in 240×320 game space.
+    /// events, with stylus coordinates in whatever resolution the game
+    /// is actually running at.
     fn ui_run_screen(&mut self, ui: &mut egui::Ui) {
         let Some(tex) = self.last_frame_texture.clone() else {
             ui.allocate_ui(
@@ -587,8 +588,14 @@ impl PocketLauncher {
         };
         let size = tex.size_vec2();
         // Display at 2x for readability, the same way the CLI's
-        // minifb DisplayHook scales.
-        let scale = 2.0_f32;
+        // minifb DisplayHook scales — but never larger than the space
+        // egui actually gave us. A 480x800 WVGA game at a fixed 2x is
+        // 960x1600 and would run off the bottom of a 1080p window.
+        let available = ui.available_size();
+        let scale = 2.0_f32
+            .min(available.x / size.x)
+            .min(available.y / size.y)
+            .max(1.0);
         let display_size = size * scale;
         let (rect, response) = ui.allocate_exact_size(display_size, Sense::click_and_drag());
         let image = egui::Image::from_texture(&tex).fit_to_exact_size(display_size);
@@ -610,10 +617,12 @@ impl PocketLauncher {
                 Color32::LIGHT_GREEN,
             );
         }
-        self.handle_pointer(&rect, &response);
+        self.handle_pointer(&rect, &response, size);
     }
 
-    fn handle_pointer(&mut self, rect: &Rect, response: &egui::Response) {
+    /// `size` is the guest framebuffer's own dimensions in pixels — the
+    /// coordinate space the game expects to receive stylus events in.
+    fn handle_pointer(&mut self, rect: &Rect, response: &egui::Response, size: Vec2) {
         let Some(pos) = response.interact_pointer_pos() else {
             // No pointer over the framebuffer this frame — if the
             // user just released the button, send a corresponding
@@ -626,10 +635,15 @@ impl PocketLauncher {
             return;
         };
         let local = pos - rect.min;
-        let scale_x = FB_WIDTH as f32 / rect.width();
-        let scale_y = FB_HEIGHT as f32 / rect.height();
-        let game_x = (local.x * scale_x).clamp(0.0, (FB_WIDTH - 1) as f32) as u16;
-        let game_y = (local.y * scale_y).clamp(0.0, (FB_HEIGHT - 1) as f32) as u16;
+        // Map UI-space coords to guest framebuffer pixels. The panel
+        // scales whatever geometry the game actually runs at, so both
+        // factors have to come from the live texture rather than the
+        // compile-time constants — otherwise a 480×320 game would see
+        // taps land on the wrong pixels.
+        let scale_x = size.x / rect.width();
+        let scale_y = size.y / rect.height();
+        let game_x = (local.x * scale_x).clamp(0.0, size.x - 1.0) as u16;
+        let game_y = (local.y * scale_y).clamp(0.0, size.y - 1.0) as u16;
         if response.drag_started() || response.is_pointer_button_down_on() {
             // Either freshly pressed, or holding & dragging — if we
             // weren't already tracking a press, fire PointerDown.
