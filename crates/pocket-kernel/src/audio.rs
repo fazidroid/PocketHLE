@@ -62,6 +62,16 @@ impl Default for GuestFormat {
     }
 }
 
+#[derive(Debug)]
+#[cfg(feature = "audio-cpal")]
+struct AudioVoice {
+    samples: Vec<i16>,
+    format: GuestFormat,
+    position_q16: u64,
+    looped: bool,
+    volume: f32,
+}
+
 /// Inner state shared between the emulator thread (which calls
 /// [`AudioEngine::push_samples`]) and the cpal output callback.
 struct Shared {
@@ -100,6 +110,9 @@ struct Shared {
     /// freezes and buffer-done notifications stop until playback
     /// resumes.
     paused: bool,
+    /// Independent sound-effect voices mixed over the waveOut stream.
+    #[cfg(feature = "audio-cpal")]
+    voices: Vec<AudioVoice>,
     /// Optional WAV tap so headless runs can verify that a game
     /// really produces sound on a machine with no audio hardware.
     capture: Option<WavCapture>,
@@ -121,6 +134,8 @@ impl Shared {
             virtual_cursor: 0,
             virtual_tick: None,
             paused: false,
+            #[cfg(feature = "audio-cpal")]
+            voices: Vec::new(),
             capture: None,
         }
     }
@@ -193,12 +208,106 @@ impl Shared {
         self.read = 0;
         self.write = 0;
         self.resampler_phase = 0;
-        // `waveOutReset` documents the playback position as being
-        // reset to zero, so the cursors restart with the ring.
         self.written = 0;
         self.consumed = 0;
         self.virtual_cursor = 0;
         self.virtual_tick = None;
+        #[cfg(feature = "audio-cpal")]
+        self.voices.clear();
+    }
+
+    #[cfg(feature = "audio-cpal")]
+    fn stop_voices(&mut self) {
+        self.voices.clear();
+    }
+
+    #[cfg(feature = "audio-cpal")]
+    fn add_voice(&mut self, samples: Vec<i16>, format: GuestFormat, looped: bool) {
+        if samples.is_empty() {
+            return;
+        }
+        if let Some(cap) = self.capture.as_mut() {
+            cap.write(&samples, format);
+        }
+        self.voices.push(AudioVoice {
+            samples,
+            format,
+            position_q16: 0,
+            looped,
+            volume: 1.0,
+        });
+    }
+
+    #[cfg(feature = "audio-cpal")]
+    fn render_frames(&mut self, output: &mut [f32], output_rate: u32, output_channels: u16) {
+        let channels = output_channels.max(1) as usize;
+        let frames = output.len() / channels;
+        for frame in 0..frames {
+            let mut left = 0.0f32;
+            let mut right = 0.0f32;
+            if !self.paused {
+                let guest_channels = self.guest_format.channels.max(1) as usize;
+                if self.len >= guest_channels {
+                    let left_sample = self.ring[self.read] as f32 / 32768.0;
+                    let right_sample = if guest_channels > 1 {
+                        self.ring[(self.read + 1) % self.ring.len()] as f32 / 32768.0
+                    } else {
+                        left_sample
+                    };
+                    left += left_sample;
+                    right += right_sample;
+                    let step_q16 = ((self.guest_format.sample_rate.max(1) as u64) << 16)
+                        / output_rate.max(1) as u64;
+                    self.resampler_phase = self.resampler_phase.saturating_add(step_q16);
+                    let advance_frames = (self.resampler_phase >> 16) as usize;
+                    self.resampler_phase &= 0xFFFF;
+                    for _ in 0..advance_frames.saturating_mul(guest_channels) {
+                        let _ = self.pop_one();
+                    }
+                } else {
+                    self.resampler_phase = 0;
+                }
+
+                let mut index = 0;
+                while index < self.voices.len() {
+                    let voice = &mut self.voices[index];
+                    let voice_channels = voice.format.channels.max(1) as usize;
+                    let frame_count = voice.samples.len() / voice_channels;
+                    let source_frame = (voice.position_q16 >> 16) as usize;
+                    if frame_count == 0 || source_frame >= frame_count {
+                        if voice.looped && frame_count > 0 {
+                            voice.position_q16 %= (frame_count as u64) << 16;
+                        } else {
+                            self.voices.swap_remove(index);
+                            continue;
+                        }
+                    }
+                    let source_frame = (voice.position_q16 >> 16) as usize;
+                    let sample_index = source_frame * voice_channels;
+                    let left_sample = voice.samples[sample_index] as f32 / 32768.0 * voice.volume;
+                    let right_sample = if voice_channels > 1 {
+                        voice.samples[sample_index + 1] as f32 / 32768.0 * voice.volume
+                    } else {
+                        left_sample
+                    };
+                    left += left_sample;
+                    right += right_sample;
+                    voice.position_q16 = voice.position_q16.saturating_add(
+                        ((voice.format.sample_rate.max(1) as u64) << 16)
+                            / output_rate.max(1) as u64,
+                    );
+                    index += 1;
+                }
+            }
+            left = left.clamp(-1.0, 1.0);
+            right = right.clamp(-1.0, 1.0);
+            for channel in 0..channels {
+                output[frame * channels + channel] = if channel == 0 { left } else { right };
+            }
+        }
+        for sample in &mut output[frames * channels..] {
+            *sample = 0.0;
+        }
     }
 }
 
@@ -353,6 +462,30 @@ impl AudioEngine {
             samples.len()
         } else {
             0
+        }
+    }
+
+    pub fn play_voice(&self, samples: &[i16], format: GuestFormat, looped: bool) -> usize {
+        #[cfg(feature = "audio-cpal")]
+        {
+            if let Ok(mut s) = self.shared.lock() {
+                s.add_voice(samples.to_vec(), format, looped);
+                return samples.len();
+            } else {
+                return 0;
+            }
+        }
+        #[cfg(not(feature = "audio-cpal"))]
+        {
+            let _ = (format, looped);
+            self.push_samples(samples)
+        }
+    }
+
+    pub fn stop_voices(&self) {
+        #[cfg(feature = "audio-cpal")]
+        if let Ok(mut s) = self.shared.lock() {
+            s.stop_voices();
         }
     }
 
@@ -673,49 +806,11 @@ fn fill_output_f32(
     let mut s = match shared.lock() {
         Ok(g) => g,
         Err(_) => {
-            for x in data.iter_mut() {
-                *x = 0.0;
-            }
+            data.fill(0.0);
             return;
         }
     };
-    let guest_rate = s.guest_format.sample_rate.max(1);
-    let guest_channels = s.guest_format.channels.max(1);
-    // Step in guest-samples-per-host-frame (Q16.16).
-    let step_q16 = ((guest_rate as u64) << 16) / host_rate as u64;
-    let host_frames = data.len() / host_channels as usize;
-    let mut phase = s.resampler_phase;
-    for f in 0..host_frames {
-        // Advance the guest read cursor by the integer part of the
-        // accumulated phase increment.
-        let advance = (phase >> 16) as usize;
-        for _ in 0..advance.saturating_mul(guest_channels as usize) {
-            let _ = s.pop_one();
-        }
-        phase &= 0xFFFF;
-        // Read one guest frame (front-load any missing channels with
-        // silence).
-        let mut left = 0i16;
-        let mut right = 0i16;
-        if guest_channels >= 1 {
-            left = s.ring[s.read];
-            // Don't actually pop — we'll pop on the next iteration's
-            // `advance`. This way two host frames mapping to the
-            // same guest sample reuse it.
-            if guest_channels >= 2 {
-                let r_idx = (s.read + 1) % s.ring.len();
-                right = s.ring[r_idx];
-            } else {
-                right = left;
-            }
-        }
-        for ch in 0..host_channels as usize {
-            let v = if ch == 0 { left } else { right };
-            data[f * host_channels as usize + ch] = (v as f32) / 32768.0;
-        }
-        phase += step_q16;
-    }
-    s.resampler_phase = phase;
+    s.render_frames(data, host_rate, host_channels);
 }
 
 #[cfg(feature = "audio-cpal")]

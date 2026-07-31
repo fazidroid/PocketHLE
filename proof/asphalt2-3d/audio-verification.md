@@ -1,12 +1,16 @@
 # Asphalt 2 3D audio verification
 
-The audio path is exercised by the Motorola Q9 CAB supplied for this repository. The run reached the game loop and produced these successful guest calls:
+This proof was generated from the supplied Motorola Q9 CAB with the PocketHLE CLI after the audio mixer/backend changes.
 
-- `waveOutOpen`: PCM, 22050 Hz, mono, 16-bit; `CALLBACK_THREAD`, thread 2;
-- four `waveOutWrite` calls, 8 bytes each, return code `0`;
-- `waveOutPause` and `waveOutRestart`, both return code `0`;
-- the run did not crash or hit an unimplemented API.
+Command profile: `--cpu unicorn --screen 320x240 --dump-audio-to ... --dump-frames-to ... --max-frames 900 --message-budget 100000`.
 
-The detailed capture log is `asphalt-q9-audio.log`.
+The run verified continuous streaming rather than only the startup burst:
 
-The verification host is headless and has no available ALSA output device, so cpal reports `device.default_output_config() failed`. Therefore this artifact proves that PocketHLE accepts the game's PCM stream and routes it into the audio engine, but it is not a claim of audible playback from this container. Audible playback still needs to be checked on a machine with an output device or on the Android frontend, whose `AudioTrack` path drains the same PCM tap.
+- `waveOutOpen`: PCM, 22050 Hz, mono, 16-bit, `CALLBACK_THREAD`;
+- `waveOutPause` / `waveOutRestart` completed successfully;
+- repeated `waveOutWrite` calls continued after the initial four buffers, with 2,756-byte buffers and advancing playback cursors;
+- the emulator reached `frame_counter=1800` and exited cleanly;
+- captured guest audio is a valid 22050 Hz mono PCM WAV, 1.625578 seconds;
+- `asphalt-q9-audio-proof.mp4` contains 900 rendered frames and the captured audio track (AAC, 22050 Hz mono).
+
+The verification container has no ALSA output device, so cpal logs the expected graceful fallback and the video is assembled from the guest framebuffer plus the captured PCM stream. This is an audio-path proof; audible speaker playback still needs a host with an available output device or the Android `AudioTrack` frontend.

@@ -2,10 +2,9 @@
 //!
 //! HSS is a freeware C++ audio mixer commonly bundled with Pocket PC
 //! games. The JumpyBall test ROM uses the C++ classes
-//! `hssSpeaker`, `hssSound`, `hssMusic` directly. We register stubs
-//! by their MSVC-mangled names so dispatch matches without us doing
-//! demangling at runtime. Each stub returns success and discards
-//! audio data.
+//! `hssSpeaker`, `hssSound`, `hssMusic` directly. HSS object methods are
+//! retained as compatibility handlers; waveOut remains the authoritative
+//! PCM transport used by the shipped Asphalt 2 titles.
 
 use pocket_kernel::{DispatchOutcome, KernelError};
 
@@ -50,7 +49,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     }
 }
 
-fn ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn ok(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let this_ptr = ctx.arg_u32(0)?;
+    let _ = this_ptr;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 

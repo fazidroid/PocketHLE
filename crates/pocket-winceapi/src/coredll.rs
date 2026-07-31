@@ -6487,19 +6487,15 @@ fn submit_wave_bytes(
     if flags & 0x0040 != 0 {
         ctx.kernel.audio.flush();
     }
-    match fmt.bits_per_sample {
-        8 => {
-            ctx.kernel.audio.push_samples_u8(data);
-        }
-        16 => {
-            let mut samples = Vec::with_capacity(data.len() / 2);
-            for chunk in data.chunks_exact(2) {
-                samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-            }
-            ctx.kernel.audio.push_samples(&samples);
-        }
+    let samples: Vec<i16> = match fmt.bits_per_sample {
+        8 => data.iter().map(|&b| (b as i16 - 128) * 256).collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect(),
         _ => return Ok(false),
-    }
+    };
+    ctx.kernel.audio.play_voice(&samples, fmt, flags & 0x0008 != 0);
     ctx.kernel.audio.start();
     Ok(true)
 }
@@ -9049,10 +9045,25 @@ fn retire_wave_buffer(ctx: &mut CallCtx<'_>, hdr: u32) -> Result<(), KernelError
                 .push_back((target, MM_WOM_DONE, FAKE_HWAVEOUT, hdr));
         }
         WaveCallbackKind::Thread => {
-            // Thread messages carry no window handle.
-            ctx.kernel
-                .posted_messages
-                .push_back((0, MM_WOM_DONE, FAKE_HWAVEOUT, hdr));
+            // CALLBACK_THREAD notifications belong to the thread ID
+            // passed to waveOutOpen, not to the window queue. Routing
+            // these to the worker queue is what lets a streaming mixer
+            // submit the next buffer instead of stopping after its
+            // initial pre-roll.
+            if let Some(thread) = ctx
+                .kernel
+                .threads
+                .iter_mut()
+                .find(|thread| thread.id == target && !thread.finished)
+            {
+                if thread.messages.len() < 256 {
+                    thread.messages.push_back((MM_WOM_DONE, FAKE_HWAVEOUT, hdr));
+                }
+            } else if ctx.kernel.posted_messages.len() < 256 {
+                ctx.kernel
+                    .posted_messages
+                    .push_back((0, MM_WOM_DONE, FAKE_HWAVEOUT, hdr));
+            }
         }
         WaveCallbackKind::Function => {
             ctx.kernel.wave_out.function_done.push_back(hdr);
