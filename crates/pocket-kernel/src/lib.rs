@@ -346,6 +346,10 @@ pub trait Dispatcher {
     fn constant_for(&self, _thunk: &Thunk) -> Option<u32> {
         None
     }
+
+    fn dynamic_names(&self, _dll: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Trivial dispatcher used by tests that don't need any HLE
@@ -889,6 +893,7 @@ impl Heap {
 /// The whole emulated process state owned by the kernel.
 fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>> {
     let mut exports = HashMap::new();
+    let mut coredll = HashMap::new();
     let mut gx = HashMap::new();
     let mut commctrl = HashMap::new();
     for thunk in thunks {
@@ -897,7 +902,12 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             (ImportBinding::Name(name), _) => name.clone(),
             (ImportBinding::Ordinal(ord), _) => format!("#{ord}"),
         };
-        if thunk.dll.eq_ignore_ascii_case("gx.dll") {
+        if thunk.dll.eq_ignore_ascii_case("coredll.dll") {
+            coredll.insert(name, thunk.thunk_va);
+            if let ImportBinding::Ordinal(ord) = &thunk.binding {
+                coredll.insert(format!("#{}", ord), thunk.thunk_va);
+            }
+        } else if thunk.dll.eq_ignore_ascii_case("gx.dll") {
             gx.insert(name, thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("commctrl.dll") {
             commctrl.insert(name.clone(), thunk.thunk_va);
@@ -907,7 +917,9 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             }
         }
     }
-    // Egoman loads commctrl dynamically even though the EXE has no static import.
+    if !coredll.is_empty() {
+        exports.insert(0x1000_0000, coredll);
+    }
     if !commctrl.is_empty() {
         exports.insert(0x1000_0002, commctrl);
     }
@@ -1063,6 +1075,35 @@ impl Process {
             cpu.write_mem(imp.iat_va, &iat_bytes)?;
             thunks.push(thunk);
             thunk_by_va.insert(thunk_va, i);
+        }
+
+        let dynamic_names = dispatcher.dynamic_names("coredll.dll");
+        let dynamic_base = THUNK_REGION_BASE + thunk_size + 0x1000;
+        let dynamic_size = pocket_cpu::round_up_to_page(
+            (dynamic_names.len() as u32)
+                .saturating_mul(THUNK_STRIDE)
+                .max(0x1000),
+        );
+        if !dynamic_names.is_empty() {
+            cpu.map_region(dynamic_base, dynamic_size, Prot::READ | Prot::EXEC)?;
+            for (index, name) in dynamic_names.iter().enumerate() {
+                let thunk_va = dynamic_base + index as u32 * THUNK_STRIDE;
+                let mut buf = [0u8; THUNK_STRIDE as usize];
+                let stub = return_stub_bytes(cpu.arch());
+                for (chunk, bytes) in buf.chunks_exact_mut(8).zip(stub.chunks_exact(8)) {
+                    chunk.copy_from_slice(bytes);
+                }
+                cpu.write_mem(thunk_va, &buf)?;
+                cpu.add_code_hook(thunk_va)?;
+                thunks.push(Thunk {
+                    thunk_va,
+                    iat_va: 0,
+                    dll: "coredll.dll".to_string(),
+                    binding: ImportBinding::Name(name.clone()),
+                    friendly_name: Some(name.clone()),
+                });
+                thunk_by_va.insert(thunk_va, thunks.len() - 1);
+            }
         }
 
         // 3. Map a stack.

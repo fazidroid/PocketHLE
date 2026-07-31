@@ -58,7 +58,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetCommandLineW", get_command_line_w);
     d.register_handler(dll, "GetModuleHandleW", get_module_handle_w);
     d.register_handler(dll, "GetModuleFileNameW", get_module_file_name_w);
-    d.register_constant(dll, "GetProcAddress", 0, null_returning);
+    d.register_handler(dll, "GetProcAddress", get_proc_address_a);
+    d.register_handler(dll, "GetProcAddressA", get_proc_address_a);
     d.register_handler(dll, "LoadLibraryW", load_library_w);
     d.register_constant(dll, "FreeLibrary", 1, one_returning);
 
@@ -116,6 +117,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "memset", memset);
     d.register_handler(dll, "memcpy", memcpy);
     d.register_handler(dll, "memmove", memcpy);
+    d.register_handler(dll, "memchr", memchr);
     d.register_handler(dll, "memcmp", memcmp);
     d.register_handler(dll, "strlen", strlen);
     d.register_handler(dll, "wcslen", wcslen);
@@ -290,6 +292,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "LockResource", lock_resource);
     d.register_handler(dll, "SizeofResource", sizeof_resource);
     d.register_handler(dll, "LoadBitmapW", load_bitmap_w);
+    d.register_handler(dll, "LoadImageW", load_bitmap_w);
     d.register_handler(dll, "GetObjectW", get_object_w);
     d.register_handler(dll, "LoadStringW", load_string_w);
 
@@ -320,6 +323,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "UpdateWindow", update_window);
     d.register_constant(dll, "MoveWindow", 1, one_returning);
     d.register_constant(dll, "SetForegroundWindow", 1, one_returning);
+    d.register_constant(dll, "BringWindowToTop", 1, one_returning);
+    d.register_constant(dll, "SetActiveWindow", FAKE_HWND, one_returning);
     d.register_handler(dll, "GetKeyState", get_key_state);
     d.register_handler(dll, "GetAsyncKeyState", get_async_key_state);
     d.register_handler(dll, "GetFocus", get_focus);
@@ -586,6 +591,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "CreateThread", create_thread);
     d.register_handler(dll, "WaitForMultipleObjects", wait_for_multiple_objects);
     d.register_constant(dll, "SetThreadPriority", 1, one_returning);
+    d.register_constant(dll, "GetThreadPriority", 0, zero_returning);
     d.register_constant(dll, "TerminateThread", 1, one_returning);
 
     // ---- Thread-local storage ----
@@ -930,6 +936,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "??_M@YAXPAXIHP6AX0@Z@Z", vector_dtor_iterator);
     d.register_handler(dll, "__security_gen_cookie", security_gen_cookie);
     d.register_handler(dll, "__report_gsfailure", report_gsfailure);
+    d.register_constant(dll, "CacheSync", 1, one_returning);
+    d.register_constant(dll, "ord:1825", 0, zero_returning);
+    d.register_constant(dll, "?set_new_handler@@YAP6AXXZP6AXXZ@Z", 0, zero_returning);
 
     // ---- Clipboard (no-op) ----
     d.register_handler(dll, "OpenClipboard", open_clipboard);
@@ -1664,6 +1673,10 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     let path_p = ctx.arg_u32(0)?;
     let path = read_wstr(ctx, path_p, 260).unwrap_or_default();
     let name = String::from_utf16_lossy(&path).to_ascii_lowercase();
+    if name.ends_with("coredll.dll") || name == "coredll" {
+        log::debug!("LoadLibraryW({name:?}) -> 0x{FAKE_MODULE_HANDLE:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(FAKE_MODULE_HANDLE));
+    }
     if name.ends_with("gx.dll") || name == "gx" {
         let handle = if ctx.kernel.dynamic_exports.contains_key(&0x1000_0001) {
             0x1000_0001
@@ -2100,6 +2113,26 @@ fn memcpy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     ctx.cpu.read_mem_into(src, &mut scratch[..len])?;
     ctx.cpu.write_mem(dst, &scratch[..len])?;
     Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
+fn memchr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let ptr = ctx.arg_u32(0)?;
+    let value = ctx.arg_u32(1)? as u8;
+    let len = ctx.arg_u32(2)? as usize;
+    if len == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let scratch = &mut ctx.kernel.mem_op_scratch;
+    if scratch.len() < len {
+        scratch.resize(len, 0);
+    }
+    ctx.cpu.read_mem_into(ptr, &mut scratch[..len])?;
+    let result = scratch[..len]
+        .iter()
+        .position(|byte| *byte == value)
+        .map(|offset| ptr.wrapping_add(offset as u32))
+        .unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(result))
 }
 
 fn memcmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -8354,6 +8387,35 @@ fn virtual_query(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(buf.len() as u32))
 }
 
+fn get_proc_address_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let module = ctx.arg_u32(0)?;
+    let raw_name = ctx.arg_u32(1)?;
+    let module = if module == 0 {
+        FAKE_MODULE_HANDLE
+    } else {
+        module
+    };
+    let name = if raw_name < 0x10000 {
+        format!("#{}", raw_name & 0xffff)
+    } else {
+        read_cstr_string(ctx, raw_name, 256)?
+    };
+    let address = ctx
+        .kernel
+        .dynamic_exports
+        .get(&module)
+        .and_then(|exports| exports.get(&name).copied())
+        .or_else(|| {
+            ctx.kernel
+                .dynamic_exports
+                .get(&module)
+                .and_then(|exports| exports.get(&name.to_ascii_lowercase()).copied())
+        })
+        .unwrap_or(0);
+    log::debug!("GetProcAddressA(0x{module:08x}, {name:?}) -> 0x{address:08x}");
+    Ok(DispatchOutcome::ReturnedR0(address))
+}
+
 /// `FARPROC GetProcAddressW(HMODULE hModule, LPCWSTR lpProcName)`
 /// — we don't have any DLLs the game can dynamically load against,
 /// so always report failure (NULL). The game then has to fall back
@@ -8361,7 +8423,16 @@ fn virtual_query(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 fn get_proc_address_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let module = ctx.arg_u32(0)?;
     let name_p = ctx.arg_u32(1)?;
-    let name = String::from_utf16_lossy(&read_wstr(ctx, name_p, 256).unwrap_or_default());
+    let module = if module == 0 {
+        FAKE_MODULE_HANDLE
+    } else {
+        module
+    };
+    let name = if name_p < 0x10000 {
+        format!("#{}", name_p & 0xffff)
+    } else {
+        String::from_utf16_lossy(&read_wstr(ctx, name_p, 256).unwrap_or_default())
+    };
     let address = ctx
         .kernel
         .dynamic_exports
