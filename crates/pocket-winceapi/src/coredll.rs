@@ -9037,7 +9037,7 @@ fn wave_out_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let instance = ctx.arg_u32(4)?;
     let flags = ctx.arg_u32(5)?;
 
-    if pwfx != 0 {
+    let requested_format = if pwfx != 0 {
         // WAVEFORMATEX: 18 bytes — wFormatTag (2), nChannels (2),
         // nSamplesPerSec (4), nAvgBytesPerSec (4), nBlockAlign (2),
         // wBitsPerSample (2), cbSize (2).
@@ -9052,11 +9052,13 @@ fn wave_out_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
             bits_per_sample: bits.max(8),
         };
         ctx.kernel.wave_out_format = fmt;
-        ctx.kernel.audio.set_guest_format(fmt);
         log::debug!(
             "waveOutOpen tag={format_tag} {sample_rate} Hz / {channels} ch / {bits}-bit, flags=0x{flags:08x}"
         );
-    }
+        Some(fmt)
+    } else {
+        None
+    };
 
     // WAVE_FORMAT_QUERY = 0x1: don't actually open, just verify.
     if flags & 0x1 == 0 {
@@ -9095,6 +9097,9 @@ fn wave_out_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
             ctx.kernel.wave_out.owner_thread = ctx.kernel.current_thread;
         }
         ctx.kernel.audio.start();
+        if let Some(fmt) = requested_format {
+            ctx.kernel.audio.set_guest_format(fmt);
+        }
     }
     if phwo != 0 {
         ctx.cpu.write_mem(phwo, &FAKE_HWAVEOUT.to_le_bytes())?;
