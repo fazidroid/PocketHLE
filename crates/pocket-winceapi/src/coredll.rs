@@ -45,7 +45,21 @@ use crate::{CallCtx, WinCeDispatcher};
 /// inside the game fail.
 const FAKE_MODULE_HANDLE: u32 = PROCESS_INSTANCE_HANDLE;
 const FAKE_HWND: u32 = 0xDEAD_0001;
+/// Handle for the modeless dialog a title creates over its main window
+/// through `CreateDialogIndirectParamW`. Deliberately distinct from
+/// [`FAKE_HWND`]: Solitaire keeps the frame window and the board dialog
+/// in two different globals and drives them independently — a shared
+/// handle makes `GetWindowRect` on one return the other's geometry.
+const FAKE_DIALOG_HWND: u32 = 0xDEAD_0002;
 const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
+
+/// Every window handle we ever hand the guest. Handlers that answer
+/// questions *about* a window (`IsWindow`, `IsWindowVisible`, ...) have
+/// to accept all of them — a check against [`FAKE_HWND`] alone makes the
+/// guest treat its own dialog as destroyed and skip the work it drives.
+fn is_live_hwnd(hwnd: u32) -> bool {
+    hwnd == FAKE_HWND || hwnd == FAKE_DIALOG_HWND || hwnd == FAKE_DESKTOP_HWND
+}
 const PAINTSTRUCT_BYTES: u32 = 32;
 
 pub fn register(d: &mut WinCeDispatcher) {
@@ -432,6 +446,12 @@ pub fn register(d: &mut WinCeDispatcher) {
         "CreateDialogIndirectParamW",
         create_dialog_indirect_param_w,
     );
+    // FALSE means "not a dialog message" so the caller falls through to
+    // TranslateMessage / DispatchMessageW, which is where our synthetic
+    // WM_PAINT and real taps get delivered. Claiming a message here would
+    // swallow every one of them.
+    d.register_constant(dll, "IsDialogMessageW", 0, zero_returning);
+    d.register_handler(dll, "SetDlgItemTextW", set_dlg_item_text_w);
     d.register_handler(dll, "IsWindow", is_window);
     d.register_handler(dll, "CreateMutexW", create_mutex_w);
     d.register_handler(dll, "TlsCall", tls_call);
@@ -908,6 +928,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetRect", set_rect);
     d.register_handler(dll, "SetRectEmpty", set_rect_empty);
     d.register_handler(dll, "CopyRect", copy_rect);
+    d.register_handler(dll, "IntersectRect", intersect_rect);
+    d.register_handler(dll, "UnionRect", union_rect);
     d.register_handler(dll, "InflateRect", inflate_rect);
     d.register_handler(dll, "OffsetRect", offset_rect);
     d.register_handler(dll, "PtInRect", pt_in_rect);
@@ -4945,6 +4967,7 @@ const WM_SIZE: u32 = 0x0005;
 const WM_ACTIVATE: u32 = 0x0006;
 const WM_SETFOCUS: u32 = 0x0007;
 const WM_SHOWWINDOW: u32 = 0x0018;
+const WM_INITDIALOG: u32 = 0x0110;
 const MK_LBUTTON: u32 = 0x0001;
 
 /// Convert a host-driven [`pocket_kernel::InputEvent`] into the
@@ -6526,11 +6549,18 @@ fn get_object_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 // ---------- additional window / message handlers ----------
 
+/// `GetDlgItem(hDlg, nIDDlgItem)`
+///
+/// We have no real control hierarchy, so every child resolves to its
+/// parent. That keeps `SetFocus` / `IsWindowVisible` / `SendMessageW` on
+/// the result routed at the proc that owns the dialog, which is where
+/// the guest's own handling lives anyway. Returning `NULL` instead makes
+/// callers assume the dialog failed to build and bail out.
 fn get_dlg_item(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
     let _id = ctx.arg_u32(1)?;
-    Ok(DispatchOutcome::ReturnedR0(if hwnd == FAKE_HWND {
-        FAKE_HWND
+    Ok(DispatchOutcome::ReturnedR0(if is_live_hwnd(hwnd) {
+        hwnd
     } else {
         0
     }))
@@ -6551,7 +6581,7 @@ fn enum_windows(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn is_window_visible(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0((hwnd == FAKE_HWND) as u32))
+    Ok(DispatchOutcome::ReturnedR0(is_live_hwnd(hwnd) as u32))
 }
 
 /// `IsWindowEnabled(hwnd)`
@@ -6561,7 +6591,7 @@ fn is_window_visible(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 /// User" name entry) drop the input they just received.
 fn is_window_enabled(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0((hwnd == FAKE_HWND) as u32))
+    Ok(DispatchOutcome::ReturnedR0(is_live_hwnd(hwnd) as u32))
 }
 
 /// `GetWindowThreadProcessId(hwnd, lpdwProcessId)`
@@ -6652,6 +6682,25 @@ fn get_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
         0
     };
     Ok(DispatchOutcome::ReturnedR0(v))
+}
+
+/// `BOOL SetDlgItemTextW(HWND hDlg, int nIDDlgItem, LPCWSTR lpString)` —
+/// Solitaire uses it to refresh the score / time labels on its status
+/// dialog. We draw no real controls, so log the text and report success.
+fn set_dlg_item_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let id = ctx.arg_u32(1)?;
+    let p = ctx.arg_u32(2)?;
+    if p != 0 {
+        let chars = read_wstr(ctx, p, 256).unwrap_or_default();
+        let s: String = chars
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect();
+        log::debug!("SetDlgItemTextW({id}, {s:?})");
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 /// `BOOL SetWindowTextW(HWND hWnd, LPCWSTR lpString)` — Pocket PC
@@ -8536,6 +8585,61 @@ fn copy_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `BOOL IntersectRect(LPRECT lprcDst, const RECT *lprcSrc1, const RECT *lprcSrc2)`
+///
+/// Solitaire calls this ~900 times per paint pass to clip each card
+/// rectangle against the update region. Leaving it unimplemented
+/// returns `r0 = 0` ("rectangles do not intersect") *and* never fills
+/// `lprcDst`, so the game concludes there is nothing to redraw and
+/// skips the blit for every card.
+fn intersect_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src1 = ctx.arg_u32(1)?;
+    let src2 = ctx.arg_u32(2)?;
+    if dst == 0 || src1 == 0 || src2 == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let (l1, t1, r1, b1) = rect_load(ctx, src1)?;
+    let (l2, t2, r2, b2) = rect_load(ctx, src2)?;
+    let l = l1.max(l2);
+    let t = t1.max(t2);
+    let r = r1.min(r2);
+    let b = b1.min(b2);
+    // Win32 zeroes the destination when the intersection is empty.
+    if l >= r || t >= b {
+        rect_store(ctx, dst, 0, 0, 0, 0)?;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    rect_store(ctx, dst, l, t, r, b)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL UnionRect(LPRECT lprcDst, const RECT *lprcSrc1, const RECT *lprcSrc2)`
+///
+/// The bounding box of both sources, ignoring empty ones.
+fn union_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let src1 = ctx.arg_u32(1)?;
+    let src2 = ctx.arg_u32(2)?;
+    if dst == 0 || src1 == 0 || src2 == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let a = rect_load(ctx, src1)?;
+    let b = rect_load(ctx, src2)?;
+    let empty = |(l, t, r, b): (i32, i32, i32, i32)| l >= r || t >= b;
+    let out = match (empty(a), empty(b)) {
+        (true, true) => {
+            rect_store(ctx, dst, 0, 0, 0, 0)?;
+            return Ok(DispatchOutcome::ReturnedR0(0));
+        }
+        (true, false) => b,
+        (false, true) => a,
+        (false, false) => (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)),
+    };
+    rect_store(ctx, dst, out.0, out.1, out.2, out.3)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn inflate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let p = ctx.arg_u32(0)?;
     let dx = ctx.arg_u32(1)? as i32;
@@ -8886,26 +8990,73 @@ fn get_class_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `CreateDialogIndirectParamW(hInstance, lpTemplate, hWndParent, lpDialogFunc, dwInitParam)`
+///
+/// Creates the dialog *and* delivers `WM_INITDIALOG` to `lpDialogFunc`
+/// before returning, the way the real API does. The detour must not be
+/// mistaken for the return value: a caller like Solitaire stores our
+/// result in a global and then gates its whole message pump on it
+/// (`if (g_hDlg) IsDialogMessageW(...)`), so handing back the
+/// `DialogProc`'s `BOOL` — usually `FALSE` — leaves the pump fetching
+/// and discarding every message, taps included, forever.
+///
+/// So use the same round-trip as [`create_window_ex_w`]: stash the
+/// interrupted call, point `LR` at our own thunk so this handler
+/// re-fires when the callback returns, then hand back the HWND.
 fn create_dialog_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Must come first: on re-entry R0..R3 hold the callback's result,
+    // not our arguments.
+    if let Some(frame) = ctx.kernel.dialog_frame {
+        // A nested `CreateDialogIndirectParamW` from inside the
+        // `DialogProc` runs on a deeper stack; only SP back at its
+        // saved value means our callback has actually returned.
+        if ctx.cpu.read_reg(ArmReg::Sp)? >= frame.sp {
+            ctx.kernel.dialog_frame = None;
+            ctx.cpu.write_reg(ArmReg::Sp, frame.sp)?;
+            ctx.cpu.write_reg(ArmReg::R1, frame.args[1])?;
+            ctx.cpu.write_reg(ArmReg::R2, frame.args[2])?;
+            ctx.cpu.write_reg(ArmReg::R3, frame.args[3])?;
+            ctx.cpu.write_reg(ArmReg::Lr, frame.lr)?;
+            log::debug!("CreateDialogIndirectParamW -> hwnd=0x{FAKE_DIALOG_HWND:08x}");
+            return Ok(DispatchOutcome::ReturnedR0(FAKE_DIALOG_HWND));
+        }
+    }
     let dialog_proc = ctx.arg_u32(3)?;
     let init_param = ctx.arg_u32(4).unwrap_or(0);
     if dialog_proc == 0 {
-        return Ok(DispatchOutcome::ReturnedR0(FAKE_HWND));
+        return Ok(DispatchOutcome::ReturnedR0(FAKE_DIALOG_HWND));
     }
-    use pocket_cpu::regs::ArmReg;
-    ctx.cpu.write_reg(ArmReg::R0, FAKE_HWND)?;
-    ctx.cpu.write_reg(ArmReg::R1, 0x0110)?;
+    // Route later SendMessageW / DispatchMessageW for this handle to the
+    // DialogProc rather than the frame window's WndProc.
+    ctx.kernel
+        .window_procs
+        .insert(FAKE_DIALOG_HWND, dialog_proc);
+    let args = [
+        ctx.cpu.read_reg(ArmReg::R0)?,
+        ctx.cpu.read_reg(ArmReg::R1)?,
+        ctx.cpu.read_reg(ArmReg::R2)?,
+        ctx.cpu.read_reg(ArmReg::R3)?,
+    ];
+    let frame = GuestCallFrame {
+        args,
+        lr: ctx.cpu.read_reg(ArmReg::Lr)?,
+        sp: ctx.cpu.read_reg(ArmReg::Sp)?,
+    };
+    // DialogProc's four arguments all travel in registers, so the guest
+    // stack needs no adjustment here.
+    ctx.cpu.write_reg(ArmReg::R0, FAKE_DIALOG_HWND)?;
+    ctx.cpu.write_reg(ArmReg::R1, WM_INITDIALOG)?;
     ctx.cpu.write_reg(ArmReg::R2, 0)?;
     ctx.cpu.write_reg(ArmReg::R3, init_param)?;
+    ctx.cpu.write_reg(ArmReg::Lr, ctx.thunk.thunk_va)?;
+    ctx.kernel.dialog_frame = Some(frame);
     log::debug!("CreateDialogIndirectParamW -> WM_INITDIALOG trampoline at 0x{dialog_proc:08x}");
     Ok(DispatchOutcome::JumpTo(dialog_proc))
 }
 
 fn is_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0(
-        (hwnd == FAKE_HWND || hwnd == FAKE_DESKTOP_HWND) as u32,
-    ))
+    Ok(DispatchOutcome::ReturnedR0(is_live_hwnd(hwnd) as u32))
 }
 
 fn create_mutex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {

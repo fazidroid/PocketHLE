@@ -590,6 +590,12 @@ pub struct KernelState {
     /// Which leg of the synchronous window-creation message sequence is
     /// in flight inside the guest `WndProc`.
     pub create_stage: CreateStage,
+    /// Registers of the `CreateDialogIndirectParamW` call we interrupted
+    /// to deliver `WM_INITDIALOG` to the guest's `DialogProc`. Same
+    /// round-trip idiom as [`create_frame`](Self::create_frame): the
+    /// dialog HWND is only returned to the caller once the callback
+    /// unwinds, otherwise the caller stores the callback's `BOOL`.
+    pub dialog_frame: Option<GuestCallFrame>,
     /// Input events queued by the host frontend (mouse / D-pad /
     /// keyboard). Drained by `GetMessageW` / `PeekMessageW` before
     /// any synthetic timer / paint message is fabricated, so real
@@ -1464,6 +1470,7 @@ impl Process {
                 synthetic_size_sent: false,
                 create_frame: None,
                 create_stage: CreateStage::Idle,
+                dialog_frame: None,
                 pending_input: VecDeque::new(),
                 gapi_keys_queried: false,
                 pending_message: None,
