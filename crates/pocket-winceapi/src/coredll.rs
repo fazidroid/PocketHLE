@@ -1788,7 +1788,8 @@ fn load_resource_module(ctx: &mut CallCtx<'_>, request: &str) -> Result<Option<u
         if aligned == 0 {
             continue;
         }
-        ctx.cpu.map_region(base + s.virtual_address, aligned, prot)?;
+        ctx.cpu
+            .map_region(base + s.virtual_address, aligned, prot)?;
         ctx.cpu.write_mem(base + s.virtual_address, &s.data)?;
     }
     ctx.kernel.next_module_base = base + MODULE_REGION_STRIDE;
@@ -5479,15 +5480,15 @@ fn get_stock_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     // Map stock indices to our pre-registered handles.
     let idx = ctx.arg_u32(0)?;
     let h = match idx {
-        0 => STOCK_WHITE_BRUSH,   // WHITE_BRUSH
-        1 => STOCK_LTGRAY_BRUSH,  // LTGRAY_BRUSH
-        2 => STOCK_GRAY_BRUSH,    // GRAY_BRUSH
-        3 => STOCK_DKGRAY_BRUSH,  // DKGRAY_BRUSH
-        4 => STOCK_BLACK_BRUSH,   // BLACK_BRUSH
-        5 => STOCK_NULL_BRUSH,    // NULL_BRUSH / HOLLOW_BRUSH
-        6 => STOCK_WHITE_PEN,     // WHITE_PEN
-        7 => STOCK_BLACK_PEN,     // BLACK_PEN
-        8 => STOCK_NULL_PEN,      // NULL_PEN
+        0 => STOCK_WHITE_BRUSH,       // WHITE_BRUSH
+        1 => STOCK_LTGRAY_BRUSH,      // LTGRAY_BRUSH
+        2 => STOCK_GRAY_BRUSH,        // GRAY_BRUSH
+        3 => STOCK_DKGRAY_BRUSH,      // DKGRAY_BRUSH
+        4 => STOCK_BLACK_BRUSH,       // BLACK_BRUSH
+        5 => STOCK_NULL_BRUSH,        // NULL_BRUSH / HOLLOW_BRUSH
+        6 => STOCK_WHITE_PEN,         // WHITE_PEN
+        7 => STOCK_BLACK_PEN,         // BLACK_PEN
+        8 => STOCK_NULL_PEN,          // NULL_PEN
         13 | 17 => STOCK_SYSTEM_FONT, // SYSTEM_FONT / DEFAULT_GUI_FONT
         _ => STOCK_WHITE_BRUSH,
     };

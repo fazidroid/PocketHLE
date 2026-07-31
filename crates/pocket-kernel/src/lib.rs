@@ -731,8 +731,11 @@ impl KernelState {
     /// Used by the handlers that only get a resource *address* (or that
     /// were handed a bogus `hModule`) and have to search everywhere.
     pub fn resource_scopes(&self) -> impl Iterator<Item = (&[ResourceEntry], u32)> {
-        std::iter::once((self.resources.as_slice(), self.image_base))
-            .chain(self.modules.iter().map(|m| (m.resources.as_slice(), m.base)))
+        std::iter::once((self.resources.as_slice(), self.image_base)).chain(
+            self.modules
+                .iter()
+                .map(|m| (m.resources.as_slice(), m.base)),
+        )
     }
 
     /// Find the host file backing a guest `LoadLibraryW` request.
@@ -774,7 +777,7 @@ impl KernelState {
 /// a `.dll` extension (`"\\Windows\\PegCards"` -> `"pegcards.dll"`).
 pub fn module_file_name(request: &str) -> String {
     let base = request
-        .rsplit(|c| c == '\\' || c == '/')
+        .rsplit(['\\', '/'])
         .next()
         .unwrap_or(request)
         .to_ascii_lowercase();
