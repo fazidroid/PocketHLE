@@ -10432,6 +10432,7 @@ mod tests {
             synthetic_size_sent: false,
             create_frame: None,
             create_stage: pocket_kernel::CreateStage::Idle,
+            dialog_frame: None,
             pending_input: std::collections::VecDeque::new(),
             gapi_keys_queried: false,
             pending_message: None,
