@@ -5390,8 +5390,89 @@ fn msg_wait_for_multiple_objects(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcom
 }
 
 fn wait_for_multiple_objects(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x102;
+    const WAIT_FAILED: u32 = 0xffff_ffff;
+    const INFINITE: u32 = 0xffff_ffff;
+
     let count = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0(count))
+    let handles_ptr = ctx.arg_u32(1)?;
+    let wait_all = ctx.arg_u32(2)? != 0;
+    let timeout = ctx.arg_u32(3)?;
+    if count == 0 || count > 64 || handles_ptr == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(WAIT_FAILED));
+    }
+
+    let raw = ctx.cpu.read_mem(handles_ptr, count.saturating_mul(4))?;
+    let handles: Vec<u32> = raw
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .collect();
+    if handles.len() != count as usize {
+        return Ok(DispatchOutcome::ReturnedR0(WAIT_FAILED));
+    }
+
+    let is_signalled = |kernel: &KernelState, handle: u32| {
+        kernel
+            .events
+            .get(&handle)
+            .map(|event| event.signalled)
+            .or_else(|| {
+                kernel
+                    .msg_queues
+                    .get(&handle)
+                    .map(|queue| !queue.messages.is_empty())
+            })
+            .or_else(|| {
+                kernel
+                    .threads
+                    .iter()
+                    .find(|thread| thread.handle == handle)
+                    .map(|thread| thread.finished)
+            })
+            .unwrap_or(false)
+    };
+
+    let ready_index = handles
+        .iter()
+        .position(|&handle| is_signalled(ctx.kernel, handle));
+    let ready = if wait_all {
+        handles
+            .iter()
+            .all(|&handle| is_signalled(ctx.kernel, handle))
+    } else {
+        ready_index.is_some()
+    };
+    if ready {
+        if wait_all {
+            for handle in &handles {
+                if let Some(event) = ctx.kernel.events.get_mut(handle) {
+                    if !event.manual_reset {
+                        event.signalled = false;
+                    }
+                }
+            }
+            return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
+        }
+        let index = ready_index.expect("ready implies one signalled handle");
+        if let Some(event) = ctx.kernel.events.get_mut(&handles[index]) {
+            if !event.manual_reset {
+                event.signalled = false;
+            }
+        }
+        return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0 + index as u32));
+    }
+
+    if let Some(outcome) = park_worker(ctx, WAIT_TIMEOUT)? {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = resume_worker(ctx, WAIT_TIMEOUT)? {
+        return Ok(outcome);
+    }
+    if timeout != INFINITE {
+        return Ok(DispatchOutcome::ReturnedR0(WAIT_TIMEOUT));
+    }
+    Ok(DispatchOutcome::ReturnedR0(WAIT_TIMEOUT))
 }
 
 fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
