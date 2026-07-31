@@ -1,11 +1,8 @@
 package com.pockethle.app
 
 import android.annotation.SuppressLint
-import android.graphics.Bitmap
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Rect
-import android.graphics.Typeface
+import android.opengl.GLES20
+import android.opengl.GLSurfaceView
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -14,8 +11,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.MotionEvent
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.view.View
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -38,11 +33,13 @@ import org.json.JSONObject
  * never streamed intermediate frames, which looked like an infinite
  * loading spinner once the real Unicorn backend was wired up.
  */
-class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
+class GameActivity : AppCompatActivity() {
 
-    private lateinit var surface: SurfaceView
+    private lateinit var surface: GLSurfaceView
     private lateinit var progress: ProgressBar
     private lateinit var status: TextView
+    private lateinit var fpsOverlay: TextView
+    private lateinit var glRenderer: FrameRenderer
 
     /** Cached handle from `nativeStartGame` (`0` once we've finished). */
     @Volatile private var session: Long = 0
@@ -51,8 +48,6 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
      * repaint after `surfaceChanged` resizes the SurfaceView even if
      * the worker has not produced a new frame yet. */
     private var lastFrame: FrameSnapshot? = null
-    private var frameBitmap: Bitmap? = null
-    private var framePixels: IntArray = IntArray(0)
     private var frameBuffer: ByteArray = ByteArray(0)
 
     /**
@@ -84,7 +79,10 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
             if (raw != null) {
                 decodeFrame(raw)?.let { frame ->
                     lastFrame = frame
-                    paintFrame(frame)
+                    glRenderer.submit(frame)
+                    surface.requestRender()
+                    fpsCounter.recordFrame()
+                    updateFpsOverlay()
                 }
             }
             if (NativeBridge.nativeIsRunning(session) == 0) {
@@ -108,8 +106,12 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         title = name
 
         surface = findViewById(R.id.surface)
-        surface.holder.addCallback(this)
+        glRenderer = FrameRenderer()
+        surface.setEGLContextClientVersion(2)
+        surface.setRenderer(glRenderer)
+        surface.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
         progress = findViewById(R.id.progress)
+        fpsOverlay = findViewById(R.id.fps_overlay)
         status = findViewById(R.id.status)
 
         showFps = readShowFpsPreference()
@@ -157,6 +159,7 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
     override fun onDestroy() {
         finishSession()
         mainHandler.removeCallbacksAndMessages(null)
+        surface.onPause()
         super.onDestroy()
     }
 
@@ -286,82 +289,20 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     private fun paintFrame(frame: FrameSnapshot) {
-        val holder = surface.holder
-        val canvas = holder.lockCanvas() ?: return
-        try {
-            // Hide the spinner the moment we have something to draw.
-            progress.visibility = View.GONE
-            canvas.drawColor(Color.BLACK)
-            if (frameBitmap?.width != frame.width || frameBitmap?.height != frame.height) {
-                frameBitmap?.recycle()
-                frameBitmap = Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.ARGB_8888)
-                framePixels = IntArray(frame.width * frame.height)
-            }
-            val bitmap = frameBitmap ?: return
-            var i = 0
-            var p = 0
-            while (i + 3 < frame.rgba.size) {
-                val r = frame.rgba[i].toInt() and 0xff
-                val g = frame.rgba[i + 1].toInt() and 0xff
-                val b = frame.rgba[i + 2].toInt() and 0xff
-                val a = frame.rgba[i + 3].toInt() and 0xff
-                framePixels[p++] = (a shl 24) or (r shl 16) or (g shl 8) or b
-                i += 4
-            }
-            bitmap.setPixels(framePixels, 0, frame.width, 0, 0, frame.width, frame.height)
-            val w = canvas.width
-            val h = canvas.height
-            val scale = minOf(
-                w.toFloat() / frame.width,
-                h.toFloat() / frame.height,
-            )
-            val dstW = (frame.width * scale).toInt()
-            val dstH = (frame.height * scale).toInt()
-            val left = (w - dstW) / 2
-            val top = (h - dstH) / 2
-            val src = Rect(0, 0, frame.width, frame.height)
-            val dst = Rect(left, top, left + dstW, top + dstH)
-            canvas.drawBitmap(bitmap, src, dst, Paint(Paint.FILTER_BITMAP_FLAG))
-            // j2me-loader-style FPS counter: count this frame in the
-            // 1-second sliding window and (if enabled) draw the
-            // latest published count as green text on a translucent
-            // black background pinned to the upper-left corner of
-            // the framebuffer rect.
-            fpsCounter.recordFrame()
-            if (showFps) {
-                drawFpsOverlay(canvas, left, top)
-            }
-        } finally {
-            holder.unlockCanvasAndPost(canvas)
-        }
+        progress.visibility = View.GONE
+        glRenderer.submit(frame)
+        surface.requestRender()
+        fpsCounter.recordFrame()
+        updateFpsOverlay()
     }
 
-    private fun drawFpsOverlay(canvas: android.graphics.Canvas, left: Int, top: Int) {
-        val text = "FPS ${fpsCounter.lastSecondCount}"
-        val bgPaint = Paint().apply {
-            color = 0x90000000.toInt()
-            style = Paint.Style.FILL
+    private fun updateFpsOverlay() {
+        if (showFps) {
+            fpsOverlay.text = "FPS ${fpsCounter.lastSecondCount}"
+            fpsOverlay.visibility = View.VISIBLE
+        } else {
+            fpsOverlay.visibility = View.GONE
         }
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFF00FF00.toInt()
-            textSize = FPS_TEXT_SIZE_PX
-            typeface = Typeface.MONOSPACE
-        }
-        val padding = 6f
-        val textWidth = textPaint.measureText(text)
-        val metrics = textPaint.fontMetrics
-        val textHeight = metrics.descent - metrics.ascent
-        val rectLeft = left + padding
-        val rectTop = top + padding
-        val rectRight = rectLeft + textWidth + padding * 2
-        val rectBottom = rectTop + textHeight + padding * 2
-        canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, bgPaint)
-        canvas.drawText(
-            text,
-            rectLeft + padding,
-            rectTop + padding - metrics.ascent,
-            textPaint,
-        )
     }
 
     /**
@@ -407,20 +348,6 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
             }
         }
     }
-
-    // -------------------------------------------------------------------
-    // SurfaceHolder.Callback
-    // -------------------------------------------------------------------
-
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        lastFrame?.let { paintFrame(it) }
-    }
-
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        lastFrame?.let { paintFrame(it) }
-    }
-
-    override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
 
     // -------------------------------------------------------------------
     // Input plumbing
@@ -553,6 +480,102 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         val rgba: ByteArray,
     )
 
+    private class FrameRenderer : GLSurfaceView.Renderer {
+        @Volatile private var pending: FrameSnapshot? = null
+        private var texture = 0
+        private var program = 0
+        private var vertexBuffer: java.nio.FloatBuffer? = null
+        private var positionHandle = 0
+        private var texCoordHandle = 0
+        private var textureHandle = 0
+        private var samplerHandle = 0
+        private var textureWidth = 0
+        private var textureHeight = 0
+
+        fun submit(frame: FrameSnapshot) {
+            pending = frame
+        }
+
+        override fun onSurfaceCreated(gl: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
+            GLES20.glClearColor(0f, 0f, 0f, 1f)
+            program = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER)
+            val textures = IntArray(1)
+            GLES20.glGenTextures(1, textures, 0)
+            texture = textures[0]
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            vertexBuffer = java.nio.ByteBuffer.allocateDirect(VERTICES.size * 4)
+                .order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer().apply { put(VERTICES); position(0) }
+            positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
+            texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
+            textureHandle = GLES20.glGetUniformLocation(program, "uTexture")
+            samplerHandle = textureHandle
+        }
+
+        override fun onSurfaceChanged(gl: javax.microedition.khronos.opengles.GL10?, width: Int, height: Int) {
+            GLES20.glViewport(0, 0, width, height)
+        }
+
+        override fun onDrawFrame(gl: javax.microedition.khronos.opengles.GL10?) {
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            val frame = pending ?: return
+            GLES20.glUseProgram(program)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture)
+            val pixels = java.nio.ByteBuffer.wrap(frame.rgba)
+            if (frame.width != textureWidth || frame.height != textureHeight) {
+                GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, frame.width, frame.height, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixels)
+                textureWidth = frame.width
+                textureHeight = frame.height
+            } else {
+                GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, frame.width, frame.height, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixels)
+            }
+            vertexBuffer?.let { buffer ->
+                buffer.position(0)
+                GLES20.glEnableVertexAttribArray(positionHandle)
+                GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 16, buffer)
+                buffer.position(2)
+                GLES20.glEnableVertexAttribArray(texCoordHandle)
+                GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 16, buffer)
+                GLES20.glUniform1i(samplerHandle, 0)
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            }
+        }
+
+        private fun buildProgram(vertex: String, fragment: String): Int {
+            val vs = compileShader(GLES20.GL_VERTEX_SHADER, vertex)
+            val fs = compileShader(GLES20.GL_FRAGMENT_SHADER, fragment)
+            return GLES20.glCreateProgram().also { p ->
+                GLES20.glAttachShader(p, vs)
+                GLES20.glAttachShader(p, fs)
+                GLES20.glLinkProgram(p)
+                GLES20.glDeleteShader(vs)
+                GLES20.glDeleteShader(fs)
+            }
+        }
+
+        private fun compileShader(type: Int, source: String): Int {
+            return GLES20.glCreateShader(type).also { shader ->
+                GLES20.glShaderSource(shader, source)
+                GLES20.glCompileShader(shader)
+            }
+        }
+
+        companion object {
+            private val VERTICES = floatArrayOf(
+                -1f, -1f, 0f, 1f,
+                 1f, -1f, 1f, 1f,
+                -1f,  1f, 0f, 0f,
+                 1f,  1f, 1f, 0f,
+            )
+            private const val VERTEX_SHADER = "attribute vec2 aPosition; attribute vec2 aTexCoord; varying vec2 vTexCoord; void main() { gl_Position = vec4(aPosition, 0.0, 1.0); vTexCoord = aTexCoord; }"
+            private const val FRAGMENT_SHADER = "precision mediump float; varying vec2 vTexCoord; uniform sampler2D uTexture; void main() { gl_FragColor = texture2D(uTexture, vTexCoord); }"
+        }
+    }
+
     companion object {
         const val EXTRA_GAME_ID = "com.pockethle.app.EXTRA_GAME_ID"
         const val EXTRA_GAME_NAME = "com.pockethle.app.EXTRA_GAME_NAME"
@@ -572,13 +595,5 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         /** Polling cadence in ms. 33 ≈ 30 Hz. */
         private const val POLL_INTERVAL_MS = 16L
 
-        /**
-         * Font size of the FPS overlay drawn in [drawFpsOverlay].
-         * Picked to roughly match the height of j2me-loader's
-         * `FpsCounter` text on a phone screen (~14sp at xxhdpi),
-         * but expressed in pixels because the overlay is painted
-         * directly on the SurfaceView.
-         */
-        private const val FPS_TEXT_SIZE_PX = 28f
     }
 }
