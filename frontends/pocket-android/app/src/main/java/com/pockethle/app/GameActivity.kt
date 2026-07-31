@@ -82,10 +82,7 @@ class GameActivity : AppCompatActivity() {
             if (raw != null) {
                 decodeFrame(raw)?.let { frame ->
                     lastFrame = frame
-                    glRenderer.submit(frame)
-                    surface.requestRender()
-                    fpsCounter.recordFrame()
-                    updateFpsOverlay()
+                    paintFrame(frame)
                 }
             }
             if (NativeBridge.nativeIsRunning(session) == 0) {
