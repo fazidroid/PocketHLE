@@ -487,6 +487,7 @@ impl PocketLauncher {
                             ScreenPref::Landscape,
                             ScreenPref::SmallPortrait,
                             ScreenPref::Wvga,
+                            ScreenPref::Hpc,
                         ] {
                             ui.selectable_value(&mut draft.screen, pref, pref.label());
                         }
@@ -497,6 +498,27 @@ impl PocketLauncher {
                 ui.checkbox(&mut draft.halt_on_unimplemented, "");
                 ui.end_row();
             });
+
+        // Satellite libraries are not a setting — they are a fact about
+        // what got imported. Showing them here is how a user confirms
+        // that picking `solitare.exe` also brought `pegcards.dll` in,
+        // without having to go digging in the library directory.
+        let companions: Vec<String> = self
+            .library
+            .get(&id)
+            .map(|g| {
+                g.companions
+                    .iter()
+                    .filter_map(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !companions.is_empty() {
+            ui.add_space(8.0);
+            ui.label(format!("Support libraries: {}", companions.join(", ")));
+        }
+
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui.button("Save").clicked() {
@@ -751,10 +773,14 @@ impl PocketLauncher {
                 // A single "Pocket PC game" filter that matches every
                 // shape we know how to import keeps the dialog UX
                 // simple — the user picks a file and we pick the
-                // right loader from the extension below.
+                // right loader from the extension below. `.dll` is
+                // included so a user who mistakenly picks a support
+                // library gets a clear error directing them to import
+                // the `.exe` instead, rather than seeing nothing in
+                // the picker at all.
                 .add_filter(
-                    "Pocket PC game (.cab / .zip / .exe)",
-                    &["cab", "CAB", "zip", "ZIP", "exe", "EXE"],
+                    "Pocket PC game (.cab / .zip / .exe / .dll)",
+                    &["cab", "CAB", "zip", "ZIP", "exe", "EXE", "dll", "DLL"],
                 )
                 .add_filter("Cabinet archive", &["cab", "CAB"])
                 .add_filter("Zip archive", &["zip", "ZIP"])
