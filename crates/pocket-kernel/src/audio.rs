@@ -479,9 +479,9 @@ impl AudioEngine {
         {
             if let Ok(mut s) = self.shared.lock() {
                 s.add_voice(samples.to_vec(), format, looped);
-                return samples.len();
+                samples.len()
             } else {
-                return 0;
+                0
             }
         }
         #[cfg(not(feature = "audio-cpal"))]

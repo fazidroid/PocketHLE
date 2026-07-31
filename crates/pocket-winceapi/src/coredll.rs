@@ -6495,7 +6495,9 @@ fn submit_wave_bytes(
             .collect(),
         _ => return Ok(false),
     };
-    ctx.kernel.audio.play_voice(&samples, fmt, flags & 0x0008 != 0);
+    ctx.kernel
+        .audio
+        .play_voice(&samples, fmt, flags & 0x0008 != 0);
     ctx.kernel.audio.start();
     Ok(true)
 }
