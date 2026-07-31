@@ -34,6 +34,8 @@
     <string name="dpad_right_glyph">▶</string>
     <string name="action_button">Action</string>
     <string name="action_button_glyph">●</string>
+    <string name="turbo_button">Turbo boost</string>
+    <string name="turbo_button_label">TURBO</string>
     <string name="key_a_label">A</string>
     <string name="key_b_label">B</string>
     <string name="key_c_label">C</string>
