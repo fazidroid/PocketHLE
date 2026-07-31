@@ -470,6 +470,7 @@ class GameActivity : AppCompatActivity() {
         bindVk(R.id.btn_left, VK_LEFT)
         bindVk(R.id.btn_right, VK_RIGHT)
         bindVk(R.id.btn_action, VK_RETURN)
+        bindVk(R.id.btn_turbo, VK_TURBO)
         bindVk(R.id.btn_a, VK_A)
         bindVk(R.id.btn_b, VK_B)
         bindVk(R.id.btn_c, VK_C)
@@ -666,6 +667,7 @@ class GameActivity : AppCompatActivity() {
         private const val VK_A = 0xD1
         private const val VK_B = 0xD2
         private const val VK_C = 0xD3
+        private const val VK_TURBO = 0x32 // Asphalt 2 SPV: key 2 is turbo.
         private const val VK_TSOFT1 = 0xC1
         private const val VK_TSOFT2 = 0xC2
 
