@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
 # PocketHLE
 
 <p align="center">
-  <img src="./proof/asphalt4-wvga/asphalt4-gameplay-proof.png" width="72%" alt="Asphalt 4 running in PocketHLE" />
+  <img src="./frontends/pocket-desktop/assets/pockethle-logo.png" width="25%" alt="PocketHLE logo" />
 </p>
 
 <p align="center">
