@@ -22,17 +22,21 @@
 //! reaches `WinMain`.
 
 use pocket_cpu::regs::ArmReg;
+use pocket_cpu::Prot;
 use pocket_kernel::framebuffer::colorref_to_rgb565;
 use pocket_kernel::gdi::{
-    Surface, GDI_SCREEN_DC, STOCK_BLACK_BRUSH, STOCK_BLACK_PEN, STOCK_NULL_BRUSH, STOCK_NULL_PEN,
+    Surface, GDI_SCREEN_DC, STOCK_BLACK_BRUSH, STOCK_BLACK_PEN, STOCK_DKGRAY_BRUSH,
+    STOCK_GRAY_BRUSH, STOCK_LTGRAY_BRUSH, STOCK_NULL_BRUSH, STOCK_NULL_PEN, STOCK_SYSTEM_FONT,
     STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
 };
 use pocket_kernel::{
-    DispatchOutcome, GuestThread, InputEvent, KernelError, QsortFrame, VectorIterFrame,
-    WaveCallbackKind, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE,
-    PROCESS_INSTANCE_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
+    module_file_name, CreateStage, DispatchOutcome, GuestCallFrame, GuestThread, InputEvent,
+    KernelError, KernelState, LoadedModule, QsortFrame, VectorIterFrame, WaveCallbackKind,
+    FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE, MODULE_REGION_END,
+    MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
+    USER_KDATA_TLS_ARRAY_VA,
 };
-use pocket_pe::ResourceKey;
+use pocket_pe::{ResourceEntry, ResourceKey};
 
 use crate::{CallCtx, WinCeDispatcher};
 
@@ -1715,8 +1719,134 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x}");
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
-    log::debug!("LoadLibraryW({name:?}) -> NULL");
-    Ok(DispatchOutcome::ReturnedR0(0))
+    // Already resident? CE hands back the same base and bumps the
+    // reference count.
+    if let Some(existing) = ctx.kernel.module_by_name(&name).map(|m| m.handle) {
+        if let Some(m) = ctx.kernel.modules.iter_mut().find(|m| m.handle == existing) {
+            m.refcount = m.refcount.saturating_add(1);
+        }
+        log::debug!("LoadLibraryW({name:?}) -> 0x{existing:08x} (cached)");
+        return Ok(DispatchOutcome::ReturnedR0(existing));
+    }
+    match load_resource_module(ctx, &name)? {
+        Some(base) => {
+            log::info!("LoadLibraryW({name:?}) -> 0x{base:08x}");
+            Ok(DispatchOutcome::ReturnedR0(base))
+        }
+        None => {
+            log::debug!("LoadLibraryW({name:?}) -> NULL");
+            Ok(DispatchOutcome::ReturnedR0(0))
+        }
+    }
+}
+
+/// Map a satellite DLL found next to the game so its *resources* become
+/// reachable.
+///
+/// PocketHLE never executes guest code out of a runtime-loaded module:
+/// nothing resolves its exports, and the titles that call `LoadLibraryW`
+/// on a companion DLL (Solitaire + `pegcards.dll`, for instance) import
+/// no `GetProcAddress` — they only want `FindResourceW` / `LoadBitmapW` /
+/// `LoadStringW` to see the artwork inside. So we skip base relocations
+/// and the IAT and simply place the image's sections at a fresh 16 MiB
+/// slot in the module region, recording its resource directory.
+///
+/// Returns `None` (i.e. guest-visible NULL) when the file can't be found
+/// or parsed, or when the module region is exhausted.
+fn load_resource_module(ctx: &mut CallCtx<'_>, request: &str) -> Result<Option<u32>, KernelError> {
+    let Some(host_path) = ctx.kernel.find_module_file(request) else {
+        log::debug!("LoadLibraryW({request:?}): no host file found");
+        return Ok(None);
+    };
+    let image = match pocket_pe::load_file(&host_path) {
+        Ok(img) => img,
+        Err(e) => {
+            log::warn!(
+                "LoadLibraryW({request:?}): {} is not a PE ({e})",
+                host_path.display()
+            );
+            return Ok(None);
+        }
+    };
+    let base = ctx.kernel.next_module_base;
+    if base
+        .checked_add(MODULE_REGION_STRIDE)
+        .is_none_or(|end| end > MODULE_REGION_END)
+    {
+        log::warn!("LoadLibraryW({request:?}): module region exhausted");
+        return Ok(None);
+    }
+    for s in &image.sections {
+        let mut prot = Prot::READ;
+        if s.is_writable() {
+            prot |= Prot::WRITE;
+        }
+        if s.is_executable() {
+            prot |= Prot::EXEC;
+        }
+        let aligned = pocket_cpu::round_up_to_page(s.virtual_size.max(s.data.len() as u32));
+        if aligned == 0 {
+            continue;
+        }
+        ctx.cpu.map_region(base + s.virtual_address, aligned, prot)?;
+        ctx.cpu.write_mem(base + s.virtual_address, &s.data)?;
+    }
+    ctx.kernel.next_module_base = base + MODULE_REGION_STRIDE;
+    let name = module_file_name(request);
+    log::info!(
+        "loaded module {name} from {} at 0x{base:08x} ({} sections, {} resources)",
+        host_path.display(),
+        image.sections.len(),
+        image.resources.len()
+    );
+    ctx.kernel.modules.push(LoadedModule {
+        handle: base,
+        name,
+        base,
+        resources: image.resources,
+        refcount: 1,
+    });
+    Ok(Some(base))
+}
+
+/// Find a resource in the scope named by `hModule`, falling back to a
+/// search across every loaded image.
+///
+/// Games are careless with the `hInstance` they pass here — a satellite
+/// DLL's resource is often requested with the EXE's instance handle, or
+/// with a handle from a `LoadLibraryW` we never saw — so a miss in the
+/// nominal scope is not fatal. Returns the entry (cloned, so no borrow
+/// of `ctx.kernel` outlives the lookup) together with the image base its
+/// `data_rva` is relative to.
+fn lookup_resource(
+    kernel: &KernelState,
+    hmodule: u32,
+    ty: &ResourceKey,
+    name: &ResourceKey,
+) -> Option<(ResourceEntry, u32)> {
+    let (scoped, scoped_base) = kernel.resource_scope(hmodule);
+    if let Some(e) = scoped.iter().find(|e| e.ty == *ty && e.name == *name) {
+        return Some((e.clone(), scoped_base));
+    }
+    for (entries, base) in kernel.resource_scopes() {
+        if let Some(e) = entries.iter().find(|e| e.ty == *ty && e.name == *name) {
+            return Some((e.clone(), base));
+        }
+    }
+    None
+}
+
+/// Resolve a resource *address* previously handed to the guest by
+/// `FindResourceW` back to the entry it came from, whichever image that
+/// was.
+fn resource_at_address(kernel: &KernelState, addr: u32) -> Option<(ResourceEntry, u32)> {
+    for (entries, base) in kernel.resource_scopes() {
+        let rva = addr.wrapping_sub(base);
+        if let Some(e) = entries.iter().find(|e| e.data_rva == rva) {
+            return Some((e.clone(), base));
+        }
+    }
+    None
 }
 
 fn write_wide_str(
@@ -4234,6 +4364,28 @@ fn register_class_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
 }
 
 fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Must be the first thing we do: the thunk re-fires this whole handler
+    // when the hijacked `WndProc` returns, and by then R0..R3 hold the
+    // callback's result rather than the original arguments.
+    if let Some(frame) = ctx.kernel.create_frame {
+        // A `CreateWindowExW` issued from *inside* the WM_CREATE handler runs
+        // on a deeper stack; only SP back at its saved value means the
+        // `WndProc` we hijacked has actually returned.
+        if ctx.cpu.read_reg(ArmReg::Sp)? >= frame.sp {
+            ctx.kernel.create_frame = None;
+            ctx.kernel.create_stage = CreateStage::Idle;
+            let result = ctx.cpu.read_reg(ArmReg::R0)?;
+            if result as i32 == -1 {
+                log::warn!("WndProc returned -1 from WM_CREATE; the guest wanted creation to fail");
+            }
+            ctx.cpu.write_reg(ArmReg::Sp, frame.sp)?;
+            ctx.cpu.write_reg(ArmReg::R1, frame.args[1])?;
+            ctx.cpu.write_reg(ArmReg::R2, frame.args[2])?;
+            ctx.cpu.write_reg(ArmReg::R3, frame.args[3])?;
+            ctx.cpu.write_reg(ArmReg::Lr, frame.lr)?;
+            return Ok(DispatchOutcome::ReturnedR0(FAKE_HWND));
+        }
+    }
     let class_arg = ctx.arg_u32(1)?;
     let class_name = if class_arg != 0 {
         String::from_utf16_lossy(&read_wstr(ctx, class_arg, 128).unwrap_or_default())
@@ -4302,7 +4454,6 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             buf[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
         ctx.cpu.write_mem(create_struct, &buf)?;
-        ctx.kernel.pending_create = Some((FAKE_HWND, create_struct));
         let (screen_w, screen_h) = screen_dims(ctx);
         let size_lparam = (screen_w & 0xFFFF) | ((screen_h & 0xFFFF) << 16);
         ctx.kernel.pending_startup.clear();
@@ -4316,10 +4467,111 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     log::debug!(
         "CreateWindowExW(class={class_name:?}) -> hwnd=0x{FAKE_HWND:08x}, wndproc=0x{wnd_proc:08x}"
     );
+    if wnd_proc != 0 && create_struct != 0 && !ctx.kernel.synthetic_create_sent {
+        // Real Windows dispatches WM_CREATE from inside CreateWindowExW, and
+        // titles that run window-init code straight afterwards depend on it:
+        // Solitaire caches its window context in a global on WM_CREATE and
+        // asserts if its post-create init reads that global back unset. So
+        // detour into the WndProc now and land back in this thunk when it
+        // returns; `pending_create` stays unset so the pump can't repeat it.
+        let args = [
+            ctx.cpu.read_reg(ArmReg::R0)?,
+            ctx.cpu.read_reg(ArmReg::R1)?,
+            ctx.cpu.read_reg(ArmReg::R2)?,
+            ctx.cpu.read_reg(ArmReg::R3)?,
+        ];
+        let frame = GuestCallFrame {
+            args,
+            lr: ctx.cpu.read_reg(ArmReg::Lr)?,
+            sp: ctx.cpu.read_reg(ArmReg::Sp)?,
+        };
+        // WndProc's four arguments all travel in registers, so the guest
+        // stack needs no adjustment here.
+        ctx.cpu.write_reg(ArmReg::R0, FAKE_HWND)?;
+        ctx.cpu.write_reg(ArmReg::R1, WM_CREATE)?;
+        ctx.cpu.write_reg(ArmReg::R2, 0)?;
+        ctx.cpu.write_reg(ArmReg::R3, create_struct)?;
+        ctx.cpu.write_reg(ArmReg::Lr, ctx.thunk.thunk_va)?;
+        ctx.kernel.create_frame = Some(frame);
+        ctx.kernel.create_stage = CreateStage::Create;
+        ctx.kernel.synthetic_create_sent = true;
+        log::debug!("WM_CREATE -> WndProc(0x{wnd_proc:08x}) from CreateWindowExW");
+        return Ok(DispatchOutcome::JumpTo(wnd_proc));
+    }
+    if create_struct != 0 {
+        ctx.kernel.pending_create = Some((FAKE_HWND, create_struct));
+    }
     Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
 }
 
-fn show_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+/// `BOOL ShowWindow(HWND hWnd, int nCmdShow)`.
+///
+/// Real Windows sizes the window here and dispatches `WM_SIZE`
+/// synchronously before returning. Solitaire builds its whole board
+/// layout in the `WM_SIZE` arm of its `WndProc`, then starts drawing
+/// straight after `ShowWindow` / `UpdateWindow` — well before it first
+/// reaches its message pump. Leaving `WM_SIZE` on the startup queue
+/// therefore left every pile rectangle zeroed, so the game logged
+/// `Invalid call to DrawBackground!` each frame and stacked every card
+/// at (0,0). Delivering it here — rather than from `CreateWindowExW`,
+/// which runs before the game has allocated its state struct — matches
+/// the real ordering and gives the guest a laid-out board.
+fn show_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Must come first: the thunk re-fires this whole handler when the
+    // hijacked `WndProc` returns.
+    if ctx.kernel.create_stage == CreateStage::Size {
+        if let Some(frame) = ctx.kernel.create_frame {
+            // A nested `ShowWindow` from inside the WM_SIZE handler runs on a
+            // deeper stack; only SP back at its saved value is a real return.
+            if ctx.cpu.read_reg(ArmReg::Sp)? >= frame.sp {
+                ctx.kernel.create_frame = None;
+                ctx.kernel.create_stage = CreateStage::Idle;
+                ctx.cpu.write_reg(ArmReg::Sp, frame.sp)?;
+                ctx.cpu.write_reg(ArmReg::R1, frame.args[1])?;
+                ctx.cpu.write_reg(ArmReg::R2, frame.args[2])?;
+                ctx.cpu.write_reg(ArmReg::R3, frame.args[3])?;
+                ctx.cpu.write_reg(ArmReg::Lr, frame.lr)?;
+                return Ok(DispatchOutcome::ReturnedR0(1));
+            }
+        }
+    }
+    let hwnd = ctx.arg_u32(0)?;
+    let wnd_proc = ctx.kernel.window_procs.get(&hwnd).copied().unwrap_or(0);
+    // Only the first show of the main window needs the sizing pass, and
+    // only once no other guest-callback detour is already in flight.
+    if wnd_proc != 0
+        && hwnd == FAKE_HWND
+        && !ctx.kernel.synthetic_size_sent
+        && ctx.kernel.create_frame.is_none()
+    {
+        let args = [
+            ctx.cpu.read_reg(ArmReg::R0)?,
+            ctx.cpu.read_reg(ArmReg::R1)?,
+            ctx.cpu.read_reg(ArmReg::R2)?,
+            ctx.cpu.read_reg(ArmReg::R3)?,
+        ];
+        let frame = GuestCallFrame {
+            args,
+            lr: ctx.cpu.read_reg(ArmReg::Lr)?,
+            sp: ctx.cpu.read_reg(ArmReg::Sp)?,
+        };
+        let (screen_w, screen_h) = screen_dims(ctx);
+        let size_lparam = (screen_w & 0xFFFF) | ((screen_h & 0xFFFF) << 16);
+        // The queued copy would otherwise arrive a second time.
+        ctx.kernel
+            .pending_startup
+            .retain(|&(msg, _, _)| msg != WM_SIZE);
+        ctx.cpu.write_reg(ArmReg::R0, hwnd)?;
+        ctx.cpu.write_reg(ArmReg::R1, WM_SIZE)?;
+        ctx.cpu.write_reg(ArmReg::R2, 0)?;
+        ctx.cpu.write_reg(ArmReg::R3, size_lparam)?;
+        ctx.cpu.write_reg(ArmReg::Lr, ctx.thunk.thunk_va)?;
+        ctx.kernel.create_frame = Some(frame);
+        ctx.kernel.create_stage = CreateStage::Size;
+        ctx.kernel.synthetic_size_sent = true;
+        log::debug!("WM_SIZE({screen_w}x{screen_h}) -> WndProc(0x{wnd_proc:08x}) from ShowWindow");
+        return Ok(DispatchOutcome::JumpTo(wnd_proc));
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -5227,15 +5479,16 @@ fn get_stock_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     // Map stock indices to our pre-registered handles.
     let idx = ctx.arg_u32(0)?;
     let h = match idx {
-        0 => STOCK_WHITE_BRUSH, // WHITE_BRUSH
-        1 => 0xDEAD_5702,       // LTGRAY_BRUSH (synthetic)
-        2 => 0xDEAD_5703,       // GRAY_BRUSH
-        4 => STOCK_BLACK_BRUSH, // BLACK_BRUSH
-        5 => STOCK_NULL_BRUSH,  // NULL_BRUSH / HOLLOW_BRUSH
-        6 => STOCK_WHITE_PEN,   // WHITE_PEN
-        7 => STOCK_BLACK_PEN,   // BLACK_PEN
-        8 => STOCK_NULL_PEN,    // NULL_PEN
-        17 => 0xDEAD_5710,      // DEFAULT_GUI_FONT
+        0 => STOCK_WHITE_BRUSH,   // WHITE_BRUSH
+        1 => STOCK_LTGRAY_BRUSH,  // LTGRAY_BRUSH
+        2 => STOCK_GRAY_BRUSH,    // GRAY_BRUSH
+        3 => STOCK_DKGRAY_BRUSH,  // DKGRAY_BRUSH
+        4 => STOCK_BLACK_BRUSH,   // BLACK_BRUSH
+        5 => STOCK_NULL_BRUSH,    // NULL_BRUSH / HOLLOW_BRUSH
+        6 => STOCK_WHITE_PEN,     // WHITE_PEN
+        7 => STOCK_BLACK_PEN,     // BLACK_PEN
+        8 => STOCK_NULL_PEN,      // NULL_PEN
+        13 | 17 => STOCK_SYSTEM_FONT, // SYSTEM_FONT / DEFAULT_GUI_FONT
         _ => STOCK_WHITE_BRUSH,
     };
     Ok(DispatchOutcome::ReturnedR0(h))
@@ -5862,18 +6115,13 @@ fn read_wide_resource_key(ctx: &mut CallCtx<'_>, raw: u32) -> Result<ResourceKey
 
 fn find_resource_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // FindResourceW(hModule, lpName, lpType)
-    let _hmod = ctx.arg_u32(0)?;
+    let hmod = ctx.arg_u32(0)?;
     let name_raw = ctx.arg_u32(1)?;
     let type_raw = ctx.arg_u32(2)?;
     let want_name = read_wide_resource_key(ctx, name_raw)?;
     let want_type = read_wide_resource_key(ctx, type_raw)?;
-    if let Some(entry) = ctx
-        .kernel
-        .resources
-        .iter()
-        .find(|e| e.ty == want_type && e.name == want_name)
-    {
-        let va = ctx.kernel.image_base.wrapping_add(entry.data_rva);
+    if let Some((entry, base)) = lookup_resource(ctx.kernel, hmod, &want_type, &want_name) {
+        let va = base.wrapping_add(entry.data_rva);
         log::trace!(
             "FindResourceW(name={want_name:?}, type={want_type:?}) -> 0x{va:08x} ({} bytes)",
             entry.size
@@ -5901,9 +6149,8 @@ fn sizeof_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     // SizeofResource(hModule, hResInfo) — hResInfo is the VA we
     // returned from FindResourceW. We look up by data_rva.
     let h = ctx.arg_u32(1)?;
-    let rva = h.wrapping_sub(ctx.kernel.image_base);
-    if let Some(e) = ctx.kernel.resources.iter().find(|e| e.data_rva == rva) {
-        return Ok(DispatchOutcome::ReturnedR0(e.size));
+    if let Some((entry, _base)) = resource_at_address(ctx.kernel, h) {
+        return Ok(DispatchOutcome::ReturnedR0(entry.size));
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -5917,24 +6164,18 @@ fn sizeof_resource(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 /// we also handle 24-bpp BGR and 16-bpp RGB565/RGB555.
 fn load_bitmap_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     const RT_BITMAP: ResourceKey = ResourceKey::Id(2);
-    let _hinst = ctx.arg_u32(0)?;
+    let hinst = ctx.arg_u32(0)?;
     let name_raw = ctx.arg_u32(1)?;
     let want_name = read_wide_resource_key(ctx, name_raw)?;
-    let entry = match ctx
-        .kernel
-        .resources
-        .iter()
-        .find(|e| e.ty == RT_BITMAP && e.name == want_name)
-        .cloned()
-    {
-        Some(e) => e,
+    let (entry, base) = match lookup_resource(ctx.kernel, hinst, &RT_BITMAP, &want_name) {
+        Some(found) => found,
         None => {
             log::trace!("LoadBitmapW(name={want_name:?}) -> NULL (resource not found)");
             return Ok(DispatchOutcome::ReturnedR0(0));
         }
     };
-    // Read the bitmap data straight out of the guest's mapped image.
-    let va = ctx.kernel.image_base.wrapping_add(entry.data_rva);
+    // Read the bitmap data straight out of the owning module's mapped image.
+    let va = base.wrapping_add(entry.data_rva);
     let raw = match ctx.cpu.read_mem(va, entry.size) {
         Ok(b) => b,
         Err(_) => {
@@ -6104,7 +6345,7 @@ fn bgrx_to_rgb565(b: u8, g: u8, r: u8) -> u16 {
 /// NUL); writes a NUL into `lpBuf[0]` and returns 0 if not found.
 fn load_string_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     const RT_STRING: ResourceKey = ResourceKey::Id(6);
-    let _hinst = ctx.arg_u32(0)?;
+    let hinst = ctx.arg_u32(0)?;
     let id = ctx.arg_u32(1)? & 0xFFFF;
     let buf = ctx.arg_u32(2)?;
     let cch = ctx.arg_u32(3)? as usize;
@@ -6112,14 +6353,10 @@ fn load_string_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     let block_id = (id >> 4) + 1;
     let sub = (id & 0xF) as usize;
     let mut wide: Vec<u16> = Vec::new();
-    if let Some(entry) = ctx
-        .kernel
-        .resources
-        .iter()
-        .find(|e| e.ty == RT_STRING && e.name == ResourceKey::Id(block_id))
-        .cloned()
+    if let Some((entry, base)) =
+        lookup_resource(ctx.kernel, hinst, &RT_STRING, &ResourceKey::Id(block_id))
     {
-        let va = ctx.kernel.image_base.wrapping_add(entry.data_rva);
+        let va = base.wrapping_add(entry.data_rva);
         if let Ok(bytes) = ctx.cpu.read_mem(va, entry.size) {
             // Walk the 16 length-prefixed records.
             let mut pos = 0usize;
@@ -6405,13 +6642,10 @@ fn play_sound_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     if flags & SND_RESOURCE != 0 {
         let name = read_wide_resource_key(ctx, sound)?;
-        if let Some(resource) = ctx
-            .kernel
-            .resources
-            .iter()
-            .find(|e| e.ty == ResourceKey::Id(10) && e.name == name)
+        if let Some((resource, base)) =
+            lookup_resource(ctx.kernel, _hmod, &ResourceKey::Id(10), &name)
         {
-            let va = ctx.kernel.image_base.wrapping_add(resource.data_rva);
+            let va = base.wrapping_add(resource.data_rva);
             let bytes = ctx.cpu.read_mem(va, resource.size)?;
             let ok = submit_wave_bytes(ctx, &bytes, flags, "resource")?;
             log::debug!(
@@ -8687,7 +8921,7 @@ const WOM_DONE: u32 = 0x3BD;
 /// `waveOutProc(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance,
 /// DWORD_PTR dwParam1, DWORD_PTR dwParam2)` takes five arguments, so
 /// the fifth goes on the guest stack per AAPCS. The interrupted call's
-/// R0..R3 / LR / SP are stashed in [`WaveCallbackFrame`] and restored
+/// R0..R3 / LR / SP are stashed in [`GuestCallFrame`] and restored
 /// on re-entry, which makes the detour invisible to the caller.
 fn wave_out_enter_callback(
     ctx: &mut CallCtx<'_>,
@@ -8731,7 +8965,7 @@ fn wave_out_enter_callback(
         .write_reg(ArmReg::R2, ctx.kernel.wave_out.instance)?;
     ctx.cpu.write_reg(ArmReg::R3, hdr)?;
     ctx.cpu.write_reg(ArmReg::Lr, thunk_va)?;
-    ctx.kernel.wave_out.function_frame = Some(pocket_kernel::WaveCallbackFrame { args, lr, sp });
+    ctx.kernel.wave_out.function_frame = Some(pocket_kernel::GuestCallFrame { args, lr, sp });
     log::trace!("waveOutProc(0x{proc_va:08x}) for hdr=0x{hdr:08x}");
     Ok(Some(DispatchOutcome::JumpTo(proc_va)))
 }
@@ -9931,6 +10165,9 @@ mod tests {
             image_base: 0,
             dynamic_exports: std::collections::HashMap::new(),
             next_module_handle: 0x1000_0001,
+            modules: Vec::new(),
+            next_module_base: pocket_kernel::MODULE_REGION_BASE,
+            module_search_dirs: Vec::new(),
             fb_mapped: false,
             gx_readback_scratch: Vec::new(),
             mem_op_scratch: Vec::new(),
@@ -9954,6 +10191,9 @@ mod tests {
             synthetic_timer_next_ms: 0,
             synthetic_paint_next_ms: 0,
             synthetic_create_sent: false,
+            synthetic_size_sent: false,
+            create_frame: None,
+            create_stage: pocket_kernel::CreateStage::Idle,
             pending_input: std::collections::VecDeque::new(),
             gapi_keys_queried: false,
             pending_message: None,
