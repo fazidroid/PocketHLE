@@ -36,6 +36,35 @@ pub const STOCK_NULL_BRUSH: u32 = 0xDEAD_5705;
 pub const STOCK_BLACK_PEN: u32 = 0xDEAD_5707;
 pub const STOCK_WHITE_PEN: u32 = 0xDEAD_5706;
 pub const STOCK_NULL_PEN: u32 = 0xDEAD_5708;
+pub const STOCK_LTGRAY_BRUSH: u32 = 0xDEAD_5702;
+pub const STOCK_GRAY_BRUSH: u32 = 0xDEAD_5703;
+pub const STOCK_DKGRAY_BRUSH: u32 = 0xDEAD_5709;
+/// `GetStockObject(SYSTEM_FONT)` / `DEFAULT_GUI_FONT`.
+pub const STOCK_SYSTEM_FONT: u32 = 0xDEAD_5710;
+/// The 1x1 monochrome bitmap every real memory DC starts out with.
+/// `SelectObject(memdc, hbm)` must return *this* rather than NULL for a
+/// fresh DC — guests routinely test the result and bail on NULL.
+pub const STOCK_DEFAULT_BITMAP: u32 = 0xDEAD_5720;
+
+/// Handles that are pre-registered in [`GdiState::new`] and must outlive
+/// every `DeleteObject`, just like real GDI stock objects.
+pub fn is_stock_handle(handle: u32) -> bool {
+    matches!(
+        handle,
+        GDI_SCREEN_DC
+            | STOCK_WHITE_BRUSH
+            | STOCK_LTGRAY_BRUSH
+            | STOCK_GRAY_BRUSH
+            | STOCK_BLACK_BRUSH
+            | STOCK_NULL_BRUSH
+            | STOCK_WHITE_PEN
+            | STOCK_BLACK_PEN
+            | STOCK_NULL_PEN
+            | STOCK_DKGRAY_BRUSH
+            | STOCK_SYSTEM_FONT
+            | STOCK_DEFAULT_BITMAP
+    )
+}
 
 /// Whether a DC paints into the on-screen framebuffer or into an
 /// off-screen [`Bitmap`].
@@ -164,6 +193,12 @@ pub fn rgb565_to_rgb555(p: u16) -> u16 {
 pub struct Dc {
     pub surface: DcSurface,
     pub selected_bitmap: Option<u32>,
+    /// Handles currently selected into the DC. Kept alongside the cached
+    /// colours below so `SelectObject` can hand the guest back a real
+    /// handle to restore later, the way GDI does.
+    pub selected_brush: u32,
+    pub selected_pen: u32,
+    pub selected_font: u32,
     pub brush_color: u32,
     pub pen_color: u32,
     pub text_color: u32,
@@ -176,6 +211,9 @@ impl Default for Dc {
         Self {
             surface: DcSurface::Memory,
             selected_bitmap: None,
+            selected_brush: STOCK_WHITE_BRUSH,
+            selected_pen: STOCK_BLACK_PEN,
+            selected_font: STOCK_SYSTEM_FONT,
             brush_color: 0x00ff_ffff,
             pen_color: 0,
             text_color: 0,
@@ -250,6 +288,25 @@ impl GdiState {
                 width: 0,
             }),
         );
+        s.objects.insert(
+            STOCK_LTGRAY_BRUSH,
+            GdiObject::Brush(Brush { color: 0x00c0_c0c0 }),
+        );
+        s.objects.insert(
+            STOCK_GRAY_BRUSH,
+            GdiObject::Brush(Brush { color: 0x0080_8080 }),
+        );
+        s.objects.insert(
+            STOCK_DKGRAY_BRUSH,
+            GdiObject::Brush(Brush { color: 0x0040_4040 }),
+        );
+        s.objects
+            .insert(STOCK_SYSTEM_FONT, GdiObject::Font(Font { height: 12 }));
+        // Every memory DC starts with a 1x1 monochrome bitmap selected.
+        // We never draw through it; it exists so the first
+        // SelectObject(memdc, hbm) can return a non-NULL "previous".
+        s.objects
+            .insert(STOCK_DEFAULT_BITMAP, GdiObject::Bitmap(Bitmap::new(1, 1)));
         // Screen DC is also pre-registered so that get_screen_dc()
         // returns a stable handle whose surface is `Screen`.
         s.objects.insert(
@@ -267,16 +324,7 @@ impl GdiState {
         self.next_handle = self.next_handle.wrapping_add(1);
         // Avoid stomping on the stock handles by stepping over them.
         debug_assert!(
-            !matches!(
-                h,
-                GDI_SCREEN_DC
-                    | STOCK_WHITE_BRUSH
-                    | STOCK_BLACK_BRUSH
-                    | STOCK_NULL_BRUSH
-                    | STOCK_BLACK_PEN
-                    | STOCK_WHITE_PEN
-                    | STOCK_NULL_PEN
-            ),
+            !is_stock_handle(h),
             "alloc_handle collided with a stock handle"
         );
         h
@@ -324,16 +372,7 @@ impl GdiState {
 
     pub fn delete(&mut self, handle: u32) -> bool {
         // Stock objects are immortal.
-        if matches!(
-            handle,
-            GDI_SCREEN_DC
-                | STOCK_WHITE_BRUSH
-                | STOCK_BLACK_BRUSH
-                | STOCK_NULL_BRUSH
-                | STOCK_BLACK_PEN
-                | STOCK_WHITE_PEN
-                | STOCK_NULL_PEN
-        ) {
+        if is_stock_handle(handle) {
             return true;
         }
         self.objects.remove(&handle).is_some()
@@ -414,23 +453,33 @@ impl GdiState {
         };
         match kind {
             "bitmap" => {
-                let prev = dc.selected_bitmap.unwrap_or(0);
+                // A fresh memory DC has the 1x1 stock bitmap selected in real
+                // GDI, so the first SelectObject must not return NULL: guests
+                // treat NULL as failure and skip the blit entirely.
+                let prev = dc.selected_bitmap.unwrap_or(STOCK_DEFAULT_BITMAP);
                 dc.selected_bitmap = Some(obj_handle);
                 prev
             }
             "brush" => {
-                let prev_color = dc.brush_color;
+                let prev = dc.selected_brush;
+                dc.selected_brush = obj_handle;
                 if let Some(c) = color {
                     dc.brush_color = c;
                 }
-                prev_color
+                prev
             }
             "pen" => {
-                let prev_color = dc.pen_color;
+                let prev = dc.selected_pen;
+                dc.selected_pen = obj_handle;
                 if let Some(c) = color {
                     dc.pen_color = c;
                 }
-                prev_color
+                prev
+            }
+            "font" => {
+                let prev = dc.selected_font;
+                dc.selected_font = obj_handle;
+                prev
             }
             _ => 0,
         }

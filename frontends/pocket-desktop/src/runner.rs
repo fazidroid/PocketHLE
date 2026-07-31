@@ -86,13 +86,6 @@ impl Runner {
         summary_lines.push(format!("Backend: {}", effective_backend.label()));
         summary_lines.push(format!("Executable: {}", exe.display()));
 
-        // The screen has to be sized before the game runs: a GAPI title
-        // reads the display geometry once during start-up and lays its
-        // HUD out around it.
-        let (screen_w, screen_h) = game.settings.screen.size();
-        emu.set_screen_size(screen_w, screen_h);
-        summary_lines.push(format!("Screen: {screen_w}x{screen_h}"));
-
         emu.set_halt_on_unimplemented(game.settings.halt_on_unimplemented);
         emu.max_slices = game.settings.max_slices;
         emu.instruction_budget_per_slice = game.settings.instructions_per_slice;
@@ -104,6 +97,15 @@ impl Runner {
                 framebuffer: None,
             };
         }
+
+        // The screen has to be sized before the game runs: a GAPI title
+        // reads the display geometry once during start-up and lays its
+        // HUD out around it. `set_screen_size` requires `load_pe` to have
+        // created the process first, so this call must come after the
+        // load succeeds.
+        let (screen_w, screen_h) = game.settings.screen.size();
+        emu.set_screen_size(screen_w, screen_h);
+        summary_lines.push(format!("Screen: {screen_w}x{screen_h}"));
 
         for value in &game.registry {
             let registry_value = if let Some(text) = value.string.as_deref() {

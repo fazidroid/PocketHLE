@@ -18,6 +18,7 @@
 //! against.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 
 use byteorder::{ByteOrder, LittleEndian};
 use indexmap::IndexMap;
@@ -143,6 +144,24 @@ pub const HEAP_SIZE: u32 = 0x0400_0000;
 
 /// Guest-visible RAM window used by GAPI for direct framebuffer writes.
 pub const SYNTHETIC_FRAMEBUFFER_BASE: u32 = 0x7800_0000;
+
+/// Base of the region runtime-loaded modules are mapped at.
+///
+/// A fair number of Pocket PC titles split their artwork into a
+/// resource-only satellite DLL and pull it in with `LoadLibraryW`
+/// (Solitaire's `pegcards.dll` carries nothing but the card faces —
+/// zero exports, 132 KiB of `.rsrc`). Those images have to live
+/// somewhere the main image, heap, stack and thunk pool don't, so we
+/// hand each one a 16 MiB slot in the otherwise unused window between
+/// the EXE (low addresses) and the heap at [`HEAP_BASE`].
+pub const MODULE_REGION_BASE: u32 = 0x3000_0000;
+/// Distance between consecutive runtime module bases. WinCE satellite
+/// DLLs are tiny; 16 MiB each is absurdly generous and keeps the
+/// arithmetic trivial.
+pub const MODULE_REGION_STRIDE: u32 = 0x0100_0000;
+/// One past the last address [`MODULE_REGION_BASE`] may grow into, so
+/// the 16th `LoadLibraryW` fails instead of colliding with the heap.
+pub const MODULE_REGION_END: u32 = 0x4000_0000;
 
 /// "bx lr" in ARM mode (little endian).
 pub const ARM_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
@@ -273,19 +292,42 @@ pub struct WaveOutState {
     /// Set while the guest is executing `waveOutProc`, so the pump
     /// knows to restore the interrupted call's registers when the
     /// callback returns.
-    pub function_frame: Option<WaveCallbackFrame>,
+    pub function_frame: Option<GuestCallFrame>,
 }
 
-/// Registers of the API call we interrupted to run the guest's
-/// `waveOutProc`, so it can be resumed transparently afterwards.
+/// Registers of the API call we interrupted to run a guest callback
+/// (`waveOutProc`, a `WndProc` receiving `WM_CREATE`, ...), so the
+/// interrupted call can be resumed transparently afterwards.
 #[derive(Debug, Clone, Copy)]
-pub struct WaveCallbackFrame {
+pub struct GuestCallFrame {
     /// R0..R3 of the interrupted call.
     pub args: [u32; 4],
     /// LR of the interrupted call — where it should return to.
     pub lr: u32,
-    /// SP before we pushed `waveOutProc`'s stacked 5th argument.
+    /// SP at the point we hijacked the call. Also used to tell a
+    /// genuine callback return (SP back where it was) from a *nested*
+    /// call to the same API from inside the callback (SP lower).
     pub sp: u32,
+}
+
+/// Which leg of the synchronous `CreateWindowExW` message sequence is
+/// currently running inside the guest `WndProc`.
+///
+/// Real Windows delivers `WM_CREATE` and then `WM_SIZE` before
+/// `CreateWindowExW` returns. Solitaire computes its whole board layout
+/// in the `WM_SIZE` arm, so a title that draws immediately after
+/// `CreateWindowExW` — before it ever reaches its message pump — sees a
+/// zeroed layout and refuses to paint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CreateStage {
+    /// No detour in flight.
+    #[default]
+    Idle,
+    /// The `WndProc` is running `WM_CREATE`; `WM_SIZE` comes next.
+    Create,
+    /// The `WndProc` is running `WM_SIZE`, the last message of the
+    /// sequence. When it returns, `CreateWindowExW` finally does too.
+    Size,
 }
 
 /// A Win32 event object created by `CreateEventW`.
@@ -369,6 +411,30 @@ impl Dispatcher for NullDispatcher {
     }
 }
 
+/// A DLL the guest pulled in at runtime with `LoadLibraryW`.
+///
+/// PocketHLE does not *execute* satellite modules: nothing resolves
+/// their exports (a resource-only DLL has none, and the titles that
+/// load one import no `GetProcAddress`), so we skip base relocations
+/// and the IAT entirely and only make the image's bytes readable so
+/// `FindResourceW` / `LoadBitmapW` / `LoadStringW` can reach them.
+#[derive(Debug, Clone)]
+pub struct LoadedModule {
+    /// `HMODULE` handed back to the guest. Equal to [`Self::base`],
+    /// which is what the real CE loader returns.
+    pub handle: u32,
+    /// Lower-cased file name, no directory (`pegcards.dll`).
+    pub name: String,
+    /// Address the image was mapped at.
+    pub base: u32,
+    /// Flattened `.rsrc` directory of that image.
+    pub resources: Vec<ResourceEntry>,
+    /// `LoadLibrary` count, decremented by `FreeLibrary`. We never
+    /// unmap on zero — a game that frees and re-loads its artwork DLL
+    /// would otherwise pay for a second slot.
+    pub refcount: u32,
+}
+
 /// Mutable kernel state that persists across calls and that handlers
 /// need to read or modify. Bundled into one struct so we can hand it
 /// out by `&mut` without conflicting with the immutable parts of
@@ -397,6 +463,18 @@ pub struct KernelState {
     pub image_base: u32,
     pub dynamic_exports: HashMap<u32, HashMap<String, u32>>,
     pub next_module_handle: u32,
+    /// DLLs the guest brought in at runtime via `LoadLibraryW`, in load
+    /// order. Only resource-carrying satellite modules end up here; the
+    /// HLE'd system DLLs are answered with fixed fake handles instead.
+    pub modules: Vec<LoadedModule>,
+    /// Base address the next `LoadLibraryW` will map at. Starts at
+    /// [`MODULE_REGION_BASE`] and walks up by [`MODULE_REGION_STRIDE`].
+    pub next_module_base: u32,
+    /// Host directories searched for a runtime-loaded module, most
+    /// specific first. Normally just the directory the EXE came from
+    /// (a bare-exe run) or the CAB extraction root, which is where a
+    /// game's satellite DLLs sit next to it on a real device.
+    pub module_search_dirs: Vec<PathBuf>,
     /// Set the first time `GXBeginDraw` runs. The dispatcher maps the
     /// framebuffer region into the guest VA space lazily — but that
     /// requires `&mut dyn Cpu`, which isn't available outside a call,
@@ -501,6 +579,17 @@ pub struct KernelState {
     /// `GetMessageW` so the guest's `WndProc` runs its window-init
     /// code (which typically calls `SetTimer`).
     pub synthetic_create_sent: bool,
+    /// Set once the startup `WM_SIZE` has been handed to the guest, so
+    /// the synchronous `CreateWindowExW` / `ShowWindow` sequence only
+    /// runs it once.
+    pub synthetic_size_sent: bool,
+    /// Registers of the `CreateWindowExW` / `ShowWindow` call we
+    /// interrupted to run the guest's `WndProc` synchronously. See
+    /// [`CreateStage`].
+    pub create_frame: Option<GuestCallFrame>,
+    /// Which leg of the synchronous window-creation message sequence is
+    /// in flight inside the guest `WndProc`.
+    pub create_stage: CreateStage,
     /// Input events queued by the host frontend (mouse / D-pad /
     /// keyboard). Drained by `GetMessageW` / `PeekMessageW` before
     /// any synthetic timer / paint message is fabricated, so real
@@ -606,6 +695,97 @@ pub struct KernelState {
     /// this caches the synthetic sub-menu we hand back so the
     /// invariant holds.
     pub sub_menus: HashMap<(u32, u32), u32>,
+}
+
+impl KernelState {
+    /// Look up an already-loaded runtime module by its `HMODULE`.
+    pub fn module_by_handle(&self, handle: u32) -> Option<&LoadedModule> {
+        self.modules.iter().find(|m| m.handle == handle)
+    }
+
+    /// Look up an already-loaded runtime module by file name. `name` may
+    /// carry a directory and/or mixed case; only the file stem+extension
+    /// is compared, case-insensitively.
+    pub fn module_by_name(&self, name: &str) -> Option<&LoadedModule> {
+        let key = module_file_name(name);
+        self.modules.iter().find(|m| m.name == key)
+    }
+
+    /// Resources and image base to search for a given `hModule`.
+    ///
+    /// A null / process instance handle means "the EXE", which is also
+    /// what we fall back to for a handle we don't recognise: games are
+    /// sloppy about what they pass here and the main image is the only
+    /// sane default.
+    pub fn resource_scope(&self, hmodule: u32) -> (&[ResourceEntry], u32) {
+        if hmodule != 0 {
+            if let Some(m) = self.module_by_handle(hmodule) {
+                return (&m.resources, m.base);
+            }
+        }
+        (&self.resources, self.image_base)
+    }
+
+    /// Every resource scope in the process, main image first.
+    ///
+    /// Used by the handlers that only get a resource *address* (or that
+    /// were handed a bogus `hModule`) and have to search everywhere.
+    pub fn resource_scopes(&self) -> impl Iterator<Item = (&[ResourceEntry], u32)> {
+        std::iter::once((self.resources.as_slice(), self.image_base)).chain(
+            self.modules
+                .iter()
+                .map(|m| (m.resources.as_slice(), m.base)),
+        )
+    }
+
+    /// Find the host file backing a guest `LoadLibraryW` request.
+    ///
+    /// Tries the VFS first (so a CAB-mounted absolute path such as
+    /// `\Program Files\Solitaire\pegcards.dll` resolves exactly), then
+    /// falls back to a case-insensitive scan of [`Self::module_search_dirs`]
+    /// for the bare file name — which is how a bare-EXE run finds the
+    /// satellite DLLs sitting next to the executable.
+    pub fn find_module_file(&self, request: &str) -> Option<PathBuf> {
+        if request.contains('\\') || request.contains('/') {
+            if let Some(p) = self.vfs.resolve(request) {
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+        let want = module_file_name(request);
+        for dir in &self.module_search_dirs {
+            let direct = dir.join(&want);
+            if direct.is_file() {
+                return Some(direct);
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if name == want && entry.path().is_file() {
+                    return Some(entry.path());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Normalise a guest module request to a lower-cased bare file name with
+/// a `.dll` extension (`"\\Windows\\PegCards"` -> `"pegcards.dll"`).
+pub fn module_file_name(request: &str) -> String {
+    let base = request
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(request)
+        .to_ascii_lowercase();
+    if base.contains('.') {
+        base
+    } else {
+        format!("{base}.dll")
+    }
 }
 
 /// Saved register context for one cooperative guest thread.
@@ -1226,6 +1406,15 @@ impl Process {
 
         let resources = image.resources.clone();
         let img_base = image.image_base;
+        // A game's satellite DLLs sit next to the EXE on a real device, so
+        // the directory we loaded the EXE from is the natural search path
+        // for `LoadLibraryW`. For a CAB/ZIP run that directory *is* the
+        // extraction root, so this covers both cases.
+        let module_search_dirs: Vec<PathBuf> = Path::new(&image.source_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| vec![p.to_path_buf()])
+            .unwrap_or_default();
         Ok(Process {
             image,
             thunks,
@@ -1242,6 +1431,9 @@ impl Process {
                 image_base: img_base,
                 dynamic_exports,
                 next_module_handle: 0x1000_0001,
+                modules: Vec::new(),
+                next_module_base: MODULE_REGION_BASE,
+                module_search_dirs,
                 fb_mapped: false,
                 gx_readback_scratch: Vec::new(),
                 mem_op_scratch: Vec::new(),
@@ -1269,6 +1461,9 @@ impl Process {
                 synthetic_timer_next_ms: 0,
                 synthetic_paint_next_ms: 0,
                 synthetic_create_sent: false,
+                synthetic_size_sent: false,
+                create_frame: None,
+                create_stage: CreateStage::Idle,
                 pending_input: VecDeque::new(),
                 gapi_keys_queried: false,
                 pending_message: None,

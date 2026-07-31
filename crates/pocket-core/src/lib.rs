@@ -30,6 +30,10 @@ pub struct Emulator {
     cpu: Box<dyn Cpu>,
     process: Option<Process>,
     dispatcher: WinCeDispatcher,
+    /// Screen geometry requested by the frontend, remembered so
+    /// [`Emulator::set_screen_size`] works whether it is called before
+    /// or after [`Emulator::load_pe`]. See that method for why.
+    requested_screen: Option<(u32, u32)>,
     pub instruction_budget_per_slice: u64,
     pub max_slices: u64,
 }
@@ -40,6 +44,7 @@ impl Emulator {
             cpu: Box::new(StubCpu::new()),
             process: None,
             dispatcher: WinCeDispatcher::new(),
+            requested_screen: None,
             instruction_budget_per_slice: 1_000_000,
             max_slices: 1024,
         }
@@ -60,6 +65,7 @@ impl Emulator {
             cpu: Box::new(cpu),
             process: None,
             dispatcher: WinCeDispatcher::new(),
+            requested_screen: None,
             instruction_budget_per_slice: 1_000_000,
             max_slices: 1024,
         })
@@ -88,6 +94,11 @@ impl Emulator {
         )
         .context("mapping image into CPU")?;
         self.process = Some(process);
+        // A frontend that sized the screen before loading gets its
+        // request honoured here rather than silently dropped.
+        if let Some((w, h)) = self.requested_screen {
+            self.apply_screen_size(w, h);
+        }
         Ok(self.process.as_ref().unwrap())
     }
 
@@ -267,11 +278,19 @@ impl Emulator {
         self.process.as_ref().map(|p| p.state.audio.tap())
     }
 
-    /// Resize the emulated display. Must be called after
-    /// [`Self::load_pe`] and before [`Self::run`], because the guest
+    /// Resize the emulated display. Call it any time before
+    /// [`Self::run`] — either side of [`Self::load_pe`] works, because
+    /// a request made before the process exists is remembered and
+    /// applied by `load_pe`. It must precede `run`, since the guest
     /// reads the geometry once during start-up (`GetSystemMetrics`,
     /// `GetDeviceCaps`, `GXGetDisplayProperties`) and sizes its back
     /// buffer from it.
+    ///
+    /// The ordering used to matter and silently didn't hold: the
+    /// desktop launcher sized the screen before loading, so every game
+    /// ran at the default no matter which resolution the user picked in
+    /// the GUI. Deferring instead of dropping the request keeps that
+    /// class of bug from coming back through a new frontend.
     ///
     /// The default is the Pocket PC 240×320 portrait LCD. Windows
     /// Mobile Smartphone titles — e.g. the Motorola Q9 build of
@@ -282,16 +301,30 @@ impl Emulator {
             log::warn!("set_screen_size({width}x{height}) ignored: zero dimension");
             return;
         }
-        if let Some(p) = self.process.as_mut() {
-            p.state.framebuffer = pocket_kernel::Framebuffer::new(width, height);
-            // The GAPI mapping is sized from the framebuffer, so drop
-            // it; the next GXOpenDisplay/GXBeginDraw re-maps at the
-            // new size.
-            p.state.fb_mapped = false;
-            p.state.gx_readback_scratch.clear();
-        } else {
-            log::warn!("set_screen_size called before load_pe; ignored");
+        self.requested_screen = Some((width, height));
+        if self.process.is_some() {
+            self.apply_screen_size(width, height);
         }
+    }
+
+    /// Screen geometry the guest will see, once [`Self::load_pe`] has
+    /// run. Reflects the live framebuffer, so it also covers a game
+    /// that resized the display itself.
+    pub fn screen_size(&self) -> Option<(u32, u32)> {
+        let fb = &self.process.as_ref()?.state.framebuffer;
+        Some((fb.width, fb.height))
+    }
+
+    /// Resize the live framebuffer. Only valid with a process loaded.
+    fn apply_screen_size(&mut self, width: u32, height: u32) {
+        let Some(p) = self.process.as_mut() else {
+            return;
+        };
+        p.state.framebuffer = pocket_kernel::Framebuffer::new(width, height);
+        // The GAPI mapping is sized from the framebuffer, so drop it;
+        // the next GXOpenDisplay/GXBeginDraw re-maps at the new size.
+        p.state.fb_mapped = false;
+        p.state.gx_readback_scratch.clear();
     }
 }
 
@@ -302,5 +335,32 @@ mod tests {
     #[test]
     fn stub_emulator_constructs() {
         let _ = Emulator::with_stub_cpu();
+    }
+
+    #[test]
+    fn a_screen_size_set_before_load_is_remembered() {
+        // The desktop launcher sizes the screen before it loads the PE.
+        // That used to be silently dropped, so every game ran at the
+        // 240x320 default however the user configured it. The request
+        // has to survive until there is a process to apply it to.
+        let mut emu = Emulator::with_stub_cpu();
+        assert_eq!(emu.screen_size(), None, "no process yet");
+        emu.set_screen_size(480, 320);
+        assert_eq!(
+            emu.requested_screen,
+            Some((480, 320)),
+            "request must be kept for load_pe to apply"
+        );
+    }
+
+    #[test]
+    fn a_zero_dimension_screen_size_is_refused() {
+        // Never leave a zero-sized framebuffer behind: a later
+        // load_pe must not apply it either.
+        let mut emu = Emulator::with_stub_cpu();
+        emu.set_screen_size(480, 0);
+        assert_eq!(emu.requested_screen, None);
+        emu.set_screen_size(0, 320);
+        assert_eq!(emu.requested_screen, None);
     }
 }

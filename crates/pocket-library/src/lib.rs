@@ -53,6 +53,11 @@ pub enum LibraryError {
     InvalidId(String),
     #[error("file `{0}` is not an ARM PE32 executable")]
     NotArmPe(String),
+    #[error(
+        "`{0}` is a support library, not a game — import the .exe instead \
+         and any DLLs next to it are picked up automatically"
+    )]
+    IsLibrary(String),
 }
 
 fn default_schema_version() -> u32 {
@@ -99,6 +104,16 @@ pub struct GameEntry {
     /// icon, in which case frontends fall back to a placeholder.
     #[serde(default)]
     pub icon: Option<PathBuf>,
+    /// Support libraries that were copied in alongside the executable,
+    /// relative to `<library_root>/games/<id>/`.
+    ///
+    /// Purely informational — the emulator finds these by name at
+    /// `LoadLibraryW` time because they sit in the same directory as
+    /// the executable. Recorded so the launcher can tell the user that
+    /// importing one `.exe` also brought in its satellite DLLs, and so
+    /// a game directory stays self-describing.
+    #[serde(default)]
+    pub companions: Vec<PathBuf>,
 }
 
 impl GameEntry {
@@ -220,6 +235,14 @@ pub enum ScreenPref {
     SmallPortrait,
     /// 480x800 WVGA Windows Phone display.
     Wvga,
+    /// 480x320 — the Handheld PC / H/PC landscape panel.
+    ///
+    /// Windows CE's bundled applets (Solitaire among them) are H/PC
+    /// class and lay their UI out against this geometry. Launching
+    /// them at the 240x320 Pocket PC default leaves the window
+    /// clipped, so they need their own entry rather than being
+    /// squeezed into `Landscape`.
+    Hpc,
 }
 
 impl ScreenPref {
@@ -229,6 +252,7 @@ impl ScreenPref {
             ScreenPref::Landscape => "320x240 (landscape)",
             ScreenPref::SmallPortrait => "176x220 (small)",
             ScreenPref::Wvga => "480x800 (WVGA)",
+            ScreenPref::Hpc => "480x320 (Handheld PC)",
         }
     }
 
@@ -239,6 +263,7 @@ impl ScreenPref {
             ScreenPref::Landscape => (320, 240),
             ScreenPref::SmallPortrait => (176, 220),
             ScreenPref::Wvga => (480, 800),
+            ScreenPref::Hpc => (480, 320),
         }
     }
 }
@@ -532,7 +557,7 @@ impl Library {
             let by_basename = |name: &str| {
                 long_names.iter().find_map(|(_, path)| {
                     let basename = path.file_name()?.to_string_lossy();
-                    (basename.eq_ignore_ascii_case(name) && is_arm_pe(path).unwrap_or(false))
+                    (basename.eq_ignore_ascii_case(name) && is_guest_exe(path))
                         .then_some(path.clone())
                 })
             };
@@ -566,6 +591,14 @@ impl Library {
                     continue;
                 }
                 if !is_pe_file(&f.extracted_path) {
+                    continue;
+                }
+                // A cabinet renames its payload to 8.3 names, so the
+                // extension check above misses a satellite library
+                // stored as `PEGCAR~1.002`. The COFF DLL bit does not
+                // lie. A cabinet that ships *only* libraries still
+                // falls through to `NoExecutable` below.
+                if is_guest_dll(&f.extracted_path) {
                     continue;
                 }
                 if best.as_ref().map(|(_, sz)| *sz).unwrap_or(0) < f.size {
@@ -614,6 +647,7 @@ impl Library {
                 ..GameSettings::default()
             },
             icon: extract_icon_png(&game_dir, &exe_abs),
+            companions: record_extracted_libraries(&extracted_dir, &game_dir),
         };
 
         self.commit_entry(&id, entry)
@@ -625,11 +659,21 @@ impl Library {
     /// rest of the launcher pipeline can treat it identically to a
     /// CAB-extracted game.
     ///
+    /// Any guest DLLs sitting next to the executable are copied in as
+    /// well. A fair number of titles split their artwork or engine into
+    /// a satellite library and pull it in with `LoadLibraryW` at
+    /// runtime — the CE shell's Solitaire keeps every card face in
+    /// `pegcards.dll` — and the emulator resolves those by name in the
+    /// executable's own directory, exactly as a real device would. Copy
+    /// only the executable and the game loads but cannot draw.
+    ///
     /// The user-supplied .exe is checked for an ARM machine type
     /// before being accepted; a mistakenly-imported x86 desktop
     /// build returns [`LibraryError::NotArmPe`] rather than silently
     /// crashing the emulator with "guest jumped to unmapped address"
-    /// later on.
+    /// later on. A DLL handed in as the entry point is rejected with
+    /// [`LibraryError::IsLibrary`]: it is a real file the game needs,
+    /// but it has no entry point to start.
     pub fn import_exe(&mut self, exe_path: impl AsRef<Path>) -> Result<&GameEntry, LibraryError> {
         let exe_path = exe_path.as_ref();
         let source_name = exe_path
@@ -640,8 +684,14 @@ impl Library {
         if id.is_empty() {
             return Err(LibraryError::InvalidId(source_name));
         }
-        if !is_arm_pe(exe_path).unwrap_or(false) {
+        let Some(pe) = sniff_pe(exe_path).ok().flatten() else {
             return Err(LibraryError::NotArmPe(source_name));
+        };
+        if !pe.is_supported_guest() {
+            return Err(LibraryError::NotArmPe(source_name));
+        }
+        if pe.is_dll() {
+            return Err(LibraryError::IsLibrary(source_name));
         }
 
         let game_dir = self.root.join("games").join(&id);
@@ -652,6 +702,7 @@ impl Library {
         fs::create_dir_all(&extracted_dir)?;
         let dest_exe = extracted_dir.join(&source_name);
         fs::copy(exe_path, &dest_exe)?;
+        let companions = copy_sibling_libraries(exe_path, &extracted_dir, &game_dir);
 
         let executable = dest_exe
             .strip_prefix(&game_dir)
@@ -673,6 +724,7 @@ impl Library {
                 ..GameSettings::default()
             },
             icon: extract_icon_png(&game_dir, &dest_exe),
+            companions,
         };
 
         self.commit_entry(&id, entry)
@@ -766,7 +818,10 @@ impl Library {
             return result;
         }
 
-        // Find the largest ARM PE inside the extraction.
+        // Find the largest ARM PE inside the extraction. Satellite
+        // libraries are skipped: a resource-only DLL can easily be the
+        // largest PE in the archive — it is where the artwork lives —
+        // and it has no entry point to start.
         let mut best: Option<(PathBuf, u64)> = None;
         for path in &written {
             let Ok(meta) = fs::metadata(path) else {
@@ -775,7 +830,7 @@ impl Library {
             if !meta.is_file() {
                 continue;
             }
-            if !is_arm_pe(path).unwrap_or(false) {
+            if !is_guest_exe(path) {
                 continue;
             }
             if best.as_ref().map(|(_, sz)| *sz).unwrap_or(0) < meta.len() {
@@ -803,6 +858,7 @@ impl Library {
                 ..GameSettings::default()
             },
             icon: extract_icon_png(&game_dir, &exe_abs),
+            companions: record_extracted_libraries(&extracted_dir, &game_dir),
         };
 
         self.commit_entry(&id, entry)
@@ -876,6 +932,89 @@ impl Library {
         write_json(&game_dir.join("game.json"), &cloned)?;
         self.save()
     }
+}
+
+/// Number of satellite libraries we are willing to pull in next to a
+/// hand-picked `.exe`. A game ships a handful; a user who points the
+/// importer at a system directory should not have it copied wholesale.
+const MAX_SIBLING_LIBRARIES: usize = 16;
+
+/// Copy the guest support libraries sitting next to `exe_path` into
+/// `dest_dir`, so `LoadLibraryW` finds them at run time.
+///
+/// Returns the copied files as paths relative to `game_dir`, for
+/// [`GameEntry::companions`].
+///
+/// The filter is deliberately narrow: only ARM/MIPS PE images with
+/// `IMAGE_FILE_DLL` set, only in the executable's own directory, never
+/// recursing. That is enough for the satellite-DLL layout games
+/// actually ship (`solitare.exe` + `pegcards.dll` in one folder) while
+/// keeping an import from a busy Downloads folder from dragging in
+/// unrelated binaries. Host x86 DLLs are skipped because they fail the
+/// machine check.
+fn copy_sibling_libraries(exe_path: &Path, dest_dir: &Path, game_dir: &Path) -> Vec<PathBuf> {
+    let Some(src_dir) = exe_path.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(src_dir) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p != exe_path)
+        .filter(|p| p.is_file())
+        .filter(|p| is_guest_dll(p))
+        .collect();
+    // Stable order so a re-import produces the same manifest.
+    candidates.sort();
+
+    let mut copied = Vec::new();
+    for src in candidates.iter().take(MAX_SIBLING_LIBRARIES) {
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let dest = dest_dir.join(name);
+        if let Err(e) = fs::copy(src, &dest) {
+            log::warn!("could not copy support library {}: {e}", src.display());
+            continue;
+        }
+        log::info!("imported support library {}", src.display());
+        copied.push(
+            dest.strip_prefix(game_dir)
+                .map(Path::to_path_buf)
+                .unwrap_or(dest),
+        );
+    }
+    if candidates.len() > MAX_SIBLING_LIBRARIES {
+        log::warn!(
+            "{} has {} sibling DLLs; imported the first {MAX_SIBLING_LIBRARIES}",
+            src_dir.display(),
+            candidates.len(),
+        );
+    }
+    copied
+}
+
+/// List the guest DLLs already sitting in a CAB/ZIP extraction, as
+/// paths relative to `game_dir`.
+///
+/// Unlike [`copy_sibling_libraries`] this copies nothing: an archive
+/// import has already written every payload file into `extracted_dir`,
+/// so the libraries are where the emulator will look for them. We only
+/// record them for [`GameEntry::companions`].
+fn record_extracted_libraries(extracted_dir: &Path, game_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(extracted_dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && is_guest_dll(p))
+        .filter_map(|p| p.strip_prefix(game_dir).map(Path::to_path_buf).ok())
+        .collect();
+    found.sort();
+    found
 }
 
 fn materialise_legacy_assets(root: &Path, files: &[pocket_cab::CabFile], app_name: Option<&str>) {
@@ -1118,32 +1257,91 @@ fn is_supported_guest_machine(machine: u16) -> bool {
     )
 }
 
+/// `IMAGE_FILE_DLL` in the COFF characteristics word. The only
+/// reliable way to tell a library from an executable: a WinCE cabinet
+/// stores its payload under generated 8.3 names, so the `.dll`
+/// extension is frequently not there to read.
+const IMAGE_FILE_DLL: u16 = 0x2000;
+
+/// The COFF header fields we care about at import time.
+#[derive(Debug, Clone, Copy)]
+struct PeSniff {
+    machine: u16,
+    characteristics: u16,
+}
+
+impl PeSniff {
+    fn is_supported_guest(self) -> bool {
+        is_supported_guest_machine(self.machine)
+    }
+
+    fn is_dll(self) -> bool {
+        (self.characteristics & IMAGE_FILE_DLL) != 0
+    }
+}
+
+/// Cheap PE header sniff: read the COFF machine and characteristics
+/// without parsing the whole image.
+///
+/// Returns `Ok(None)` for non-PE / short files so the caller can scan
+/// a whole directory without having to discriminate between "isn't a
+/// PE" and "actually failed I/O".
+fn sniff_pe(path: &Path) -> std::io::Result<Option<PeSniff>> {
+    let mut f = fs::File::open(path)?;
+    let mut head = [0u8; 0x40];
+    let n = f.read(&mut head)?;
+    if n < 0x40 {
+        return Ok(None);
+    }
+    if &head[0..2] != b"MZ" {
+        return Ok(None);
+    }
+    let lfanew = u32::from_le_bytes(head[0x3c..0x40].try_into().unwrap()) as u64;
+    f.seek(SeekFrom::Start(lfanew))?;
+    // PE signature (4) + machine (2) + sections (2) + timestamp (4)
+    // + symbol table (8) + optional header size (2) + characteristics (2).
+    let mut coff = [0u8; 24];
+    if f.read(&mut coff)? < 24 {
+        return Ok(None);
+    }
+    if &coff[0..4] != b"PE\0\0" {
+        return Ok(None);
+    }
+    Ok(Some(PeSniff {
+        machine: u16::from_le_bytes([coff[4], coff[5]]),
+        characteristics: u16::from_le_bytes([coff[22], coff[23]]),
+    }))
+}
+
 /// Cheap PE header sniff: is `path` an ARM or little-endian MIPS PE32.
 ///
 /// Returns `Ok(false)` for non-PE / short / non-ARM files so the
 /// caller can scan a whole directory without having to discriminate
 /// between "isn't an ARM PE" and "actually failed I/O".
 fn is_arm_pe(path: &Path) -> std::io::Result<bool> {
-    let mut f = fs::File::open(path)?;
-    let mut head = [0u8; 0x40];
-    let n = f.read(&mut head)?;
-    if n < 0x40 {
-        return Ok(false);
-    }
-    if &head[0..2] != b"MZ" {
-        return Ok(false);
-    }
-    let lfanew = u32::from_le_bytes(head[0x3c..0x40].try_into().unwrap()) as u64;
-    f.seek(SeekFrom::Start(lfanew))?;
-    let mut sig = [0u8; 6];
-    if f.read(&mut sig)? < 6 {
-        return Ok(false);
-    }
-    if &sig[0..4] != b"PE\0\0" {
-        return Ok(false);
-    }
-    let machine = u16::from_le_bytes([sig[4], sig[5]]);
-    Ok(is_supported_guest_machine(machine))
+    Ok(sniff_pe(path)?.is_some_and(PeSniff::is_supported_guest))
+}
+
+/// Is `path` a guest PE that can serve as a process entry point —
+/// i.e. an ARM/MIPS image that is *not* a DLL?
+///
+/// A resource-only satellite library (Solitaire's `pegcards.dll` is
+/// 132 KiB of card artwork with zero exports) looks exactly like a
+/// game to a size-ranked scan, so every entry-point search has to
+/// filter on this rather than on the file extension.
+fn is_guest_exe(path: &Path) -> bool {
+    sniff_pe(path)
+        .ok()
+        .flatten()
+        .is_some_and(|pe| pe.is_supported_guest() && !pe.is_dll())
+}
+
+/// Is `path` a guest DLL — an ARM/MIPS PE with `IMAGE_FILE_DLL` set?
+fn is_guest_dll(path: &Path) -> bool {
+    sniff_pe(path)
+        .ok()
+        .flatten()
+        .is_some_and(|pe| pe.is_supported_guest() && pe.is_dll())
 }
 
 fn now_unix_seconds() -> i64 {
@@ -1273,6 +1471,7 @@ mod tests {
             imported_at: 0,
             settings: GameSettings::default(),
             icon: None,
+            companions: Vec::new(),
         }
     }
 
@@ -1504,5 +1703,128 @@ mod tests {
         let game2 = lib2.get("legacy").unwrap();
         assert_eq!(game2.settings.cpu_backend, CpuBackendPref::Unicorn);
         assert_eq!(game2.settings.max_slices, default_max_slices());
+    }
+
+    /// Write a PE that is just enough header for [`sniff_pe`]: an `MZ`
+    /// stub whose `e_lfanew` points at a COFF header carrying `machine`
+    /// and `characteristics`. No sections, no optional header — the
+    /// importer's accept/reject decision is made entirely from these
+    /// two fields.
+    fn write_stub_pe(path: &Path, machine: u16, characteristics: u16) {
+        let mut buf = vec![0u8; 0x40];
+        buf[0..2].copy_from_slice(b"MZ");
+        buf[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        let mut coff = vec![0u8; 24];
+        coff[0..4].copy_from_slice(b"PE\0\0");
+        coff[4..6].copy_from_slice(&machine.to_le_bytes());
+        coff[22..24].copy_from_slice(&characteristics.to_le_bytes());
+        buf.extend_from_slice(&coff);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, &buf).unwrap();
+    }
+
+    const MACHINE_ARM: u16 = 0x01c0;
+    const MACHINE_X86: u16 = 0x014c;
+
+    #[test]
+    fn a_dll_handed_in_as_a_game_is_rejected_as_a_library() {
+        // The user picks `pegcards.dll` in the import dialog. It is a
+        // real ARM PE the game needs, so the machine check passes and
+        // the old importer accepted it as a game that then could not
+        // start. The DLL characteristic bit has to be what decides.
+        let root = tmpdir("import_dll_rejected");
+        let src = tmpdir("import_dll_rejected_src");
+        fs::create_dir_all(&src).unwrap();
+        let dll = src.join("pegcards.dll");
+        write_stub_pe(&dll, MACHINE_ARM, IMAGE_FILE_DLL);
+
+        let mut lib = Library::open(&root).unwrap();
+        match lib.import_exe(&dll) {
+            Err(LibraryError::IsLibrary(name)) => assert_eq!(name, "pegcards.dll"),
+            other => panic!("expected IsLibrary, got {other:?}"),
+        }
+        // Nothing may be left behind for a rejected import.
+        assert!(!root.join("games").join("pegcards").exists());
+    }
+
+    #[test]
+    fn importing_an_exe_brings_its_satellite_libraries_along() {
+        // Solitaire's layout: the executable plus the resource-only DLL
+        // holding every card face. The emulator resolves the DLL by
+        // name in the executable's own directory, so the import has to
+        // put them back in one directory or the game draws nothing.
+        let root = tmpdir("import_exe_companions");
+        let src = tmpdir("import_exe_companions_src");
+        fs::create_dir_all(&src).unwrap();
+        let exe = src.join("solitare.exe");
+        write_stub_pe(&exe, MACHINE_ARM, 0);
+        write_stub_pe(&src.join("pegcards.dll"), MACHINE_ARM, IMAGE_FILE_DLL);
+        // An unrelated host DLL in the same folder must not come along.
+        write_stub_pe(&src.join("msvcrt.dll"), MACHINE_X86, IMAGE_FILE_DLL);
+
+        let mut lib = Library::open(&root).unwrap();
+        let entry = lib.import_exe(&exe).unwrap().clone();
+        assert_eq!(entry.id, "solitare");
+        assert_eq!(
+            entry.companions,
+            vec![PathBuf::from("extracted/pegcards.dll")]
+        );
+
+        let extracted = root.join("games").join("solitare").join("extracted");
+        assert!(extracted.join("solitare.exe").is_file());
+        assert!(extracted.join("pegcards.dll").is_file());
+        assert!(!extracted.join("msvcrt.dll").exists());
+    }
+
+    #[test]
+    fn an_x86_exe_is_still_rejected_as_the_wrong_architecture() {
+        let root = tmpdir("import_x86_rejected");
+        let src = tmpdir("import_x86_rejected_src");
+        fs::create_dir_all(&src).unwrap();
+        let exe = src.join("setup.exe");
+        write_stub_pe(&exe, MACHINE_X86, 0);
+
+        let mut lib = Library::open(&root).unwrap();
+        assert!(matches!(
+            lib.import_exe(&exe),
+            Err(LibraryError::NotArmPe(_))
+        ));
+    }
+
+    #[test]
+    fn guest_exe_and_dll_sniffing_disagree_only_on_the_dll_bit() {
+        let dir = tmpdir("sniff_dll_bit");
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("game.exe");
+        let dll = dir.join("cards.dll");
+        write_stub_pe(&exe, MACHINE_ARM, 0);
+        write_stub_pe(&dll, MACHINE_ARM, IMAGE_FILE_DLL);
+
+        assert!(is_guest_exe(&exe));
+        assert!(!is_guest_dll(&exe));
+        assert!(is_guest_dll(&dll));
+        // The important half: a satellite DLL must never be picked as
+        // an entry point by the archive scans.
+        assert!(!is_guest_exe(&dll));
+
+        // A truncated file is neither.
+        let stub = dir.join("tiny.exe");
+        fs::write(&stub, b"MZ").unwrap();
+        assert!(!is_guest_exe(&stub));
+        assert!(!is_guest_dll(&stub));
+    }
+
+    #[test]
+    fn the_handheld_pc_screen_preference_is_480x320() {
+        assert_eq!(ScreenPref::Hpc.size(), (480, 320));
+        // Round-trips through the manifest, so an existing library
+        // keeps the setting across a restart.
+        let json = serde_json::to_string(&ScreenPref::Hpc).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ScreenPref>(&json).unwrap(),
+            ScreenPref::Hpc
+        );
     }
 }
