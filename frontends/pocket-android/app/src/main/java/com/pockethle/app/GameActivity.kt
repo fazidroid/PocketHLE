@@ -20,8 +20,6 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import org.json.JSONObject
 import android.content.pm.ActivityInfo
-import android.view.WindowInsets
-import android.view.WindowInsetsController
 
 /**
  * Hosts the emulator output for one game.
@@ -103,10 +101,15 @@ class GameActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        applyDisplayPreferences()
+        val config = readLauncherConfig()
+        fullscreen = config.fullscreen
+        requestedOrientation = orientationFor(config.orientation)
         setContentView(R.layout.activity_game)
         setSupportActionBar(findViewById<Toolbar>(R.id.toolbar))
-        findViewById<Toolbar>(R.id.toolbar).visibility = if (fullscreen) View.GONE else View.VISIBLE
+        if (fullscreen) {
+            findViewById<Toolbar>(R.id.toolbar).visibility = View.GONE
+            hideSystemBars()
+        }
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
 
         val name = intent.getStringExtra(EXTRA_GAME_NAME) ?: "PocketHLE"
@@ -331,33 +334,26 @@ class GameActivity : AppCompatActivity() {
         }.getOrDefault(true)
     }
 
-    private fun applyDisplayPreferences() {
-        val config = readLauncherConfig()
-        fullscreen = config.fullscreen
-        requestedOrientation = when (config.orientation) {
-            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        }
-        if (fullscreen) hideSystemBars()
+    private fun orientationFor(value: String): Int = when (value) {
+        "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     }
 
     private fun hideSystemBars() {
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-            window.insetsController?.let { controller ->
-                controller.hide(WindowInsets.Type.systemBars())
-                controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                View.SYSTEM_UI_FLAG_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            )
+        window.decorView.setOnSystemUiVisibilityChangeListener { visibility ->
+            if (fullscreen && visibility and View.SYSTEM_UI_FLAG_FULLSCREEN == 0) {
+                hideSystemBars()
             }
-        } else {
-            @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = (
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
-                    View.SYSTEM_UI_FLAG_FULLSCREEN or
-                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
-                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                )
         }
     }
 

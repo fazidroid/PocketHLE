@@ -332,10 +332,16 @@ pub struct LauncherConfig {
     pub show_fps: bool,
     #[serde(default)]
     pub fullscreen: bool,
+    #[serde(default = "default_orientation")]
+    pub orientation: String,
 }
 
 fn default_show_fps() -> bool {
     true
+}
+
+fn default_orientation() -> String {
+    "auto".to_string()
 }
 
 impl Default for LauncherConfig {
@@ -347,6 +353,7 @@ impl Default for LauncherConfig {
             last_import_dir: None,
             show_fps: default_show_fps(),
             fullscreen: false,
+            orientation: default_orientation(),
         }
     }
 }
@@ -1605,6 +1612,11 @@ mod tests {
         let lib2 = Library::open(&root).unwrap();
         assert_eq!(lib2.config().verbosity, 2);
         assert!(!lib2.config().show_fps);
+
+        lib.config_mut().orientation = "landscape".to_string();
+        lib.save().unwrap();
+        let lib3 = Library::open(&root).unwrap();
+        assert_eq!(lib3.config().orientation, "landscape");
     }
 
     #[test]
