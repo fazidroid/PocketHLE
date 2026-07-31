@@ -1111,7 +1111,7 @@ impl Process {
         let stack_top = DEFAULT_STACK_TOP;
         let dynamic_exports = build_dynamic_exports(&thunks);
         let stack_base = stack_top - stack_size;
-        cpu.map_region(stack_base, stack_size, Prot::READ | Prot::WRITE)?;
+        cpu.map_region(stack_base, stack_size + 0x1000, Prot::READ | Prot::WRITE)?;
         cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
         cpu.write_reg(ArmReg::Lr, PROCESS_EXIT_TRAMPOLINE_VA)?;
         if image.machine != machine::MIPS_R3000
