@@ -27,7 +27,7 @@
             android:name=".GameActivity"
             android:exported="false"
             android:configChanges="orientation|keyboardHidden|screenSize"
-            android:screenOrientation="portrait"
+            android:screenOrientation="unspecified"
             android:label="@string/app_name" />
         <activity
             android:name=".SettingsActivity"

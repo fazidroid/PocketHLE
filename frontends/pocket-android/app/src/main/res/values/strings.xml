@@ -47,6 +47,10 @@
     <string name="pref_verbosity_summary">0=quiet, 3=trace</string>
     <string name="pref_show_fps_title">Show FPS counter</string>
     <string name="pref_show_fps_summary">Overlay frames-per-second on top of the running game (j2me-loader style).</string>
+    <string name="pref_fullscreen_title">Fullscreen without system bars</string>
+    <string name="pref_fullscreen_summary">Hide the status and navigation bars while a game is running.</string>
+    <string name="pref_orientation_title">Android orientation</string>
+    <string name="pref_orientation_summary">Choose automatic rotation, portrait, or landscape for games.</string>
     <string name="pref_library_root_title">Library root</string>
     <string name="pref_cpu_backend_title">CPU backend</string>
     <string name="pref_max_slices_title">Max dispatch slices</string>
@@ -74,5 +78,15 @@
         <item>landscape</item>
         <item>small_portrait</item>
         <item>wvga</item>
+    </string-array>
+    <string-array name="orientation_entries">
+        <item>Automatic</item>
+        <item>Portrait</item>
+        <item>Landscape</item>
+    </string-array>
+    <string-array name="orientation_values">
+        <item>auto</item>
+        <item>portrait</item>
+        <item>landscape</item>
     </string-array>
 </resources>

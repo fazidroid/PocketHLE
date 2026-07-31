@@ -82,14 +82,9 @@ data class LauncherConfig(
     val defaultCpuBackend: String,
     val verbosity: Int,
     val lastImportDir: String?,
-    /**
-     * Render a j2me-loader-style FPS counter on top of the
-     * in-game framebuffer. Defaults to `true` to mirror the Rust
-     * side ([`pocket_library::LauncherConfig::show_fps`]); legacy
-     * `config.json` files that pre-date this field are upgraded
-     * with the same default.
-     */
     val showFps: Boolean,
+    val fullscreen: Boolean,
+    val orientation: String,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("schema_version", schemaVersion)
@@ -97,6 +92,8 @@ data class LauncherConfig(
         put("verbosity", verbosity)
         if (lastImportDir != null) put("last_import_dir", lastImportDir) else put("last_import_dir", JSONObject.NULL)
         put("show_fps", showFps)
+        put("fullscreen", fullscreen)
+        put("orientation", orientation)
     }
 
     companion object {
@@ -106,6 +103,8 @@ data class LauncherConfig(
             verbosity = 1,
             lastImportDir = null,
             showFps = true,
+            fullscreen = false,
+            orientation = "auto",
         )
 
         fun fromJson(obj: JSONObject): LauncherConfig = LauncherConfig(
@@ -114,6 +113,8 @@ data class LauncherConfig(
             verbosity = obj.optInt("verbosity", 1),
             lastImportDir = obj.optString("last_import_dir").takeIf { !obj.isNull("last_import_dir") && it.isNotEmpty() },
             showFps = obj.optBoolean("show_fps", true),
+            fullscreen = obj.optBoolean("fullscreen", false),
+            orientation = obj.optString("orientation", "auto"),
         )
     }
 }

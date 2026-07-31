@@ -403,6 +403,13 @@ impl PocketLauncher {
                 ui.checkbox(&mut draft.show_fps, "");
                 ui.end_row();
 
+                ui.label("Borderless fullscreen");
+                if ui.checkbox(&mut draft.fullscreen, "").changed() {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Fullscreen(draft.fullscreen));
+                }
+                ui.end_row();
+
                 ui.label("Library root");
                 ui.label(library_root);
                 ui.end_row();
@@ -598,7 +605,9 @@ impl PocketLauncher {
             .max(1.0);
         let display_size = size * scale;
         let (rect, response) = ui.allocate_exact_size(display_size, Sense::click_and_drag());
-        let image = egui::Image::from_texture(&tex).fit_to_exact_size(display_size);
+        let image = egui::Image::from_texture(&tex)
+            .fit_to_exact_size(display_size)
+            .texture_options(egui::TextureOptions::NEAREST);
         image.paint_at(ui, rect);
         // The j2me-loader-style FPS overlay is opt-in: gated on the
         // launcher's `show_fps` config flag so users who find a

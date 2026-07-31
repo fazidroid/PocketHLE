@@ -61,6 +61,22 @@ class SettingsActivity : AppCompatActivity() {
                     true
                 }
             }
+            findPreference<SwitchPreferenceCompat>("fullscreen")?.apply {
+                isChecked = current.fullscreen
+                setOnPreferenceChangeListener { _, newValue ->
+                    current = current.copy(fullscreen = newValue as Boolean)
+                    writeConfig()
+                    true
+                }
+            }
+            findPreference<ListPreference>("orientation")?.apply {
+                value = current.orientation
+                setOnPreferenceChangeListener { _, newValue ->
+                    current = current.copy(orientation = newValue.toString())
+                    writeConfig()
+                    true
+                }
+            }
             findPreference<Preference>("library_root")?.summary = rootDir
         }
 

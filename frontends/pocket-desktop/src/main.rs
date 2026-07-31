@@ -36,6 +36,7 @@ fn main() -> Result<()> {
             }))
             .with_inner_size([960.0, 600.0])
             .with_min_inner_size([640.0, 420.0])
+            .with_fullscreen(library.config().fullscreen)
             .with_title("PocketHLE"),
         ..Default::default()
     };

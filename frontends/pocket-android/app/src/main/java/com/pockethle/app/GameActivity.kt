@@ -19,6 +19,9 @@ import androidx.appcompat.widget.Toolbar
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import org.json.JSONObject
+import android.content.pm.ActivityInfo
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 
 /**
  * Hosts the emulator output for one game.
@@ -68,6 +71,8 @@ class GameActivity : AppCompatActivity() {
      * applies its `Settings.showFps` snapshot at MIDlet start. */
     private var showFps: Boolean = true
 
+    private var fullscreen: Boolean = false
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /** Polling tick. ~30 Hz keeps the SurfaceView smooth without
@@ -98,6 +103,7 @@ class GameActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyDisplayPreferences()
         setContentView(R.layout.activity_game)
         setSupportActionBar(findViewById<Toolbar>(R.id.toolbar))
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
@@ -138,6 +144,11 @@ class GameActivity : AppCompatActivity() {
         status.text = "Backend: Unicorn (ARM)\nRunning…"
         // The spinner gets hidden the moment the first frame arrives.
         mainHandler.postDelayed(pollTick, POLL_INTERVAL_MS)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && fullscreen) hideSystemBars()
     }
 
     override fun onSupportNavigateUp(): Boolean {
@@ -319,6 +330,45 @@ class GameActivity : AppCompatActivity() {
         }.getOrDefault(true)
     }
 
+    private fun applyDisplayPreferences() {
+        val config = readLauncherConfig()
+        fullscreen = config.fullscreen
+        requestedOrientation = when (config.orientation) {
+            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+        if (fullscreen) hideSystemBars()
+    }
+
+    private fun hideSystemBars() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            window.insetsController?.let { controller ->
+                controller.hide(WindowInsets.Type.systemBars())
+                controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                )
+        }
+    }
+
+    private fun readLauncherConfig(): LauncherConfig {
+        val raw = NativeBridge.readConfig(LibraryPaths.root(this))
+        return runCatching {
+            val obj = JSONObject(raw)
+            if (obj.has("ok") && !obj.optBoolean("ok", true)) LauncherConfig.default()
+            else LauncherConfig.fromJson(obj)
+        }.getOrDefault(LauncherConfig.default())
+    }
+
     /**
      * j2me-loader-inspired FPS sampler. `recordFrame()` is called
      * once per painted frame; every full second of wall-clock the
@@ -491,6 +541,8 @@ class GameActivity : AppCompatActivity() {
         private var samplerHandle = 0
         private var textureWidth = 0
         private var textureHeight = 0
+        private var viewportWidth = 1
+        private var viewportHeight = 1
 
         fun submit(frame: FrameSnapshot) {
             pending = frame
@@ -503,8 +555,8 @@ class GameActivity : AppCompatActivity() {
             GLES20.glGenTextures(1, textures, 0)
             texture = textures[0]
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture)
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
             vertexBuffer = java.nio.ByteBuffer.allocateDirect(VERTICES.size * 4)
@@ -517,6 +569,8 @@ class GameActivity : AppCompatActivity() {
 
         override fun onSurfaceChanged(gl: javax.microedition.khronos.opengles.GL10?, width: Int, height: Int) {
             GLES20.glViewport(0, 0, width, height)
+            viewportWidth = width
+            viewportHeight = height
         }
 
         override fun onDrawFrame(gl: javax.microedition.khronos.opengles.GL10?) {
@@ -533,7 +587,21 @@ class GameActivity : AppCompatActivity() {
             } else {
                 GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, frame.width, frame.height, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, pixels)
             }
+            val scale = minOf(viewportWidth.toFloat() / frame.width, viewportHeight.toFloat() / frame.height)
+            val drawnWidth = frame.width * scale
+            val drawnHeight = frame.height * scale
+            val left = (viewportWidth - drawnWidth) / viewportWidth - 1f
+            val right = (viewportWidth + drawnWidth) / viewportWidth - 1f
+            val bottom = 1f - (viewportHeight + drawnHeight) / viewportHeight
+            val top = 1f - (viewportHeight - drawnHeight) / viewportHeight
             vertexBuffer?.let { buffer ->
+                buffer.clear()
+                buffer.put(floatArrayOf(
+                    left, bottom, 0f, 1f,
+                    right, bottom, 1f, 1f,
+                    left, top, 0f, 0f,
+                    right, top, 1f, 0f,
+                ))
                 buffer.position(0)
                 GLES20.glEnableVertexAttribArray(positionHandle)
                 GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 16, buffer)

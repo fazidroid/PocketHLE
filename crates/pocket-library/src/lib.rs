@@ -330,6 +330,8 @@ pub struct LauncherConfig {
     /// settings.
     #[serde(default = "default_show_fps")]
     pub show_fps: bool,
+    #[serde(default)]
+    pub fullscreen: bool,
 }
 
 fn default_show_fps() -> bool {
@@ -344,6 +346,7 @@ impl Default for LauncherConfig {
             verbosity: 1,
             last_import_dir: None,
             show_fps: default_show_fps(),
+            fullscreen: false,
         }
     }
 }

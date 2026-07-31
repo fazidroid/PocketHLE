@@ -25,6 +25,20 @@
         android:summary="@string/pref_show_fps_summary"
         android:defaultValue="true" />
 
+    <SwitchPreferenceCompat
+        android:key="fullscreen"
+        android:title="@string/pref_fullscreen_title"
+        android:summary="@string/pref_fullscreen_summary"
+        android:defaultValue="false" />
+
+    <ListPreference
+        android:key="orientation"
+        android:title="@string/pref_orientation_title"
+        android:summary="@string/pref_orientation_summary"
+        android:entries="@array/orientation_entries"
+        android:entryValues="@array/orientation_values"
+        android:defaultValue="auto" />
+
     <Preference
         android:key="library_root"
         android:title="@string/pref_library_root_title"
