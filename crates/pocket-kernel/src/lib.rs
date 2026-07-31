@@ -24,8 +24,8 @@ use indexmap::IndexMap;
 use thiserror::Error;
 
 use pocket_cpu::{
-    dump_mem_around, dump_regs, dump_stack_code_addrs, regs::ArmReg, Arch, Cpu, CpuError,
-    FastMemOp, Prot, StopReason,
+    dump_mem_around, dump_regs, dump_stack_code_addrs, regs::ArmReg, Arch, Cpu, CpuError, Prot,
+    StopReason,
 };
 use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
@@ -1025,18 +1025,16 @@ impl Process {
             // callback overhead. Everything else falls back to the
             // original `bx lr` + code-hook path so the dispatcher can
             // service the call from Rust.
-            let native_name: Option<String> = match (&imp.binding, &friendly_name) {
-                (_, Some(n)) => Some(n.clone()),
-                (ImportBinding::Name(n), _) => Some(n.clone()),
+            let native_name: Option<&str> = match (&imp.binding, &friendly_name) {
+                (_, Some(n)) => Some(n.as_str()),
+                (ImportBinding::Name(n), _) => Some(n.as_str()),
                 _ => None,
             };
             let native =
                 if image.machine == machine::MIPS_R3000 || image.machine == machine::MIPS_R4000 {
                     None
                 } else {
-                    native_name
-                        .as_deref()
-                        .and_then(|n| native_thunks::native_thunk_for(&imp.dll, n))
+                    native_name.and_then(|n| native_thunks::native_thunk_for(&imp.dll, n))
                 };
             // Build the thunk metadata up front so we can query the
             // dispatcher for a constant-return shortcut.
@@ -1045,7 +1043,7 @@ impl Process {
                 iat_va: imp.iat_va,
                 dll: imp.dll.clone(),
                 binding: imp.binding.clone(),
-                friendly_name: friendly_name.clone(),
+                friendly_name,
             };
             // Pure constant-returning stubs (`zero_returning` /
             // `one_returning`) get a `mov r0, #imm; bx lr` patched
@@ -1070,23 +1068,7 @@ impl Process {
                     chunk.copy_from_slice(bytes);
                 }
                 cpu.write_mem(thunk_va, &buf)?;
-                let fast_mem = if cpu.arch() == Arch::Arm {
-                    match native_name.as_deref() {
-                        Some("memcpy") => Some(FastMemOp::Memcpy),
-                        Some("memmove") => Some(FastMemOp::Memmove),
-                        Some("memset") => Some(FastMemOp::Memset),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                if let Some(op) = fast_mem {
-                    if cpu.add_fast_mem_hook(thunk_va, op).is_err() {
-                        cpu.add_code_hook(thunk_va)?;
-                    }
-                } else {
-                    cpu.add_code_hook(thunk_va)?;
-                }
+                cpu.add_code_hook(thunk_va)?;
             }
             let mut iat_bytes = [0u8; 4];
             LittleEndian::write_u32(&mut iat_bytes, thunk_va);
@@ -1523,12 +1505,6 @@ pub fn run_main_loop_with_hook(
             StopReason::InstructionLimit => {
                 pc = cpu.read_reg(ArmReg::Pc)?;
                 log::trace!("instruction slice exhausted; resuming at 0x{pc:08x}");
-                continue;
-            }
-            StopReason::FastMem(addr) => {
-                let lr = cpu.read_reg(ArmReg::Lr)?;
-                pc = lr;
-                log::trace!("fast memory helper 0x{addr:08x}; resuming at 0x{pc:08x}");
                 continue;
             }
             StopReason::Hook(addr) => {

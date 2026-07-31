@@ -125,22 +125,10 @@ pub enum StopReason {
     InstructionLimit,
     /// One of the registered hooks fired.
     Hook(u32),
-    /// A backend-native fast memory helper completed.
-    FastMem(u32),
     /// `Cpu::request_stop` was called.
     Requested,
     /// The CPU executed beyond mapped memory.
     OutOfBounds,
-}
-
-/// Guest memory operation that can be handled inside the Unicorn code hook.
-/// Keeping the operation in the CPU backend avoids a stop/resume cycle for
-/// bulk CRT copies while preserving the guest ABI exactly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FastMemOp {
-    Memcpy,
-    Memmove,
-    Memset,
 }
 
 /// Common interface to a CPU emulation backend.
@@ -249,14 +237,6 @@ pub trait Cpu {
     /// emulation when the PC reaches it. Used to install IAT thunks
     /// for unimplemented imports.
     fn add_code_hook(&mut self, va: u32) -> Result<(), CpuError>;
-
-    /// Register a backend-native implementation for a hot guest memory
-    /// helper. Backends that do not provide one use the normal dispatch
-    /// path; the Unicorn backend handles the operation while its code
-    /// hook is already active, avoiding a stop/resume round-trip.
-    fn add_fast_mem_hook(&mut self, _va: u32, _op: FastMemOp) -> Result<(), CpuError> {
-        Err(CpuError::Unsupported("fast memory hook"))
-    }
 
     /// Run starting at `start_va` until either an [`StopReason::Hook`]
     /// fires, `max_instructions` is reached, or `request_stop` is

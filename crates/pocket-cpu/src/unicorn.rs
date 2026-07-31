@@ -4,14 +4,13 @@
 //! this is the authoritative ARM backend used at runtime.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
 use ::unicorn_engine::unicorn_const::{Arch as UcArch, Mode, Prot as UcProt};
 use ::unicorn_engine::{RegisterARM, RegisterMIPS, Unicorn};
 
-use crate::{regs::ArmReg, Arch, Cpu, CpuError, FastMemOp, Prot, StopReason};
+use crate::{regs::ArmReg, Arch, Cpu, CpuError, Prot, StopReason};
 
 pub struct UnicornCpu {
     uc: Unicorn<'static, ()>,
@@ -21,10 +20,6 @@ pub struct UnicornCpu {
     /// faulting address instead of just the access kind.
     last_fault: Rc<RefCell<Option<(String, u64)>>>,
     stop_requested: Rc<RefCell<bool>>,
-    last_fast_mem: Rc<RefCell<Option<u32>>>,
-    fast_mem_hooks: Rc<RefCell<HashMap<u32, FastMemOp>>>,
-    fast_mem_scratch: Rc<RefCell<Vec<u8>>>,
-    fast_mem_error: Rc<RefCell<Option<String>>>,
     arch: Arch,
     mips_status: u32,
 }
@@ -99,10 +94,6 @@ impl UnicornCpu {
             last_fault,
             last_hook: Rc::new(RefCell::new(None)),
             stop_requested: Rc::new(RefCell::new(false)),
-            last_fast_mem: Rc::new(RefCell::new(None)),
-            fast_mem_hooks: Rc::new(RefCell::new(HashMap::new())),
-            fast_mem_scratch: Rc::new(RefCell::new(Vec::new())),
-            fast_mem_error: Rc::new(RefCell::new(None)),
             mips_status: 0,
         })
     }
@@ -301,75 +292,12 @@ impl Cpu for UnicornCpu {
             .map_err(|e| CpuError::Backend(format!("add_code_hook: {e:?}")))
     }
 
-    fn add_fast_mem_hook(&mut self, va: u32, op: FastMemOp) -> Result<(), CpuError> {
-        if self.arch != Arch::Arm {
-            return Err(CpuError::Unsupported("fast memory hook on non-ARM backend"));
-        }
-        self.fast_mem_hooks.borrow_mut().insert(va, op);
-        let hooks = self.fast_mem_hooks.clone();
-        let last = self.last_fast_mem.clone();
-        let stop = self.stop_requested.clone();
-        let error = self.fast_mem_error.clone();
-        let scratch = self.fast_mem_scratch.clone();
-        let cb = move |uc: &mut Unicorn<'_, ()>, _addr: u64, _size: u32| {
-            let Some(op) = hooks.borrow().get(&va).copied() else {
-                return;
-            };
-            let result = (|| -> Result<(), String> {
-                let dst = uc
-                    .reg_read(RegisterARM::R0)
-                    .map_err(|e| format!("read fast-memory destination: {e:?}"))?
-                    as u32;
-                let arg = uc
-                    .reg_read(RegisterARM::R1)
-                    .map_err(|e| format!("read fast-memory source/value: {e:?}"))?
-                    as u32;
-                let len = uc
-                    .reg_read(RegisterARM::R2)
-                    .map_err(|e| format!("read fast-memory length: {e:?}"))?
-                    as usize;
-                let mut bytes = scratch.borrow_mut();
-                if bytes.len() < len {
-                    bytes.resize(len, 0);
-                }
-                match op {
-                    FastMemOp::Memcpy | FastMemOp::Memmove => {
-                        uc.mem_read(arg as u64, &mut bytes[..len])
-                            .map_err(|e| format!("read fast-memory source: {e:?}"))?;
-                        uc.mem_write(dst as u64, &bytes[..len])
-                            .map_err(|e| format!("write fast-memory destination: {e:?}"))?;
-                    }
-                    FastMemOp::Memset => {
-                        bytes[..len].fill(arg as u8);
-                        uc.mem_write(dst as u64, &bytes[..len])
-                            .map_err(|e| format!("write fast-memory destination: {e:?}"))?;
-                    }
-                }
-                uc.reg_write(RegisterARM::R0, dst as u64)
-                    .map_err(|e| format!("write fast-memory return value: {e:?}"))?;
-                Ok(())
-            })();
-            if let Err(message) = result {
-                *error.borrow_mut() = Some(message);
-            }
-            *last.borrow_mut() = Some(va);
-            *stop.borrow_mut() = true;
-            let _ = uc.emu_stop();
-        };
-        self.uc
-            .add_code_hook(va as u64, va as u64, cb)
-            .map(|_| ())
-            .map_err(|e| CpuError::Backend(format!("add_fast_mem_hook: {e:?}")))
-    }
-
     fn run_until_hook(
         &mut self,
         start_va: u32,
         _max_instructions: u64,
     ) -> Result<StopReason, CpuError> {
         *self.last_hook.borrow_mut() = None;
-        *self.last_fast_mem.borrow_mut() = None;
-        *self.fast_mem_error.borrow_mut() = None;
         *self.stop_requested.borrow_mut() = false;
         // IMPORTANT: run with `count = 0` (no instruction limit) so the
         // QEMU TCG keeps chaining translation blocks at full speed. A
@@ -384,12 +312,6 @@ impl Cpu for UnicornCpu {
             slice_watchdog_us(), // timeout (us); 0 = no timeout
             0,                   // count = 0 → keep TB chaining (do NOT pass a limit)
         );
-        if let Some(message) = self.fast_mem_error.borrow_mut().take() {
-            return Err(CpuError::Backend(format!("fast memory hook: {message}")));
-        }
-        if let Some(addr) = *self.last_fast_mem.borrow() {
-            return Ok(StopReason::FastMem(addr));
-        }
         if let Some(addr) = *self.last_hook.borrow() {
             return Ok(StopReason::Hook(addr));
         }
