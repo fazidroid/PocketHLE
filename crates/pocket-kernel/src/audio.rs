@@ -41,7 +41,7 @@ use std::time::Instant;
 /// stereo this is just over a second — plenty to absorb scheduling
 /// jitter, but small enough that overflows produce dropped samples
 /// instead of unbounded memory growth.
-const RING_CAPACITY_SAMPLES: usize = 1 << 17; // 131072
+const RING_CAPACITY_SAMPLES: usize = 1 << 20; // 1048576
 
 /// Audio format last requested by the guest. We remember it so the
 /// cpal callback can decide whether to upsample or play 1:1.
@@ -82,8 +82,13 @@ struct Shared {
     read: usize,
     /// Write cursor.
     write: usize,
-    /// Format the guest most recently requested.
+    /// Format of the most recently submitted guest stream.
     guest_format: GuestFormat,
+    /// Stable output format used by host frontends for the lifetime of
+    /// the audio session. Android AudioTrack must not be reconfigured
+    /// halfway through a session when another waveOut device opens.
+    mix_format: GuestFormat,
+    mix_format_ready: bool,
     /// Track whether the guest explicitly opened audio so Android does
     /// not build AudioTrack from the fallback format.
     guest_format_ready: bool,
@@ -126,6 +131,8 @@ impl Shared {
             read: 0,
             write: 0,
             guest_format: GuestFormat::default(),
+            mix_format: GuestFormat::default(),
+            mix_format_ready: false,
             guest_format_ready: false,
             resampler_phase: 0,
             written: 0,
@@ -445,9 +452,11 @@ impl AudioEngine {
     pub fn set_guest_format(&self, fmt: GuestFormat) {
         if let Ok(mut s) = self.shared.lock() {
             s.guest_format = fmt;
+            if !s.mix_format_ready {
+                s.mix_format = fmt;
+                s.mix_format_ready = true;
+            }
             s.guest_format_ready = true;
-            // Reset resampler phase on format change so the first
-            // sample of a new wave plays from t=0.
             s.resampler_phase = 0;
         }
     }
@@ -506,6 +515,9 @@ impl AudioEngine {
     pub fn flush(&self) {
         if let Ok(mut s) = self.shared.lock() {
             s.clear();
+            s.mix_format_ready = false;
+            s.guest_format_ready = false;
+            s.resampler_phase = 0;
         }
     }
 
@@ -644,7 +656,13 @@ impl AudioTap {
     pub fn guest_format(&self) -> GuestFormat {
         self.shared
             .lock()
-            .map(|s| s.guest_format)
+            .map(|s| {
+                if s.mix_format_ready {
+                    s.mix_format
+                } else {
+                    s.guest_format
+                }
+            })
             .unwrap_or_default()
     }
 
