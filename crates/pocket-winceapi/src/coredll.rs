@@ -160,6 +160,10 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "wcsstr", wcsstr);
     d.register_handler(dll, "_wtol", wtol);
     d.register_handler(dll, "_wtoi", wtol);
+    d.register_handler(dll, "CharUpperW", char_upper_w);
+    d.register_handler(dll, "CharLowerW", char_lower_w);
+    d.register_handler(dll, "CharUpperA", char_upper_a);
+    d.register_handler(dll, "CharLowerA", char_lower_a);
     d.register_handler(dll, "swprintf", swprintf);
     d.register_handler(dll, "wsprintfW", swprintf);
     d.register_handler(dll, "sprintf", sprintf);
@@ -200,6 +204,12 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetFileAttributesW", get_file_attributes_w);
     d.register_constant(dll, "CreateDirectoryW", 1, one_returning);
     d.register_handler(dll, "RemoveDirectoryW", remove_directory_w);
+    d.register_constant(dll, "CopyFileW", 1, one_returning);
+    d.register_constant(dll, "MoveFileW", 1, one_returning);
+    d.register_constant(dll, "SetEndOfFile", 1, one_returning);
+    d.register_constant(dll, "GetFileInformationByHandle", 0, zero_returning);
+    d.register_constant(dll, "OpenProcess", 0, zero_returning);
+    d.register_constant(dll, "GetExitCodeProcess", 1, one_returning);
 
     // ---- C-runtime style file I/O on top of the same VFS ----
     d.register_handler(dll, "fopen", crt_fopen);
@@ -333,6 +343,13 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "ReleaseCapture", 1, one_returning);
     d.register_constant(dll, "SetFocus", 1, one_returning);
     d.register_constant(dll, "SetWindowPos", 1, one_returning);
+    d.register_constant(dll, "AdjustWindowRectEx", 1, one_returning);
+    d.register_constant(dll, "MapWindowPoints", 1, one_returning);
+    d.register_constant(dll, "ClipCursor", 1, one_returning);
+    d.register_constant(dll, "SetCursorPos", 1, one_returning);
+    d.register_constant(dll, "GetSystemPaletteEntries", 0, zero_returning);
+    d.register_constant(dll, "RealizePalette", 1, one_returning);
+    d.register_constant(dll, "CreatePalette", 0xDEAD_5709, one_returning);
     d.register_handler(dll, "SetWindowTextW", set_window_text_w);
     d.register_handler(dll, "SetWindowTextA", set_window_text_a);
     d.register_handler(dll, "GetWindowTextW", get_window_text_w);
@@ -605,6 +622,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "InterlockedDecrement", interlocked_decrement);
     d.register_handler(dll, "InterlockedExchange", interlocked_exchange);
     d.register_handler(dll, "InterlockedExchangeAdd", interlocked_exchange_add);
+    d.register_handler(dll, "InterlockedTestExchange", interlocked_compare_exchange);
+    d.register_handler(dll, "GetSystemInfo", get_system_info);
+    d.register_constant(dll, "SetKMode", 1, one_returning);
     d.register_handler(
         dll,
         "InterlockedCompareExchange",
@@ -3294,6 +3314,64 @@ fn to_lower_w(c: u16) -> u16 {
     } else {
         c
     }
+}
+
+fn char_upper_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let chars = read_wstr(ctx, p, 0x10000)?;
+    let text = String::from_utf16_lossy(&chars);
+    let upper: String = text.to_uppercase();
+    ctx.cpu.write_mem(
+        p,
+        &upper
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(DispatchOutcome::ReturnedR0(p))
+}
+
+fn char_lower_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let chars = read_wstr(ctx, p, 0x10000)?;
+    let text = String::from_utf16_lossy(&chars);
+    let lower: String = text.to_lowercase();
+    ctx.cpu.write_mem(
+        p,
+        &lower
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(DispatchOutcome::ReturnedR0(p))
+}
+
+fn char_upper_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = read_cstr(ctx, p, 0x10000)?;
+    let upper: Vec<u8> = String::from_utf8_lossy(&bytes).to_uppercase().into_bytes();
+    ctx.cpu.write_mem(p, &upper)?;
+    Ok(DispatchOutcome::ReturnedR0(p))
+}
+
+fn char_lower_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = read_cstr(ctx, p, 0x10000)?;
+    let lower: Vec<u8> = String::from_utf8_lossy(&bytes).to_lowercase().into_bytes();
+    ctx.cpu.write_mem(p, &lower)?;
+    Ok(DispatchOutcome::ReturnedR0(p))
 }
 
 // ---------- file I/O ----------
@@ -7541,6 +7619,22 @@ fn tls_set_value(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     ctx.cpu
         .write_mem(USER_KDATA_TLS_ARRAY_VA + slot * 4, &value.to_le_bytes())?;
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn get_system_info(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p != 0 {
+        let mut data = [0u8; 36];
+        data[0..4].copy_from_slice(&36u32.to_le_bytes());
+        data[4..8].copy_from_slice(&1u32.to_le_bytes());
+        data[8..12].copy_from_slice(&1u32.to_le_bytes());
+        data[12..16].copy_from_slice(&5u32.to_le_bytes());
+        data[16..20].copy_from_slice(&0u32.to_le_bytes());
+        data[20..24].copy_from_slice(&1u32.to_le_bytes());
+        data[24..28].copy_from_slice(&4096u32.to_le_bytes());
+        ctx.cpu.write_mem(p, &data)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 // ---------- Interlocked / atomics ----------
