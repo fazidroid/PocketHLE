@@ -51,9 +51,6 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
      * repaint after `surfaceChanged` resizes the SurfaceView even if
      * the worker has not produced a new frame yet. */
     private var lastFrame: FrameSnapshot? = null
-    private var frameBitmap: Bitmap? = null
-    private var framePixels: IntArray = IntArray(0)
-    private var frameBuffer: ByteArray = ByteArray(0)
 
     /**
      * j2me-loader-style FPS counter. Counts frames painted to the
@@ -278,11 +275,9 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         if (w <= 0 || h <= 0) return null
         val pixelBytes = w * h * 4
         if (raw.size < 8 + pixelBytes) return null
-        if (frameBuffer.size != pixelBytes) {
-            frameBuffer = ByteArray(pixelBytes)
-        }
-        System.arraycopy(raw, 8, frameBuffer, 0, pixelBytes)
-        return FrameSnapshot(w, h, frameBuffer)
+        val rgba = ByteArray(pixelBytes)
+        System.arraycopy(raw, 8, rgba, 0, pixelBytes)
+        return FrameSnapshot(w, h, rgba)
     }
 
     private fun paintFrame(frame: FrameSnapshot) {
@@ -292,12 +287,8 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
             // Hide the spinner the moment we have something to draw.
             progress.visibility = View.GONE
             canvas.drawColor(Color.BLACK)
-            if (frameBitmap?.width != frame.width || frameBitmap?.height != frame.height) {
-                frameBitmap?.recycle()
-                frameBitmap = Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.ARGB_8888)
-                framePixels = IntArray(frame.width * frame.height)
-            }
-            val bitmap = frameBitmap ?: return
+            val bitmap = Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.ARGB_8888)
+            val pixelInts = IntArray(frame.width * frame.height)
             var i = 0
             var p = 0
             while (i + 3 < frame.rgba.size) {
@@ -305,10 +296,10 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 val g = frame.rgba[i + 1].toInt() and 0xff
                 val b = frame.rgba[i + 2].toInt() and 0xff
                 val a = frame.rgba[i + 3].toInt() and 0xff
-                framePixels[p++] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                pixelInts[p++] = (a shl 24) or (r shl 16) or (g shl 8) or b
                 i += 4
             }
-            bitmap.setPixels(framePixels, 0, frame.width, 0, 0, frame.width, frame.height)
+            bitmap.setPixels(pixelInts, 0, frame.width, 0, 0, frame.width, frame.height)
             val w = canvas.width
             val h = canvas.height
             val scale = minOf(
@@ -569,8 +560,8 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         private const val VK_TSOFT1 = 0xC1
         private const val VK_TSOFT2 = 0xC2
 
-        /** Polling cadence in ms. 16 ≈ 60 Hz. */
-        private const val POLL_INTERVAL_MS = 16L
+        /** Polling cadence in ms. 33 ≈ 30 Hz. */
+        private const val POLL_INTERVAL_MS = 33L
 
         /**
          * Font size of the FPS overlay drawn in [drawFpsOverlay].
