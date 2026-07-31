@@ -106,6 +106,7 @@ class GameActivity : AppCompatActivity() {
         applyDisplayPreferences()
         setContentView(R.layout.activity_game)
         setSupportActionBar(findViewById<Toolbar>(R.id.toolbar))
+        findViewById<Toolbar>(R.id.toolbar).visibility = if (fullscreen) View.GONE else View.VISIBLE
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
 
         val name = intent.getStringExtra(EXTRA_GAME_NAME) ?: "PocketHLE"
