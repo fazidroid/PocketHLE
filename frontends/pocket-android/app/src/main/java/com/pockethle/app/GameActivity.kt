@@ -515,7 +515,7 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     /**
      * Map a screen-space touch on the SurfaceView into the
-     * 240×320 game-space coordinates the kernel expects. Returns
+     * streamed game-space coordinates the kernel expects. Returns
      * `null` if the touch landed in the letter-box around the
      * scaled framebuffer.
      */
@@ -553,7 +553,7 @@ class GameActivity : AppCompatActivity(), SurfaceHolder.Callback {
         private const val VK_DOWN = 0x28
         private const val VK_LEFT = 0x25
         private const val VK_RIGHT = 0x27
-        private const val VK_RETURN = 0xD4 // Pocket PC center / Start.
+        private const val VK_RETURN = 0x0D // Host Enter; HLE remaps it to GAPI vkA.
         private const val VK_A = 0xD1
         private const val VK_B = 0xD2
         private const val VK_C = 0xD3

@@ -476,7 +476,11 @@ impl WinCeSetupScript {
                         script.install_dirs.push(dir);
                     }
                 } else if !structural.contains(&t.as_str()) {
-                    current_long = Some(t);
+                    if t.to_ascii_lowercase().ends_with(".lnk") {
+                        current_long = None;
+                    } else {
+                        current_long = Some(t);
+                    }
                 }
             }
             if let Some(source) = parm_value(line, "Source") {
@@ -754,19 +758,10 @@ pub fn materialise_setup_names(root: &Path, files: &[CabFile]) -> Vec<(PathBuf, 
     };
     let mut created = Vec::new();
     for (short, long) in &script.renames {
-        // `_setup.xml` sometimes spells the payload name slightly
-        // differently from the cabinet directory (case, or a stale
-        // stem), but the numeric extension `.001` / `.002` is assigned
-        // by the packer and always matches, so fall back to that.
-        let suffix = short.rsplit('.').next().unwrap_or(short);
-        let Some(src) = files.iter().find(|file| {
-            file.short_name.eq_ignore_ascii_case(short)
-                || file
-                    .short_name
-                    .rsplit('.')
-                    .next()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(suffix))
-        }) else {
+        let Some(src) = files
+            .iter()
+            .find(|file| file.short_name.eq_ignore_ascii_case(short))
+        else {
             log::debug!("_setup.xml names {short} but the cab has no such file; skipping");
             continue;
         };

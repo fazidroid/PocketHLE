@@ -51,6 +51,7 @@
     <string name="pref_cpu_backend_title">CPU backend</string>
     <string name="pref_max_slices_title">Max dispatch slices</string>
     <string name="pref_instr_per_slice_title">Instructions per slice</string>
+    <string name="pref_screen_title">Screen geometry</string>
     <string name="pref_halt_unimpl_title">Halt on unimplemented API</string>
     <string name="pref_halt_unimpl_summary">Stop the emulator the first time the guest hits an API that PocketHLE has not yet implemented.</string>
 
@@ -61,5 +62,17 @@
     <string-array name="cpu_backend_values">
         <item>stub</item>
         <item>unicorn</item>
+    </string-array>
+    <string-array name="screen_entries">
+        <item>240x320 (portrait)</item>
+        <item>320x240 (landscape)</item>
+        <item>176x220 (small)</item>
+        <item>480x800 (WVGA)</item>
+    </string-array>
+    <string-array name="screen_values">
+        <item>portrait</item>
+        <item>landscape</item>
+        <item>small_portrait</item>
+        <item>wvga</item>
     </string-array>
 </resources>

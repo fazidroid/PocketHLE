@@ -486,6 +486,7 @@ impl PocketLauncher {
                             ScreenPref::Portrait,
                             ScreenPref::Landscape,
                             ScreenPref::SmallPortrait,
+                            ScreenPref::Wvga,
                         ] {
                             ui.selectable_value(&mut draft.screen, pref, pref.label());
                         }

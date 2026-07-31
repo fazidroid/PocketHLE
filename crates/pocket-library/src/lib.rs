@@ -218,6 +218,8 @@ pub enum ScreenPref {
     Landscape,
     /// 176x220 — the small Smartphone panel.
     SmallPortrait,
+    /// 480x800 WVGA Windows Phone display.
+    Wvga,
 }
 
 impl ScreenPref {
@@ -226,6 +228,7 @@ impl ScreenPref {
             ScreenPref::Portrait => "240x320 (portrait)",
             ScreenPref::Landscape => "320x240 (landscape)",
             ScreenPref::SmallPortrait => "176x220 (small)",
+            ScreenPref::Wvga => "480x800 (WVGA)",
         }
     }
 
@@ -235,6 +238,7 @@ impl ScreenPref {
             ScreenPref::Portrait => (240, 320),
             ScreenPref::Landscape => (320, 240),
             ScreenPref::SmallPortrait => (176, 220),
+            ScreenPref::Wvga => (480, 800),
         }
     }
 }
@@ -519,24 +523,57 @@ impl Library {
             header.as_ref().and_then(|h| h.app_name.as_deref()),
         );
 
-        // Pick the largest ARM PE32 executable as the entry point.
-        let mut best: Option<(PathBuf, u64)> = None;
-        for f in &files {
-            let lower = f.short_name.to_ascii_lowercase();
-            // Skip obvious non-executables. WinCE installer files like
-            // `.000` headers must never be treated as the game .exe.
-            if lower.ends_with(".000") || lower.ends_with(".dll") {
-                continue;
+        let setup = files
+            .iter()
+            .find(|f| f.short_name.eq_ignore_ascii_case("_setup.xml"))
+            .and_then(|f| fs::read(&f.extracted_path).ok())
+            .map(|bytes| pocket_cab::WinCeSetupScript::parse_bytes(&bytes));
+        let materialised_exe = setup.as_ref().and_then(|script| {
+            let by_basename = |name: &str| {
+                long_names.iter().find_map(|(_, path)| {
+                    let basename = path.file_name()?.to_string_lossy();
+                    (basename.eq_ignore_ascii_case(name) && is_arm_pe(path).unwrap_or(false))
+                        .then_some(path.clone())
+                })
+            };
+            if let Some(target) = &script.shortcut_target {
+                let name = target.rsplit(['\\', '/']).next().unwrap_or(target);
+                if name.to_ascii_lowercase().ends_with(".exe") {
+                    if let Some(path) = by_basename(name) {
+                        return Some(path);
+                    }
+                }
             }
-            // Cheap PE check — read the first bytes and look for "MZ".
-            if !is_pe_file(&f.extracted_path) {
-                continue;
+            script
+                .renames
+                .iter()
+                .filter(|(_, name)| name.to_ascii_lowercase().ends_with(".exe"))
+                .filter_map(|(_, name)| by_basename(name))
+                .max_by_key(|path| fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+        });
+        let (mut exe_abs, _) = if let Some(path) = materialised_exe {
+            (
+                path.clone(),
+                fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            )
+        } else {
+            // Legacy cabinets without setup.xml do not provide long-name
+            // mappings, so retain the size-based PE fallback.
+            let mut best: Option<(PathBuf, u64)> = None;
+            for f in &files {
+                let lower = f.short_name.to_ascii_lowercase();
+                if lower.ends_with(".000") || lower.ends_with(".dll") {
+                    continue;
+                }
+                if !is_pe_file(&f.extracted_path) {
+                    continue;
+                }
+                if best.as_ref().map(|(_, sz)| *sz).unwrap_or(0) < f.size {
+                    best = Some((f.extracted_path.clone(), f.size));
+                }
             }
-            if best.as_ref().map(|(_, sz)| *sz).unwrap_or(0) < f.size {
-                best = Some((f.extracted_path.clone(), f.size));
-            }
-        }
-        let (mut exe_abs, _) = best.ok_or(LibraryError::NoExecutable)?;
+            best.ok_or(LibraryError::NoExecutable)?
+        };
         // Prefer the long name `_setup.xml` asked for: that is what the
         // installer would have written on the device, and it is the name
         // `GetModuleFileNameW` reports to the game.
@@ -569,7 +606,11 @@ impl Library {
             imported_at: now_unix_seconds(),
             settings: GameSettings {
                 cpu_backend: self.config.default_cpu_backend,
-                screen: guess_screen(&exe_abs, &files),
+                screen: guess_screen(
+                    &exe_abs,
+                    &files,
+                    header.as_ref().and_then(|h| h.app_name.as_deref()),
+                ),
                 ..GameSettings::default()
             },
             icon: extract_icon_png(&game_dir, &exe_abs),
@@ -1168,9 +1209,17 @@ fn extract_icon_png(game_dir: &Path, exe_abs: &Path) -> Option<PathBuf> {
 /// `entry_point` is checked first because it is the long name restored
 /// from `_setup.xml`; the raw cabinet entries only carry generated 8.3
 /// names like `ASPHAL~1.001`, which say nothing about the device.
-fn guess_screen(entry_point: &Path, files: &[pocket_cab::CabFile]) -> ScreenPref {
+fn guess_screen(
+    entry_point: &Path,
+    files: &[pocket_cab::CabFile],
+    app_name: Option<&str>,
+) -> ScreenPref {
     const LANDSCAPE_TAGS: [&str; 5] = ["moto_q", "motoq", "_q9", "_q8", "_q11"];
+    const WVGA_TAGS: [&str; 7] = [
+        "wvga", "touch_hd", "hd2", "hd7", "hd_game", "480x800", "asphalt4",
+    ];
     let names = std::iter::once(entry_point.to_path_buf())
+        .chain(app_name.map(PathBuf::from))
         .chain(files.iter().map(|f| f.extracted_path.clone()))
         .filter_map(|p| {
             p.file_name()
@@ -1179,6 +1228,9 @@ fn guess_screen(entry_point: &Path, files: &[pocket_cab::CabFile]) -> ScreenPref
     for name in names {
         if LANDSCAPE_TAGS.iter().any(|tag| name.contains(tag)) {
             return ScreenPref::Landscape;
+        }
+        if WVGA_TAGS.iter().any(|tag| name.contains(tag)) {
+            return ScreenPref::Wvga;
         }
     }
     ScreenPref::default()

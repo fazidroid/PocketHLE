@@ -80,6 +80,14 @@ class GameSettingsActivity : AppCompatActivity() {
                     } else false
                 }
             }
+            findPreference<ListPreference>("screen")?.apply {
+                value = current.screen
+                setOnPreferenceChangeListener { _, newValue ->
+                    current = current.copy(screen = newValue.toString())
+                    writeGameSettings()
+                    true
+                }
+            }
             findPreference<SwitchPreferenceCompat>("halt_on_unimplemented")?.apply {
                 isChecked = current.haltOnUnimplemented
                 setOnPreferenceChangeListener { _, newValue ->

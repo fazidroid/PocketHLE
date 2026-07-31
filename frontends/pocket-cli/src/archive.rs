@@ -129,8 +129,10 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     materialise_long_names(tmp.path(), &files, &setup);
     materialise_legacy_names(tmp.path(), &files, header.as_ref());
 
-    materialise_legacy_install_names(tmp.path(), &files, header.as_ref());
-    materialise_legacy_install_files(tmp.path(), &files, header.as_ref());
+    if setup.is_none() {
+        materialise_legacy_install_names(tmp.path(), &files, header.as_ref());
+        materialise_legacy_install_files(tmp.path(), &files, header.as_ref());
+    }
 
     let exe_path = match find_main_exe(&files, &setup, header.as_ref()) {
         Some(p) => p,

@@ -13,13 +13,20 @@
         android:key="max_slices"
         android:title="@string/pref_max_slices_title"
         android:inputType="number"
-        android:defaultValue="1024" />
+        android:defaultValue="50000000" />
 
     <EditTextPreference
         android:key="instructions_per_slice"
         android:title="@string/pref_instr_per_slice_title"
         android:inputType="number"
         android:defaultValue="1000000" />
+
+    <ListPreference
+        android:key="screen"
+        android:title="@string/pref_screen_title"
+        android:entries="@array/screen_entries"
+        android:entryValues="@array/screen_values"
+        android:defaultValue="portrait" />
 
     <SwitchPreferenceCompat
         android:key="halt_on_unimplemented"

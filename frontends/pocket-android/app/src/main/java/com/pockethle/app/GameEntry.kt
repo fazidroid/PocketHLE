@@ -48,27 +48,31 @@ data class GameSettings(
     val maxSlices: Long,
     val instructionsPerSlice: Long,
     val haltOnUnimplemented: Boolean,
+    val screen: String,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("cpu_backend", cpuBackend)
         put("max_slices", maxSlices)
         put("instructions_per_slice", instructionsPerSlice)
         put("halt_on_unimplemented", haltOnUnimplemented)
+        put("screen", screen)
     }
 
     companion object {
         fun default(): GameSettings = GameSettings(
-            cpuBackend = "stub",
-            maxSlices = 1024L,
+            cpuBackend = "unicorn",
+            maxSlices = 50_000_000L,
             instructionsPerSlice = 1_000_000L,
             haltOnUnimplemented = false,
+            screen = "portrait",
         )
 
         fun fromJson(obj: JSONObject): GameSettings = GameSettings(
-            cpuBackend = obj.optString("cpu_backend", "stub"),
-            maxSlices = obj.optLong("max_slices", 1024L),
+            cpuBackend = obj.optString("cpu_backend", "unicorn"),
+            maxSlices = obj.optLong("max_slices", 50_000_000L),
             instructionsPerSlice = obj.optLong("instructions_per_slice", 1_000_000L),
             haltOnUnimplemented = obj.optBoolean("halt_on_unimplemented", false),
+            screen = obj.optString("screen", "portrait"),
         )
     }
 }
