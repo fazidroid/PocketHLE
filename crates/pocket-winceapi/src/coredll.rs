@@ -8823,6 +8823,7 @@ fn wave_out_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 
     // WAVE_FORMAT_QUERY = 0x1: don't actually open, just verify.
     if flags & 0x1 == 0 {
+        let already_open = ctx.kernel.wave_out.handle != 0;
         // The notification mode lives in the top half of `fdwOpen`.
         // Games double-buffer audio and only submit the next chunk
         // once they are told the previous one drained, so getting this
@@ -8839,15 +8840,23 @@ fn wave_out_open(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
             _ => WaveCallbackKind::None,
         };
         log::debug!("waveOutOpen notification: {kind:?} target=0x{callback:08x}");
-        ctx.kernel.wave_out = pocket_kernel::WaveOutState {
-            handle: FAKE_HWAVEOUT,
-            callback_kind: kind,
-            callback_target: callback,
-            instance,
-            owner_thread: ctx.kernel.current_thread,
-            ..Default::default()
-        };
-        ctx.kernel.audio.flush();
+        if !already_open {
+            ctx.kernel.wave_out = pocket_kernel::WaveOutState {
+                handle: FAKE_HWAVEOUT,
+                callback_kind: kind,
+                callback_target: callback,
+                instance,
+                owner_thread: ctx.kernel.current_thread,
+                ..Default::default()
+            };
+            ctx.kernel.audio.flush();
+        } else {
+            ctx.kernel.wave_out.handle = FAKE_HWAVEOUT;
+            ctx.kernel.wave_out.callback_kind = kind;
+            ctx.kernel.wave_out.callback_target = callback;
+            ctx.kernel.wave_out.instance = instance;
+            ctx.kernel.wave_out.owner_thread = ctx.kernel.current_thread;
+        }
         ctx.kernel.audio.start();
     }
     if phwo != 0 {
