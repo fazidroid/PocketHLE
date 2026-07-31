@@ -1,354 +1,255 @@
+<!--
+Copyright (C) 2026 PocketHLE Emulator Project
+SPDX-License-Identifier: Apache-2.0 OR MIT
+-->
+
 # PocketHLE
 
-> High-level emulator for Windows Mobile / Pocket PC games.
-> Inspired by [touchHLE](https://github.com/touchHLE/touchHLE) (iPhone OS) and
-> [EKA2L1](https://github.com/EKA2L1/EKA2L1) (Symbian).
+<p align="center">
+  <img src="./proof/asphalt4-wvga/asphalt4-gameplay-proof.png" width="72%" alt="Asphalt 4 running in PocketHLE" />
+</p>
 
-PocketHLE focuses on running individual Pocket PC 2002 / 2003 / Windows Mobile
-5/6 games without emulating an entire Windows CE kernel. Like touchHLE, it
-loads a real game executable, runs the ARM code in a CPU emulator, and
-implements the system DLLs (`coredll`, `aygshell`, `gx`, `hss`, ...) on the
-host side so the game thinks it's running on a real Pocket PC.
+<p align="center">
+  A high-level Windows Mobile / Pocket PC emulator for Linux, Windows and Android.
+</p>
 
-The first target ROM is a small physics game called **JumpyBall** (provided
-by the user, ARM PE32, Windows CE 5 GUI). All work is driven from the public
-APIs that this game uses.
+<p align="center">
+  <a href="https://discord.gg/pSjD428p2">
+    <img src="https://img.shields.io/badge/Discord-Join%20our%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the PocketHLE Discord community" />
+  </a>
+</p>
 
-> **Status:** early but visibly working — the ARM CPU runs, the loader
-> works, system-DLL imports are intercepted, a software-rasterised
-> framebuffer is wired through GDI/GAPI, and JumpyBall reaches its
-> main menu and credits screen out of the box (`pockethle run
-> JumpyBallPPC.cab`). See [Roadmap](#roadmap) for what is still
-> stubbed.
+<p align="center">
+  <strong>Join our Discord for development updates, compatibility discussions, support and community chat.</strong>
+</p>
 
-[Russian (Русский) version → `README.ru.md`](README.ru.md)
+[Русская версия → `README.ru.md`](README.ru.md)
 
 ---
 
-## Table of contents
+> [!NOTE]
+> PocketHLE targets native ARM Windows CE / Windows Mobile executables packaged in `.CAB` archives. It is experimental software: compatibility, performance and input behavior vary by game and host platform.
 
-- [Features](#features)
-- [Architecture](#architecture)
-- [Building on Linux](#building-on-linux)
-- [Building on Windows](#building-on-windows)
-- [Building for Android](#building-for-android)
-- [Trying it on the JumpyBall test ROM](#trying-it-on-the-jumpyball-test-rom)
-- [Library layout](#library-layout)
-- [Roadmap](#roadmap)
-- [Project layout](#project-layout)
-- [Comparison to other emulators](#comparison-to-other-emulators)
-- [License](#license)
+> [!WARNING]
+> PocketHLE is developed for research and educational purposes. It does not include Microsoft system files, firmware or game data. Use only legally obtained game copies and archives.
 
-## Features
+## Info
 
-- **CAB extractor** — unpacks Windows Mobile `.CAB` archives. Auto-detects the
-  largest ARM `.exe` inside.
-- **PE32 loader** — supports the WinCE flavour of `IMAGE_FILE_MACHINE_ARM`
-  (`0x01c0`), parses imports by ordinal *and* name, lays out sections in the
-  emulated address space.
-- **Pluggable CPU backend** — a tiny `Cpu` trait with two implementations:
-  - `stub` — software-only, no real instruction decoding, used for tests.
-  - `unicorn` — wraps [Unicorn Engine 2](https://www.unicorn-engine.org/);
-    runs real ARM machine code at native-ish speed.
-- **HLE thunk dispatcher** — every imported symbol is rewritten in the IAT
-  to point at a synthetic 4-byte page. The CPU gets a code hook on each
-  thunk; on hit, the host's [`WinCeDispatcher`] looks up a Rust handler and
-  resumes execution at `LR`.
-- **Ordinal → name resolver** — partial maps for `coredll.dll` and
-  `aygshell.dll` shipped as JSON data files. The resolver kicks in
-  automatically so logs say `PeekMessageW` instead of `ord 266`.
-- **Linux CLI frontend** with `pe-info`, `unpack-cab`, `inspect-cab` and
-  `run` subcommands.
-- **Cross-platform desktop GUI** — `pocket-desktop` (egui) for Linux & Windows.
-  Library / import / settings screens inspired by
-  [j2me-loader](https://github.com/nikita36078/j2me-loader).
-- **Android launcher** — Gradle project with a j2me-loader-style RecyclerView,
-  per-game settings, FAB import, and a `SurfaceView`-based game screen.
-- **Cross-platform CI** — GitHub Actions builds release artifacts for Linux
-  (`tar.gz`), Windows (`zip`) and Android (`apk`) on every push, the way
-  [touchHLE](https://github.com/touchHLE/touchHLE) does.
+PocketHLE is an early-stage high-level emulator for Pocket PC 2002/2003 and Windows Mobile 5/6 games. Instead of emulating a complete Windows CE device, it loads the original game executable, runs its ARM code through a CPU backend, and provides clean-room host-side implementations of the Windows CE APIs the game expects.
+
+The project is inspired by [touchHLE](https://github.com/touchHLE/touchHLE) and [EKA2L1](https://github.com/EKA2L1/EKA2L1), with a launcher and library workflow influenced by [j2me-loader](https://github.com/nikita36078/j2me-loader).
+
+## Games Tested
+
+| Asphalt 4 Elite Racing | Spore Origins |
+| :---: | :---: |
+| ![Asphalt 4 gameplay](./proof/games/asphalt-4-elite-racing.jpg) | ![Spore Origins](./proof/games/spore-origins.jpg) |
+
+| Zuma Deluxe | Bejeweled |
+| :---: | :---: |
+| ![Zuma Deluxe](./proof/games/zuma-deluxe.jpg) | ![Bejeweled](./proof/games/bejeweled.jpg) |
+
+> [!IMPORTANT]
+> The screenshots above are representative game references supplied for the project presentation. The checked-in, reproducible emulator proof currently covers Asphalt 4 WVGA. Spore Origins, Zuma Deluxe and Bejeweled have game-specific compatibility work in the codebase, but should not be described as fully verified here without a corresponding checked-in run capture.
+
+Additional compatibility probes and rendering captures are available under [`proof/`](proof/), including Asphalt 2 3D, Crazy Taxi, Diamond Twister, Splinter Cell Conviction and other Windows Mobile titles.
+
+## Status
+
+PocketHLE can currently:
+
+* import and unpack Windows Mobile `.CAB` archives;
+* restore long filenames and installation paths from `_setup.xml`;
+* select the intended game executable instead of helper binaries;
+* load native ARM and MIPS PE images and inspect their imports;
+* execute ARM code with the Unicorn Engine backend;
+* intercept imported Windows CE DLL calls through HLE thunks;
+* provide ordinal-to-name resolution for `coredll.dll` and `aygshell.dll`;
+* emulate core windowing, GDI, GAPI, registry, filesystem, timing, input and audio paths;
+* render software framebuffers in the desktop frontend and Android `SurfaceView` / OpenGL frontend;
+* run a shared game library with per-game settings on desktop and Android;
+* build Linux, Windows and Android artifacts through GitHub Actions.
+
+The current reference proof demonstrates Asphalt 4 rendering at WVGA with captured PCM audio. Android also has a game launcher, fullscreen/orientation controls, display modes, per-game settings and a turbo control for titles that need accelerated startup.
+
+PocketHLE is not a full Windows CE emulator. Some games still stop during CRT initialization, dynamic imports, worker-thread setup or unimplemented APIs. A successful boot or first frame does not automatically mean that an entire game is playable from start to finish.
 
 ## Architecture
 
 ```
-+-----------+    +-----------+    +---------+    +----------+
-| pocket-cli|    |pocket-     |    | pocket- |    |pocket-   |
-| (CLI)     |    | android    |    | core    |--->| pocket-pe|
-+-----+-----+    | (Gradle)   |    +----+----+    +----------+
-      |          +-----+------+         |
-      v                |                v
-+-----+----------------+----------------+----+
-|             pocket-kernel                  |   process model, IAT thunks
-|  +--------------+   +--------------------+ |
-|  |pocket-cpu    |   |pocket-winceapi     | |   coredll / aygshell /
-|  | (Unicorn)    |   |  (HLE handlers)    | |   gx / hss handlers
-|  +--------------+   +--------------------+ |
-+--------------------------------------------+
++----------------+    +----------------+    +----------------+
+| pocket-cli     |    | pocket-desktop |    | pocket-android |
+| CLI / captures |    | egui launcher  |    | Kotlin + JNI   |
++--------+-------+    +--------+-------+    +--------+-------+
+         \                     |                     /
+          \                    |                    /
+           +-------------------+--------------------+
+                               |
+                      +--------v--------+
+                      |   pocket-core   |
+                      | Emulator / VFS  |
+                      +--------+--------+
+                               |
+          +--------------------+--------------------+
+          |                    |                    |
+  +-------v-------+    +-------v--------+   +-------v--------+
+  | pocket-cab    |    | pocket-pe      |   | pocket-library |
+  | CAB installer |    | ARM/MIPS PE    |   | game database  |
+  +---------------+    +----------------+   +----------------+
+                               |
+                      +--------v--------+
+                      | pocket-kernel   |
+                      | process / GDI   |
+                      | HLE dispatch    |
+                      +--------+--------+
+                               |
+                  +------------+------------+
+                  |                         |
+          +-------v-------+         +-------v--------+
+          | pocket-cpu    |         | pocket-winceapi |
+          | stub/Unicorn  |         | coredll/gx/hss  |
+          +---------------+         +----------------+
 ```
 
-When `Emulator::run()` is invoked:
+When a game starts:
 
-1. `pocket-cab` unpacks the user's `.CAB` and identifies the game `.exe`.
-2. `pocket-pe` parses the PE, builds a list of `LoadedSection`s and the
-   `Vec<ImportSymbol>` describing every imported function.
-3. `pocket-kernel::Process::map_into` creates the address space:
-   - maps each section,
-   - allocates a `THUNK_REGION_BASE` pool of 4-byte stubs (`bx lr`),
-   - patches the IAT so every imported symbol points at one of those
-     stubs,
-   - registers a code hook on every stub.
-4. `pocket-kernel::run_main_loop` enters Unicorn at the entry point. As soon
-   as the guest jumps through any IAT entry, Unicorn returns control;
-   `WinCeDispatcher::dispatch` looks up the symbol and invokes the matching
-   Rust handler, then resumes the guest at `LR`.
+1. `pocket-cab` extracts the archive and reconstructs its installed files and registry values.
+2. `pocket-pe` parses the PE image, sections and imported symbols.
+3. `pocket-kernel` maps the image, patches the import address table with HLE thunks and creates the guest process state.
+4. `pocket-cpu` executes the guest ARM or MIPS code.
+5. `pocket-winceapi` dispatches imported Windows CE calls to Rust handlers for graphics, files, windows, input, registry, timing and audio.
+6. The selected frontend displays the framebuffer and forwards host input back to the guest.
 
-This is exactly the design touchHLE uses for Objective-C runtime calls and
-Foundation, just adapted to Win32-style import tables.
+## Using
 
-## Building on Linux
+Download a release archive for your platform, import a legally obtained Pocket PC `.CAB`, and choose the game in the desktop or Android launcher.
+
+For command-line runs:
 
 ```bash
-# 1. Toolchain
-rustup default stable               # 1.85+ recommended
+# Inspect a cabinet
+pockethle inspect-cab ~/Games/Asphalt4.cab
 
-# 2. Native deps (Ubuntu / Debian)
-sudo apt install -y cmake build-essential pkg-config libclang-dev \
-                    libgtk-3-dev libxkbcommon-dev \
-                    libwayland-dev libx11-dev libxcb1-dev \
-                    libxrandr-dev libxinerama-dev libxi-dev \
-                    libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev
+# Run a cabinet; the launcher extracts and mounts its install directory
+pockethle run ~/Games/Asphalt4.cab
 
-# 3. Build everything (stub CPU only — fast, ~30 s)
-cargo build --release --workspace
+# Run with the real ARM CPU backend and capture frames
+pockethle run ~/Games/Asphalt4.cab \
+  --cpu unicorn \
+  --dump-frames-to /tmp/pockethle-frames \
+  --max-frames 8
 
-# 4. Build the CLI with the real ARM CPU backend (~3 minutes first time;
-#    Unicorn Engine is built from source).
-cargo build --release -p pocket-cli      --features unicorn
-cargo build --release -p pocket-desktop  --features unicorn
-
-# 5. Run tests
-cargo test --workspace
+# Inspect or run an extracted executable
+pockethle pe-info /tmp/pockethle/Asphalt4.exe
+pockethle run /tmp/pockethle/Asphalt4.exe --cpu unicorn
 ```
 
-The resulting binaries live at:
+The CLI also supports `.exe` and `.zip` inputs. Use `--cpu stub` for trace-only and loader tests; it does not execute real game instructions.
 
-- `target/release/pockethle`     — CLI (`pe-info`, `unpack-cab`, `inspect-cab`, `run`, ...)
-- `target/release/pockethle-gui` — desktop GUI (`pocket-desktop`)
+## Build
 
-## Building on Windows
+### Linux
 
-PocketHLE builds out of the box on Windows with the MSVC toolchain (the same
-way touchHLE distributes its Windows build).
+```bash
+# Rust 1.85+ is recommended
+rustup default stable
+
+# Native dependencies for the desktop frontend
+sudo apt install -y cmake build-essential pkg-config libclang-dev \
+  libgtk-3-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev \
+  libxrandr-dev libxinerama-dev libxi-dev libxcursor-dev \
+  libxdamage-dev libxext-dev libxfixes-dev
+
+# Build and test the workspace
+cargo build --release --workspace
+cargo test --workspace
+
+# Build the real CPU backend
+cargo build --release -p pocket-cli --features unicorn
+cargo build --release -p pocket-desktop --features unicorn
+```
+
+The binaries are written to `target/release/`:
+
+* `pockethle` — command-line frontend;
+* `pockethle-gui` — desktop launcher.
+
+### Windows
+
+Install Rust with the MSVC toolchain and CMake, then run:
 
 ```powershell
-# 1. Install rustup, then:
-rustup default stable-x86_64-pc-windows-msvc
-
-# 2. Build CLI + desktop GUI (stub CPU — fast)
-cargo build --release -p pocket-cli
-cargo build --release -p pocket-desktop
-
-# 3. (Optional) Real ARM CPU via Unicorn Engine — needs cmake on PATH
-#    and a working MSVC C/C++ toolchain. Building Unicorn from source the
-#    first time takes a few minutes.
-cargo build --release -p pocket-cli      --features unicorn
-cargo build --release -p pocket-desktop  --features unicorn
+cargo build --release --workspace
+cargo build --release -p pocket-cli --features unicorn
+cargo build --release -p pocket-desktop --features unicorn
 ```
 
-The resulting binaries are `target\release\pockethle.exe` and
-`target\release\pockethle-gui.exe`.
+The resulting binaries are `target\release\pockethle.exe` and `target\release\pockethle-gui.exe`.
 
-Double-clicking `pockethle-gui.exe` opens a small launcher window: import a
-`.CAB`, pick a game from the library, hit Run.
+### Android
 
-## Trying it on the JumpyBall test ROM
-
-The `run` subcommand accepts a Pocket PC `.exe`, a `.cab`, or a
-`.zip` directly — archives are auto-extracted into a temp dir and the
-largest ARM PE inside is launched. The default build of `pockethle`
-includes both the `unicorn` CPU and the `display` host-window
-features so a freshly-checked-out repo can render a game without
-extra flags.
+The Android frontend lives in [`frontends/pocket-android`](frontends/pocket-android). It requires Android Studio Iguana or newer, Android NDK r26 or newer and [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk).
 
 ```bash
-# (a) Run from the original Microsoft cabinet — auto-extracts and
-#     auto-mounts the cabinet contents at the guest's `\Application\`
-#     so CreateFileW finds the bundled resources.
-pockethle run ~/JumpyBallPPC.cab
-
-# (b) Same, but pop a host window with the live framebuffer.
-pockethle run ~/JumpyBallPPC.cab --display
-
-# (c) Headless capture: dump every rendered frame as PPM and stop
-#     after eight frames — useful for CI / regression diffs.
-pockethle run ~/JumpyBallPPC.cab \
-    --dump-frames-to /tmp/jumpy_frames --max-frames 8
-
-# (d) The classic flow is still supported if you want to inspect
-#     things by hand:
-pockethle inspect-cab ~/JumpyBallPPC.cab
-pockethle unpack-cab  ~/JumpyBallPPC.cab /tmp/jumpy
-pockethle pe-info     /tmp/jumpy/JUMPYB~1.002
-pockethle run         /tmp/jumpy/JUMPYB~1.002
-
-# (e) For trace-only analysis (no real CPU), pass `--cpu stub`. This
-#     does not require the Unicorn build.
-pockethle run ~/JumpyBallPPC.cab --cpu stub --max-slices 1
-```
-
-Real PPC2003 games typically need a few hundred thousand emulated
-slices to finish their CRT init, build their soft-float lookup
-tables and load bitmap resources before the first `WM_PAINT` is
-delivered. `pockethle run` therefore defaults to `--max-slices
-2_000_000`; pass a smaller value for fast smoke tests, or `0` for no
-upper bound.
-
-The first time you run an unfamiliar binary, expect to see lines
-like:
-
-```
-[INFO  pocket_kernel] entering emulated main: entry=0x000247c8, stack_top=0x60000000
-[WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!CreateDirectoryW
-...
-```
-
-Each `unimplemented call` line is a clue: that API needs a real handler in
-`crates/pocket-winceapi/src/coredll.rs` (or wherever appropriate) before the
-game can progress. See [Roadmap](#roadmap).
-
-## Building for Android
-
-The Android frontend lives in [`frontends/pocket-android`](frontends/pocket-android).
-It depends on:
-
-- Android Studio Iguana (or any AGP 8.4+ install)
-- Android NDK r26 or newer
-- [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk) (`cargo install cargo-ndk`)
-
-Build:
-
-```bash
-# 1. Cross-compile the JNI bridge for the two Android ABIs we ship.
 cargo ndk \
-    -t arm64-v8a \
-    -t armeabi-v7a \
-    -o frontends/pocket-android/app/src/main/jniLibs \
-    build --release -p pocket-android-jni
+  -t arm64-v8a \
+  -t armeabi-v7a \
+  -o frontends/pocket-android/app/src/main/jniLibs \
+  build --release -p pocket-android-jni
 
-# 2. Build the APK (uses the Gradle wrapper).
 cd frontends/pocket-android
 ./gradlew assembleRelease
 ```
 
-The APK lands in
-`frontends/pocket-android/app/build/outputs/apk/release/`.
+The APK is created under `frontends/pocket-android/app/build/outputs/apk/release/`.
 
-The Android UI is modelled on
-[j2me-loader](https://github.com/nikita36078/j2me-loader): a RecyclerView
-launcher with per-game cards (Run / Settings / Remove), a FAB to import
-new `.CAB` files via the system file picker, a global settings screen
-(default CPU backend, log verbosity), and a per-game settings screen
-(CPU backend, dispatch slice budget, halt-on-unimplemented). Running a
-game opens a `SurfaceView`-backed `GameActivity` that displays the
-emulator's framebuffer.
+The Android launcher imports `.CAB` files through the system picker, stores the game library in app storage, offers global and per-game settings, and opens each title in a `GameActivity` backed by the native emulator and a framebuffer renderer.
 
-## Library layout
+## Library
 
-The desktop GUI and the Android launcher share an on-disk library managed
-by the [`pocket-library`](crates/pocket-library) crate. It looks like
-this:
+Desktop and Android share the `pocket-library` model:
 
 ```
 <library-root>/
-├── library.json          # index of imported games
-├── config.json           # default CPU backend, log verbosity, ...
+├── library.json
+├── config.json
 └── games/
     └── <sanitized-id>/
-        ├── game.json     # display name, source CAB, per-game settings
-        ├── source.cab    # original archive (kept for re-extraction)
+        ├── game.json
+        ├── source.cab
         └── extracted/
-            └── ... PE / data files ...
+            └── ... game files ...
 ```
 
-On Linux/Windows the default root is
-`~/.local/share/PocketHLE/library` (or platform equivalent via
-[`directories`](https://docs.rs/directories)).
-On Android it lives under the app's external files dir,
-`getExternalFilesDir(null)/library`.
+On Linux and Windows, the default location is `~/.local/share/PocketHLE/library` or the platform equivalent. Android stores it under the app's external files directory.
 
 ## Roadmap
 
-The order below roughly matches what JumpyBall calls into during its first
-hundred milliseconds:
+* complete the remaining CRT and legacy ARM startup paths;
+* expand dynamic import and thread/runtime compatibility;
+* improve resource, GDI and dialog coverage across more games;
+* add broader gamepad, keyboard and touch mapping;
+* continue improving audio mixing and host output;
+* add reproducible compatibility captures for more titles;
+* improve desktop and Android UX and diagnostics.
 
-1. **CRT prologue** — `__chkstk`, `_setjmp`, `longjmp`, `_except_handler3`.
-2. **Window setup** — `RegisterClassW`, `CreateWindowExW`, `ShowWindow`,
-   `SHFullScreen`.
-3. **Resource loading** — `FindResourceW`, `LoadResource`, `LockResource`,
-   `CreateFileW`, `ReadFile`.
-4. **GDI** — `BeginPaint`, `EndPaint`, `BitBlt`, `Rectangle`, `FillRect`,
-   `CreateCompatibleDC/Bitmap`, `SelectObject`, `DeleteObject`. We will
-   implement this as a software-rasterised framebuffer that gets blitted
-   straight to the host's window.
-5. **GAPI** — already stubbed in `pocket-winceapi/src/gx.rs`. Hook up the
-   `GXBeginDraw` framebuffer to a host-side window (SDL2 on Linux,
-   `SurfaceView` on Android).
-6. **Audio** — replace the HSS stubs with real SDL2 / OpenSL ES playback.
-7. **Input** — translate host keyboard / touch events to Pocket PC
-   `WM_KEYDOWN` / `WM_LBUTTONDOWN` and pump them into the message queue.
+## Legal notice
 
-Each milestone is intended to land as a separate small PR.
-
-## Project layout
-
-```
-crates/
-  pocket-cab/        Microsoft Cabinet extractor
-  pocket-pe/         WinCE PE32 loader (ARM / x86 / Thumb)
-  pocket-cpu/        Cpu trait + stub + unicorn backends
-  pocket-kernel/     Address space, IAT thunks, dispatcher loop
-  pocket-winceapi/   coredll / aygshell / gx (GAPI) / hss handlers
-  pocket-core/       Top-level Emulator that frontends drive
-  pocket-library/    On-disk game library + per-game config (shared by GUIs)
-frontends/
-  pocket-cli/        Cross-platform command-line tool (`pockethle`)
-  pocket-desktop/    Cross-platform egui GUI for Linux & Windows (`pockethle-gui`)
-  pocket-android-jni/Rust JNI bridge consumed by the Android app
-  pocket-android/    Gradle project (Kotlin) — j2me-loader-style launcher
-data/
-  ordinals/          JSON ordinal -> name maps for coredll, aygshell
-docs/
-  architecture/      Design notes
-  api-stubs/         Per-API specification of what stubs need to do
-```
-
-## Comparison to other emulators
-
-| Project              | Target OS                       | Approach                  | Status                                  |
-|----------------------|---------------------------------|---------------------------|-----------------------------------------|
-| `touchHLE`           | iPhone OS 2.x / 3.x             | High-level (HLE)          | Plays a handful of OpenGL ES games      |
-| `EKA2L1`             | Symbian S60v3 / S60v5           | Mostly HLE, partial LLE   | Plays many Symbian games                |
-| Microsoft Device Emu | Windows CE 5 / 6                | Full LLE (closed source)  | Discontinued                            |
-| **PocketHLE** (this) | Windows Mobile 5 / 6 / Pocket PC| HLE                       | Loads + boots CRT for JumpyBall         |
-
-PocketHLE deliberately copies touchHLE's layout — small Rust workspace,
-HLE-first — because it scales well: every new game adds a few more API
-implementations rather than years of low-level reverse engineering.
-
-## Managed .NET Compact Framework executables
-
-PocketHLE's execution backend currently supports native ARM WinCE PE images. It does not execute managed `.NET Compact Framework` assemblies: those require the CLR/Compact Framework runtime and WinForms/GDI+ managed surface, not only native WinCE API stubs.
-
-The loader detects the CLR metadata and reports the runtime version instead of entering the managed PE as if it were native ARM code. For example, `PocketSnake.exe` from the supplied installer is an x86 managed assembly with CLR metadata `v1.1.4322`; it is not a native ARM WinCE executable. It must run on Windows Mobile 2003 or a later compatible system with .NET Compact Framework 1.1 installed, or on an earlier compatible Windows CE system where that runtime is already installed.
-
-Open-source reference projects for analogous Compact Framework structure include [Pocket1945](https://github.com/timdetering/Pocket1945), [Pocket-Minesweeper](https://github.com/Enovale/Pocket-Minesweeper), and [SokobanCompact](https://github.com/OverQuantum/SokobanCompact). They are useful references for managed startup, resource loading, timer-driven updates, and WinForms painting; they are not native ARM implementations that can be loaded directly by PocketHLE.
+PocketHLE does not contain or distribute copyrighted Microsoft system DLLs, firmware or game assets. The Windows CE API layer is a clean-room reimplementation based on public API behavior and ordinal data. Users are responsible for the games and archives they provide.
 
 ## License
 
-Dual licensed under [Apache-2.0](LICENSE-APACHE) **OR** [MIT](LICENSE-MIT) at
-your option.
+PocketHLE is dual-licensed under [Apache-2.0](LICENSE-APACHE) **OR** [MIT](LICENSE-MIT), at your option.
 
-PocketHLE itself does not contain or distribute any copyrighted Microsoft
-code, Pocket PC system DLL, or game asset. Users supply their own legally
-obtained `.CAB` files. The system-DLL stubs are clean-room reimplementations
-based on publicly documented APIs and ordinal numbers.
+## Contributing
+
+Bug reports, compatibility results, API traces and pull requests are welcome. Please include the game version, target screen size, frontend, CPU backend, command line and relevant logs or frame captures when reporting a problem.
+
+Join the [PocketHLE Discord community](https://discord.gg/pSjD428p2) for development updates, compatibility discussions and support.
+
+## Special Thanks
+
+* [touchHLE](https://github.com/touchHLE/touchHLE) for the high-level emulation model and project inspiration;
+* [EKA2L1](https://github.com/EKA2L1/EKA2L1) for another practical HLE-oriented emulator architecture;
+* [j2me-loader](https://github.com/nikita36078/j2me-loader) for launcher and library UX inspiration;
+* the PocketHLE contributors and testers who provide legally obtained software, traces and compatibility reports.
