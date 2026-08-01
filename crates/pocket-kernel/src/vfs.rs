@@ -353,6 +353,14 @@ impl Vfs {
         of.file.seek(from).ok()
     }
 
+    pub fn flush(&mut self, handle: u32) -> std::io::Result<()> {
+        self.handles
+            .get_mut(&handle)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid handle"))?
+            .file
+            .flush()
+    }
+
     pub fn close(&mut self, handle: u32) -> bool {
         self.handles.remove(&handle).is_some()
     }

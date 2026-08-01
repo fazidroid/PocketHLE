@@ -197,6 +197,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "CreateFileW", create_file_w);
     d.register_handler(dll, "ReadFile", read_file);
     d.register_handler(dll, "WriteFile", write_file);
+    d.register_handler(dll, "FlushFileBuffers", flush_file_buffers);
     d.register_handler(dll, "CloseHandle", close_handle);
     d.register_handler(dll, "GetFileSize", get_file_size);
     d.register_handler(dll, "GlobalMemoryStatus", global_memory_status);
@@ -3625,6 +3626,13 @@ fn write_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             .write_mem(out_written_p, &(n as u32).to_le_bytes())?;
     }
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn flush_file_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(u32::from(
+        ctx.kernel.vfs.is_open(handle),
+    )))
 }
 
 fn close_handle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
