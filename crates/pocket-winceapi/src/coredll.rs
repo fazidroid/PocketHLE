@@ -155,6 +155,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_strncmpi", strnicmp);
     d.register_handler(dll, "atoi", atoi_handler);
     d.register_handler(dll, "atol", atoi_handler);
+    d.register_handler(dll, "atof", atof_handler);
+    d.register_handler(dll, "_itoa", itoa_handler);
     d.register_handler(dll, "_isctype", isctype);
     d.register_handler(dll, "strchr", strchr);
     d.register_handler(dll, "strrchr", strrchr);
@@ -210,6 +212,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "CreateFileW", create_file_w);
     d.register_handler(dll, "ReadFile", read_file);
     d.register_handler(dll, "WriteFile", write_file);
+    d.register_handler(dll, "FlushFileBuffers", flush_file_buffers);
     d.register_handler(dll, "CloseHandle", close_handle);
     d.register_handler(dll, "GetFileSize", get_file_size);
     d.register_handler(dll, "GlobalMemoryStatus", global_memory_status);
@@ -454,6 +457,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetDlgItemTextW", set_dlg_item_text_w);
     d.register_handler(dll, "IsWindow", is_window);
     d.register_handler(dll, "CreateMutexW", create_mutex_w);
+    d.register_handler(dll, "CreateSemaphoreW", create_semaphore_w);
+    d.register_constant(dll, "ReleaseSemaphore", 1, one_returning);
     d.register_handler(dll, "TlsCall", tls_call);
     d.register_handler(dll, "CeSetThreadQuantum", ce_set_thread_quantum);
     d.register_constant(dll, "ClientToScreen", 1, one_returning);
@@ -2513,6 +2518,16 @@ fn strnicmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// `int atoi(const char *s)` / `long atol(const char *s)`. C semantics:
 /// skip leading whitespace, optional sign, then as many digits as
 /// parse; anything else yields `0` rather than an error.
+fn atof_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let text = read_cstr_string(ctx, p, 0x1000)?;
+    let value = text.trim().parse::<f64>().unwrap_or(0.0);
+    let bits = value.to_bits();
+    ctx.cpu.write_reg(ArmReg::R0, bits as u32)?;
+    ctx.cpu.write_reg(ArmReg::R1, (bits >> 32) as u32)?;
+    Ok(DispatchOutcome::ReturnedR0(bits as u32))
+}
+
 fn atoi_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let p = ctx.arg_u32(0)?;
     let text = read_cstr_string(ctx, p, 0x1000)?;
@@ -2523,8 +2538,7 @@ fn atoi_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     while let Some(c) = it.peek() {
         if c.is_ascii_digit() {
-            digits.push(*c);
-            it.next();
+            digits.push(it.next().unwrap());
         } else {
             break;
         }
@@ -2537,6 +2551,37 @@ fn atoi_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// character satisfies. `isalpha`, `isdigit`, `isspace` and friends are
 /// macros that call straight into this, so returning 0 unconditionally
 /// broke every parser the guest CRT has.
+fn itoa_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let value = ctx.arg_u32(0)? as i32;
+    let dst = ctx.arg_u32(1)?;
+    let radix = ctx.arg_u32(2)?;
+    if dst == 0 || !(2..=36).contains(&radix) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let negative = value < 0 && radix == 10;
+    let mut magnitude = if value < 0 && radix == 10 {
+        (value as i64).unsigned_abs()
+    } else {
+        value as u32 as u64
+    };
+    let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = Vec::new();
+    loop {
+        digits.push(alphabet[(magnitude % radix as u64) as usize]);
+        magnitude /= radix as u64;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if negative {
+        digits.push(b'-');
+    }
+    digits.reverse();
+    digits.push(0);
+    ctx.cpu.write_mem(dst, &digits)?;
+    Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
 fn isctype(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     const UPPER: u32 = 0x0001;
     const LOWER: u32 = 0x0002;
@@ -3615,6 +3660,13 @@ fn write_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
             .write_mem(out_written_p, &(n as u32).to_le_bytes())?;
     }
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn flush_file_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(u32::from(
+        ctx.kernel.vfs.is_open(handle),
+    )))
 }
 
 fn close_handle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -8890,11 +8942,28 @@ fn virtual_query(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     if info == 0 || size < 16 {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
+    let (base, region_size, state, protect, kind): (u32, u32, u32, u32, u32) =
+        if address < 0x0001_0000 {
+            (0, 0x0001_0000, 0x0001_0000, 0, 0)
+        } else if address < 0x0010_0000 {
+            (0x0001_0000, 0x000f_0000, 0x0000_1000, 0x20, 0x0002_0000)
+        } else {
+            (address & !0x000f_ffff, 0x0010_0000, 0x0001_0000, 0, 0)
+        };
     let mut buf = vec![0u8; size.min(48) as usize];
-    buf[0..4].copy_from_slice(&address.to_le_bytes());
-    buf[4..8].copy_from_slice(&address.to_le_bytes());
-    buf[8..12].copy_from_slice(&0x1000u32.to_le_bytes());
-    buf[12..16].copy_from_slice(&0x1000u32.to_le_bytes());
+    buf[0..4].copy_from_slice(&base.to_le_bytes());
+    buf[4..8].copy_from_slice(&base.to_le_bytes());
+    buf[8..12].copy_from_slice(&protect.to_le_bytes());
+    buf[12..16].copy_from_slice(&region_size.to_le_bytes());
+    if buf.len() >= 20 {
+        buf[16..20].copy_from_slice(&state.to_le_bytes());
+    }
+    if buf.len() >= 24 {
+        buf[20..24].copy_from_slice(&protect.to_le_bytes());
+    }
+    if buf.len() >= 28 {
+        buf[24..28].copy_from_slice(&kind.to_le_bytes());
+    }
     ctx.cpu.write_mem(info, &buf)?;
     Ok(DispatchOutcome::ReturnedR0(buf.len() as u32))
 }
@@ -8912,18 +8981,7 @@ fn get_proc_address_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     } else {
         read_cstr_string(ctx, raw_name, 256)?
     };
-    let address = ctx
-        .kernel
-        .dynamic_exports
-        .get(&module)
-        .and_then(|exports| exports.get(&name).copied())
-        .or_else(|| {
-            ctx.kernel
-                .dynamic_exports
-                .get(&module)
-                .and_then(|exports| exports.get(&name.to_ascii_lowercase()).copied())
-        })
-        .unwrap_or(0);
+    let address = resolve_dynamic_export(ctx, module, &name);
     log::debug!("GetProcAddressA(0x{module:08x}, {name:?}) -> 0x{address:08x}");
     Ok(DispatchOutcome::ReturnedR0(address))
 }
@@ -8945,16 +9003,37 @@ fn get_proc_address_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     } else {
         String::from_utf16_lossy(&read_wstr(ctx, name_p, 256).unwrap_or_default())
     };
-    let address = ctx
-        .kernel
+    let address = resolve_dynamic_export(ctx, module, &name);
+    log::debug!("GetProcAddressW(0x{module:08x}, {name:?}) -> 0x{address:08x}");
+    Ok(DispatchOutcome::ReturnedR0(address))
+}
+
+fn resolve_dynamic_export(ctx: &CallCtx<'_>, module: u32, name: &str) -> u32 {
+    ctx.kernel
         .dynamic_exports
         .get(&module)
-        .and_then(|exports| exports.get(&name).copied())
+        .and_then(|exports| exports.get(name).copied())
         .or_else(|| {
             ctx.kernel
                 .dynamic_exports
                 .get(&module)
                 .and_then(|exports| exports.get(&name.to_ascii_lowercase()).copied())
+        })
+        .or_else(|| {
+            if module == FAKE_MODULE_HANDLE {
+                ctx.kernel
+                    .dynamic_exports
+                    .get(&FAKE_MODULE_HANDLE)
+                    .and_then(|exports| exports.get(name).copied())
+                    .or_else(|| {
+                        ctx.kernel
+                            .dynamic_exports
+                            .get(&FAKE_MODULE_HANDLE)
+                            .and_then(|exports| exports.get(&name.to_ascii_lowercase()).copied())
+                    })
+            } else {
+                None
+            }
         })
         .unwrap_or_else(|| {
             if name.eq_ignore_ascii_case("InitCommonControlsEx") {
@@ -8962,9 +9041,7 @@ fn get_proc_address_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             } else {
                 0
             }
-        });
-    log::debug!("GetProcAddressW(0x{module:08x}, {name:?}) -> 0x{address:08x}");
-    Ok(DispatchOutcome::ReturnedR0(address))
+        })
 }
 
 fn get_cursor_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -9057,6 +9134,10 @@ fn create_dialog_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutco
 fn is_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
     Ok(DispatchOutcome::ReturnedR0(is_live_hwnd(hwnd) as u32))
+}
+
+fn create_semaphore_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0xDEAD_E301))
 }
 
 fn create_mutex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {

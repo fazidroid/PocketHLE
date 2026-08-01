@@ -1080,6 +1080,7 @@ impl Heap {
 fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>> {
     let mut exports = HashMap::new();
     let mut coredll = HashMap::new();
+    let mut ddraw = HashMap::new();
     let mut gx = HashMap::new();
     let mut commctrl = HashMap::new();
     for thunk in thunks {
@@ -1093,6 +1094,8 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             if let ImportBinding::Ordinal(ord) = &thunk.binding {
                 coredll.insert(format!("#{}", ord), thunk.thunk_va);
             }
+        } else if thunk.dll.eq_ignore_ascii_case("ddraw.dll") {
+            ddraw.insert(name.clone(), thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("gx.dll") {
             gx.insert(name, thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("commctrl.dll") {
@@ -1105,6 +1108,9 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     }
     if !coredll.is_empty() {
         exports.insert(0x1000_0000, coredll);
+    }
+    if !ddraw.is_empty() {
+        exports.insert(0x1000_0003, ddraw);
     }
     if !commctrl.is_empty() {
         exports.insert(0x1000_0002, commctrl);

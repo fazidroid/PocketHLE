@@ -17,6 +17,7 @@
 pub mod aygshell;
 pub mod commctrl;
 pub mod coredll;
+pub mod ddraw;
 pub mod game_dlls;
 pub mod gx;
 pub mod hss;
@@ -112,6 +113,7 @@ impl WinCeDispatcher {
             trace_sink: None,
         };
         coredll::register(&mut d);
+        ddraw::register(&mut d);
         aygshell::register(&mut d);
         commctrl::register(&mut d);
         game_dlls::register(&mut d);
@@ -239,14 +241,9 @@ impl Dispatcher for WinCeDispatcher {
             .map(|(_, name)| name.clone())
             .collect();
         for ordinal in 0..=4095u16 {
-            if let Some(name) = ordinals::lookup("coredll.dll", ordinal) {
+            if ordinals::lookup("coredll.dll", ordinal).is_some() {
                 names.push(format!("ord:{ordinal}"));
-                if self
-                    .by_name
-                    .contains_key(&("coredll.dll".to_string(), name.clone()))
-                {
-                    names.push(format!("#{ordinal}"));
-                }
+                names.push(format!("#{ordinal}"));
             }
         }
         names.sort();
