@@ -25,7 +25,7 @@ use pocket_cpu::regs::ArmReg;
 use pocket_cpu::Prot;
 use pocket_kernel::framebuffer::colorref_to_rgb565;
 use pocket_kernel::gdi::{
-    Surface, GDI_SCREEN_DC, STOCK_BLACK_BRUSH, STOCK_BLACK_PEN, STOCK_DKGRAY_BRUSH,
+    rop3, Surface, GDI_SCREEN_DC, STOCK_BLACK_BRUSH, STOCK_BLACK_PEN, STOCK_DKGRAY_BRUSH,
     STOCK_GRAY_BRUSH, STOCK_LTGRAY_BRUSH, STOCK_NULL_BRUSH, STOCK_NULL_PEN, STOCK_SYSTEM_FONT,
     STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
 };
@@ -51,6 +51,12 @@ const FAKE_HWND: u32 = 0xDEAD_0001;
 /// in two different globals and drives them independently — a shared
 /// handle makes `GetWindowRect` on one return the other's geometry.
 const FAKE_DIALOG_HWND: u32 = 0xDEAD_0002;
+/// Handle for the commctrl status bar docked to the bottom of the main
+/// window (`CreateStatusWindow{A,W}`). The guest addresses it only
+/// through `SendMessage`, and those `SB_*` messages must be consumed by
+/// the control rather than trampolined into the app's own WndProc —
+/// hence a handle distinct from [`FAKE_HWND`].
+pub const FAKE_STATUSBAR_HWND: u32 = 0xDEAD_0C01;
 const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
 
 /// Every window handle we ever hand the guest. Handlers that answer
@@ -58,7 +64,10 @@ const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
 /// to accept all of them — a check against [`FAKE_HWND`] alone makes the
 /// guest treat its own dialog as destroyed and skip the work it drives.
 fn is_live_hwnd(hwnd: u32) -> bool {
-    hwnd == FAKE_HWND || hwnd == FAKE_DIALOG_HWND || hwnd == FAKE_DESKTOP_HWND
+    hwnd == FAKE_HWND
+        || hwnd == FAKE_DIALOG_HWND
+        || hwnd == FAKE_DESKTOP_HWND
+        || hwnd == FAKE_STATUSBAR_HWND
 }
 const PAINTSTRUCT_BYTES: u32 = 32;
 
@@ -354,6 +363,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "UpdateWindow", update_window);
     d.register_constant(dll, "MoveWindow", 1, one_returning);
     d.register_constant(dll, "SetForegroundWindow", 1, one_returning);
+    // PPC2002 apps disable the IME on the very first line of WinMain.
+    // There is no IME here, so "already disabled" is the honest answer.
+    d.register_constant(dll, "ImmDisableIME", 1, one_returning);
     d.register_constant(dll, "BringWindowToTop", 1, one_returning);
     d.register_constant(dll, "SetActiveWindow", FAKE_HWND, one_returning);
     d.register_handler(dll, "GetKeyState", get_key_state);
@@ -4904,11 +4916,140 @@ fn open_msg_queue(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(handle))
 }
 
+/// Status-bar control messages we honour. `WM_USER` is 0x400.
+mod sb {
+    pub const SETTEXTA: u32 = 0x0401;
+    pub const GETTEXTA: u32 = 0x0402;
+    pub const SETPARTS: u32 = 0x0404;
+    pub const GETPARTS: u32 = 0x0406;
+    pub const SETTEXTW: u32 = 0x040B;
+    pub const GETTEXTW: u32 = 0x040D;
+    pub const SIMPLE: u32 = 0x0409;
+}
+
+/// Handle a message addressed to the status bar control.
+///
+/// Returns `None` for messages we don't model, so the caller can fall
+/// through to its default handling. The control is a *real* window on a
+/// device, so none of these may reach the application's WndProc.
+fn status_bar_message(
+    ctx: &mut CallCtx<'_>,
+    message: u32,
+    wparam: u32,
+    lparam: u32,
+) -> Result<Option<u32>, KernelError> {
+    match message {
+        sb::SETPARTS => {
+            // wParam = part count, lParam = array of right-hand edges.
+            let count = (wparam as usize).min(256);
+            let mut edges = Vec::with_capacity(count);
+            for i in 0..count {
+                let addr = lparam.wrapping_add((i * 4) as u32);
+                edges.push(ctx.cpu.read_u32_le(addr).unwrap_or(0) as i32);
+            }
+            log::debug!("SB_SETPARTS({count}) edges={edges:?}");
+            let bar = ctx.kernel.status_bar.get_or_insert_with(Default::default);
+            bar.set_parts(edges);
+            Ok(Some(1))
+        }
+        sb::SETTEXTW | sb::SETTEXTA => {
+            // The low byte of wParam is the part index; the high byte
+            // carries drawing style flags (SBT_OWNERDRAW etc.) we don't
+            // model. lParam may be NULL to clear the part.
+            let part = (wparam & 0xff) as usize;
+            const MAX_PART_TEXT: u32 = 256;
+            let text = if lparam == 0 {
+                String::new()
+            } else if message == sb::SETTEXTW {
+                String::from_utf16_lossy(&read_wstr(ctx, lparam, MAX_PART_TEXT)?)
+            } else {
+                read_cstr_string(ctx, lparam, MAX_PART_TEXT)?
+            };
+            log::debug!("SB_SETTEXT(part={part}) {text:?}");
+            let bar = ctx.kernel.status_bar.get_or_insert_with(Default::default);
+            bar.set_part_text(part, text);
+            // The control repaints itself; the app never invalidates it.
+            repaint_status_bar(ctx);
+            Ok(Some(1))
+        }
+        sb::GETPARTS => {
+            let bar = match ctx.kernel.status_bar.as_ref() {
+                Some(b) => b,
+                None => return Ok(Some(0)),
+            };
+            let have = bar.part_edges.len();
+            let want = (wparam as usize).min(have);
+            let edges: Vec<i32> = bar.part_edges[..want].to_vec();
+            if lparam != 0 {
+                for (i, edge) in edges.iter().enumerate() {
+                    let addr = lparam.wrapping_add((i * 4) as u32);
+                    ctx.cpu.write_mem(addr, &edge.to_le_bytes())?;
+                }
+            }
+            Ok(Some(have as u32))
+        }
+        sb::GETTEXTW | sb::GETTEXTA => {
+            let part = (wparam & 0xff) as usize;
+            let text = ctx
+                .kernel
+                .status_bar
+                .as_ref()
+                .and_then(|b| b.part_text.get(part))
+                .cloned()
+                .unwrap_or_default();
+            if lparam != 0 {
+                if message == sb::GETTEXTW {
+                    let mut buf: Vec<u8> = text
+                        .encode_utf16()
+                        .flat_map(|u| u.to_le_bytes())
+                        .collect();
+                    buf.extend_from_slice(&[0, 0]);
+                    ctx.cpu.write_mem(lparam, &buf)?;
+                } else {
+                    let mut buf: Vec<u8> = text.bytes().collect();
+                    buf.push(0);
+                    ctx.cpu.write_mem(lparam, &buf)?;
+                }
+            }
+            // LOWORD = length; HIWORD = drawing style (0 = plain).
+            Ok(Some(text.chars().count() as u32 & 0xffff))
+        }
+        // SB_SIMPLE toggles between the multi-part and single-part
+        // views. We always render the parts we were given, so just
+        // acknowledge it.
+        sb::SIMPLE => Ok(Some(1)),
+        _ => Ok(None),
+    }
+}
+
+/// Repaint the status bar strip straight into the framebuffer.
+///
+/// On a device the control owns those pixels and invalidates itself
+/// when its text changes; the application never repaints it, so waiting
+/// for the guest's next `WM_PAINT` would leave the bar blank (and the
+/// guest's own paint would overdraw it anyway).
+fn repaint_status_bar(ctx: &mut CallCtx<'_>) {
+    let Some(bar) = ctx.kernel.status_bar.clone() else {
+        return;
+    };
+    let mut surf = Surface::Screen(&mut ctx.kernel.framebuffer);
+    bar.render(&mut surf);
+    ctx.kernel.framebuffer.mark_dirty();
+}
+
 fn send_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
     let message = ctx.arg_u32(1)?;
     let wparam = ctx.arg_u32(2)?;
     let lparam = ctx.arg_u32(3)?;
+    // The status bar is a control we implement ourselves — its messages
+    // must never trampoline into the application's WndProc.
+    if hwnd == FAKE_STATUSBAR_HWND {
+        if let Some(r) = status_bar_message(ctx, message, wparam, lparam)? {
+            return Ok(DispatchOutcome::ReturnedR0(r));
+        }
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
     let proc = ctx
         .kernel
         .window_procs
@@ -5769,7 +5910,7 @@ fn bit_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     log::debug!(
         "BitBlt(dst=0x{hdc_dst:08x} dst=({x},{y},{cx}x{cy}) src=0x{hdc_src:08x} src=({x1},{y1}) rop=0x{rop:08x})"
     );
-    bit_blt_inner(ctx, hdc_dst, x, y, cx, cy, hdc_src, x1, y1)?;
+    bit_blt_inner(ctx, hdc_dst, x, y, cx, cy, hdc_src, x1, y1, rop)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -5910,6 +6051,7 @@ fn bit_blt_inner(
     hdc_src: u32,
     x1: i32,
     y1: i32,
+    rop: u32,
 ) -> Result<(), KernelError> {
     // Materialise the source pixels into a kernel-level scratch
     // `Vec<u8>` instead of cloning the full source surface every
@@ -5918,6 +6060,34 @@ fn bit_blt_inner(
     // screen->memory blit, churning megabytes per frame through the
     // allocator. Reusing one buffer across the whole run amortises
     // away that allocation pressure.
+    // The pattern operand comes from the destination DC's selected
+    // brush. Only a handful of ROP codes reference it, so a missing DC
+    // is not itself a reason to bail.
+    let pat = ctx
+        .kernel
+        .gdi
+        .dc(hdc_dst)
+        .map(|d| colorref_to_rgb565(d.brush_color))
+        .unwrap_or(0);
+
+    // ROPs that ignore the source (BLACKNESS, WHITENESS, DSTINVERT,
+    // PATCOPY, ...) need no source rectangle at all — real GDI does not
+    // read one, and requiring a valid `hdcSrc` here would drop the
+    // operation entirely.
+    if !rop3::uses_src(rop) {
+        if hdc_dst == GDI_SCREEN_DC {
+            adapt_panel_to_presentation(ctx, x, y, cx, cy);
+        }
+        if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc_dst) {
+            dst.fill_rect_rop(x, y, cx, cy, pat, rop);
+        }
+        sync_dst_dib_to_guest(ctx, hdc_dst)?;
+        if hdc_dst == GDI_SCREEN_DC {
+            ctx.kernel.framebuffer.mark_dirty();
+        }
+        return Ok(());
+    }
+
     let mut scratch = std::mem::take(&mut ctx.kernel.bit_blt_src_scratch);
     let mut decode_scratch = std::mem::take(&mut ctx.kernel.dib_decode_scratch);
 
@@ -5929,7 +6099,7 @@ fn bit_blt_inner(
 
     if ok && src_w != 0 && src_h != 0 {
         if let Some(mut dst) = surface_for_dc(ctx.kernel, hdc_dst) {
-            dst.blit_from_bytes(x, y, x1, y1, cx, cy, &scratch, src_w, src_h);
+            dst.blit_from_bytes_rop(x, y, x1, y1, cx, cy, &scratch, src_w, src_h, rop, pat);
         }
     }
 
@@ -7502,14 +7672,20 @@ fn pat_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let y = ctx.arg_u32(2)? as i32;
     let w = ctx.arg_u32(3)? as i32;
     let h = ctx.arg_u32(4)? as i32;
-    let _rop = ctx.arg_u32(5)?;
+    let rop = ctx.arg_u32(5)?;
     let dc_meta = match ctx.kernel.gdi.dc(hdc).cloned() {
         Some(d) => d,
         None => return Ok(DispatchOutcome::ReturnedR0(0)),
     };
     let rgb = colorref_to_rgb565(dc_meta.brush_color);
     if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
-        surf.fill_rect(x, y, w, h, rgb);
+        // PatBlt has no source operand, so BLACKNESS/WHITENESS/
+        // DSTINVERT/PATINVERT are as common here as PATCOPY.
+        surf.fill_rect_rop(x, y, w, h, rgb, rop);
+    }
+    sync_dst_dib_to_guest(ctx, hdc)?;
+    if hdc == GDI_SCREEN_DC {
+        ctx.kernel.framebuffer.mark_dirty();
     }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -7527,8 +7703,8 @@ fn stretch_blt(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let sy = ctx.arg_u32(7)? as i32;
     let _sw = ctx.arg_u32(8)? as i32;
     let _sh = ctx.arg_u32(9)? as i32;
-    let _rop = ctx.arg_u32(10)?;
-    bit_blt_inner(ctx, hdc_dst, dx, dy, dw, dh, hdc_src, sx, sy)?;
+    let rop = ctx.arg_u32(10)?;
+    bit_blt_inner(ctx, hdc_dst, dx, dy, dw, dh, hdc_src, sx, sy, rop)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -10316,7 +10492,18 @@ fn transparent_image(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let sh = ctx.arg_u32(9)? as i32;
     let _color = ctx.arg_u32(10).unwrap_or(0);
     let _flags = ctx.arg_u32(11).unwrap_or(0);
-    bit_blt_inner(ctx, dst, dx, dy, dw.min(sw), dh.min(sh), src, sx, sy)?;
+    bit_blt_inner(
+        ctx,
+        dst,
+        dx,
+        dy,
+        dw.min(sw),
+        dh.min(sh),
+        src,
+        sx,
+        sy,
+        pocket_kernel::gdi::rop3::SRCCOPY,
+    )?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -10514,6 +10701,7 @@ mod tests {
             create_frame: None,
             create_stage: pocket_kernel::CreateStage::Idle,
             dialog_frame: None,
+            status_bar: None,
             pending_input: std::collections::VecDeque::new(),
             gapi_keys_queried: false,
             pending_message: None,

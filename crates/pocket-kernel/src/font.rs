@@ -223,6 +223,28 @@ pub fn draw_char(surf: &mut Surface<'_>, x: i32, y: i32, ch: char, color: u16) {
     }
 }
 
+/// Draw a Rust string left-to-right at `(x, y)` in `color`, returning
+/// the advance in pixels. Non-ASCII characters render as `?`, matching
+/// [`draw_str_u16`].
+pub fn draw_str(surf: &mut Surface<'_>, x: i32, y: i32, s: &str, color: u16) -> i32 {
+    let mut cx = x;
+    for ch in s.chars() {
+        let ch = if ch.is_ascii_graphic() || ch == ' ' {
+            ch
+        } else {
+            '?'
+        };
+        draw_char(surf, cx, y, ch, color);
+        cx += GLYPH_W;
+    }
+    cx - x
+}
+
+/// Width in pixels [`draw_str`] would advance for `s`.
+pub fn str_width(s: &str) -> i32 {
+    s.chars().count() as i32 * GLYPH_W
+}
+
 /// Draw a UTF-16 string left-to-right at `(x, y)` in `color`.
 /// Characters outside ASCII are rendered as `?`.
 pub fn draw_str_u16(surf: &mut Surface<'_>, x: i32, y: i32, s: &[u16], color: u16) -> i32 {

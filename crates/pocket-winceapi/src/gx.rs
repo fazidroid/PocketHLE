@@ -307,6 +307,7 @@ mod tests {
             create_frame: None,
             create_stage: pocket_kernel::CreateStage::Idle,
             dialog_frame: None,
+            status_bar: None,
             pending_input: std::collections::VecDeque::new(),
             gapi_keys_queried: false,
             pending_message: None,

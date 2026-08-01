@@ -295,6 +295,132 @@ pub struct WaveOutState {
     pub function_frame: Option<GuestCallFrame>,
 }
 
+/// A commctrl status bar created via `CreateStatusWindow{A,W}`.
+///
+/// Pocket PC titles use this for the strip along the bottom edge of
+/// the client area — PPC2002 Solitaire puts `Time: n` and `Score: n`
+/// there. The control owns its own pixels on a real device: the app
+/// only ever sends it `SB_SETPARTS` / `SB_SETTEXT`, and never paints
+/// the text itself (Solitaire imports no text-output API at all). So
+/// the HLE has to both remember the parts and draw them.
+#[derive(Debug, Clone, Default)]
+pub struct StatusBar {
+    /// Parent window the bar is docked to the bottom of.
+    pub parent: u32,
+    /// Height in pixels, from the `CreateStatusWindow` call.
+    pub height: i32,
+    /// Right edge of each part, in client coordinates, as handed to us
+    /// by `SB_SETPARTS`. A trailing `-1` means "out to the right edge"
+    /// and is stored as the client width at draw time.
+    pub part_edges: Vec<i32>,
+    /// Current text of each part, indexed by part number. Sparse:
+    /// `SB_SETTEXT` may set part 3 before part 0 exists.
+    pub part_text: Vec<String>,
+    /// Cleared whenever the text or parts change so the next frame
+    /// repaints the strip.
+    pub dirty: bool,
+}
+
+impl StatusBar {
+    /// Height a real Pocket PC status bar occupies. The control sizes
+    /// itself from the UI font on a device; we can't, so this is
+    /// measured off the PPC2002 reference screenshot, where the strip
+    /// spans rows 275..294 of a 320-row screen — 19 px. Our built-in
+    /// font is 8 px tall, which [`Self::render`] centres in that space.
+    ///
+    /// Note the reference has 45 px of chrome below the board, but the
+    /// remaining 26 px are the shell's "New Tools" command bar, a
+    /// separate window PocketHLE doesn't draw at all.
+    pub const DEFAULT_HEIGHT: i32 = 19;
+
+    /// Face colour — the classic `COLOR_BTNFACE` light grey.
+    const BG: u16 = 0xC618;
+    /// Text colour (`COLOR_BTNTEXT`).
+    const FG: u16 = 0x0000;
+    /// One-pixel highlight along the top edge, which is what makes the
+    /// strip read as a raised control rather than a painted rectangle.
+    const EDGE: u16 = 0xFFFF;
+
+    /// Store `text` for `part`, growing the sparse vector as needed.
+    pub fn set_part_text(&mut self, part: usize, text: String) {
+        if part >= self.part_text.len() {
+            self.part_text.resize(part + 1, String::new());
+        }
+        if self.part_text[part] != text {
+            self.part_text[part] = text;
+            self.dirty = true;
+        }
+    }
+
+    /// Replace the part layout. Edges are right-hand x coordinates in
+    /// client space; a negative edge means "extend to the right margin".
+    pub fn set_parts(&mut self, edges: Vec<i32>) {
+        if self.part_edges != edges {
+            self.part_edges = edges;
+            self.dirty = true;
+        }
+    }
+
+    /// Effective height in pixels.
+    pub fn height(&self) -> i32 {
+        if self.height > 0 {
+            self.height
+        } else {
+            Self::DEFAULT_HEIGHT
+        }
+    }
+
+    /// `[left, right)` x range of part `i` for a `client_w`-wide bar.
+    fn part_span(&self, i: usize, client_w: i32) -> (i32, i32) {
+        let left = if i == 0 {
+            0
+        } else {
+            self.part_edges.get(i - 1).copied().unwrap_or(0)
+        };
+        // SB_SETPARTS uses -1 for the final part to mean "run out to
+        // the right edge"; anything unset behaves the same way.
+        let right = match self.part_edges.get(i).copied() {
+            Some(edge) if edge >= 0 => edge,
+            _ => client_w,
+        };
+        (left.clamp(0, client_w), right.clamp(0, client_w))
+    }
+
+    /// Paint the bar along the bottom edge of `surf`.
+    ///
+    /// Called after the guest finishes its own `WM_PAINT`: on a device
+    /// the bar is a sibling window that paints itself *after* the parent
+    /// has filled the client area, and Solitaire does blit over the full
+    /// client rect, so painting earlier would just be overdrawn.
+    pub fn render(&self, surf: &mut Surface<'_>) {
+        let (surf_w, surf_h) = surf.dimensions();
+        let (client_w, client_h) = (surf_w as i32, surf_h as i32);
+        let bar_h = self.height().min(client_h);
+        if bar_h <= 0 || client_w <= 0 {
+            return;
+        }
+        let top = client_h - bar_h;
+        surf.fill_rect(0, top, client_w, bar_h, Self::BG);
+        surf.fill_rect(0, top, client_w, 1, Self::EDGE);
+
+        let text_y = top + 1 + ((bar_h - 1 - font::GLYPH_H) / 2).max(0);
+        for (i, text) in self.part_text.iter().enumerate() {
+            if text.is_empty() {
+                continue;
+            }
+            let (left, right) = self.part_span(i, client_w);
+            // Truncate rather than spill into the neighbouring part.
+            let room = (right - left - 4).max(0);
+            let max_chars = (room / font::GLYPH_W) as usize;
+            if max_chars == 0 {
+                continue;
+            }
+            let shown: String = text.chars().take(max_chars).collect();
+            font::draw_str(surf, left + 2, text_y, &shown, Self::FG);
+        }
+    }
+}
+
 /// Registers of the API call we interrupted to run a guest callback
 /// (`waveOutProc`, a `WndProc` receiving `WM_CREATE`, ...), so the
 /// interrupted call can be resumed transparently afterwards.
@@ -596,6 +722,13 @@ pub struct KernelState {
     /// dialog HWND is only returned to the caller once the callback
     /// unwinds, otherwise the caller stores the callback's `BOOL`.
     pub dialog_frame: Option<GuestCallFrame>,
+    /// Bottom status bar created via commctrl's `CreateStatusWindowW`.
+    ///
+    /// Pocket PC apps get a real shell-drawn bar here; PocketHLE has no
+    /// shell, so we keep the text the guest pushes at it via
+    /// `SB_SETTEXT` and paint it ourselves at the bottom of the screen.
+    /// `None` until the guest actually asks for a status window.
+    pub status_bar: Option<StatusBar>,
     /// Input events queued by the host frontend (mouse / D-pad /
     /// keyboard). Drained by `GetMessageW` / `PeekMessageW` before
     /// any synthetic timer / paint message is fabricated, so real
@@ -1477,6 +1610,7 @@ impl Process {
                 create_frame: None,
                 create_stage: CreateStage::Idle,
                 dialog_frame: None,
+            status_bar: None,
                 pending_input: VecDeque::new(),
                 gapi_keys_queried: false,
                 pending_message: None,
@@ -1908,6 +2042,79 @@ mod tests {
     use super::*;
     use pocket_cpu::stub::StubCpu;
     use pocket_pe::{LoadedImage, LoadedSection};
+
+    /// `SB_SETPARTS` hands us right-hand edges, with a trailing -1
+    /// meaning "out to the right margin". Solitaire uses exactly
+    /// `[70, -1]`, so part 1 must start at 70 and run to the edge.
+    #[test]
+    fn status_bar_part_spans_follow_edges() {
+        let mut bar = StatusBar::default();
+        bar.set_parts(vec![70, -1]);
+        assert_eq!(bar.part_span(0, 240), (0, 70));
+        assert_eq!(bar.part_span(1, 240), (70, 240));
+    }
+
+    /// An unset trailing edge behaves like -1 rather than collapsing
+    /// the part to zero width.
+    #[test]
+    fn status_bar_missing_edge_runs_to_margin() {
+        let mut bar = StatusBar::default();
+        bar.set_parts(vec![50]);
+        assert_eq!(bar.part_span(0, 200), (0, 50));
+        assert_eq!(bar.part_span(1, 200), (50, 200));
+    }
+
+    /// `SB_SETTEXT` may address a high part before the lower ones
+    /// exist; the sparse vector has to grow instead of panicking.
+    #[test]
+    fn status_bar_set_text_grows_sparsely() {
+        let mut bar = StatusBar::default();
+        bar.set_part_text(3, "Score: 0".into());
+        assert_eq!(bar.part_text.len(), 4);
+        assert_eq!(bar.part_text[3], "Score: 0");
+        assert!(bar.part_text[0].is_empty());
+        assert!(bar.dirty);
+    }
+
+    /// Re-setting identical text must not mark the bar dirty — the
+    /// game re-sends both parts on every timer tick.
+    #[test]
+    fn status_bar_identical_text_is_not_dirty() {
+        let mut bar = StatusBar::default();
+        bar.set_part_text(0, "Time: 0 ".into());
+        bar.dirty = false;
+        bar.set_part_text(0, "Time: 0 ".into());
+        assert!(!bar.dirty);
+        bar.set_part_text(0, "Time: 1 ".into());
+        assert!(bar.dirty);
+    }
+
+    /// The strip occupies the bottom `height` rows and nothing above.
+    #[test]
+    fn status_bar_renders_only_bottom_strip() {
+        let mut bm = crate::gdi::Bitmap::new(64, 40);
+        {
+            let mut surf = Surface::Bitmap(&mut bm);
+            surf.fill_rect(0, 0, 64, 40, 0x07E0); // green field
+            let mut bar = StatusBar {
+                height: 16,
+                ..Default::default()
+            };
+            bar.set_parts(vec![30, -1]);
+            bar.set_part_text(0, "Time: 0".into());
+            bar.render(&mut surf);
+        }
+        let px = |x: usize, y: usize| -> u16 {
+            let o = (y * 64 + x) * 2;
+            u16::from_le_bytes([bm.pixels[o], bm.pixels[o + 1]])
+        };
+        // Untouched above the strip.
+        assert_eq!(px(0, 0), 0x07E0);
+        assert_eq!(px(63, 23), 0x07E0);
+        // Highlight row, then face colour below it.
+        assert_eq!(px(0, 24), 0xFFFF);
+        assert_eq!(px(63, 39), 0xC618);
+    }
 
     #[test]
     fn heap_alloc_then_free_round_trips() {
