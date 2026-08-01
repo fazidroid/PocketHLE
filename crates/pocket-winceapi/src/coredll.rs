@@ -377,7 +377,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "SetCapture", FAKE_HWND, one_returning);
     d.register_constant(dll, "ReleaseCapture", 1, one_returning);
     d.register_handler(dll, "SetFocus", set_focus);
-    d.register_constant(dll, "SetWindowPos", 1, one_returning);
+    d.register_handler(dll, "SetWindowPos", set_window_pos);
     d.register_constant(dll, "AdjustWindowRectEx", 1, one_returning);
     d.register_constant(dll, "MapWindowPoints", 1, one_returning);
     d.register_constant(dll, "ClipCursor", 1, one_returning);
@@ -4671,6 +4671,26 @@ fn show_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         }
     }
     let hwnd = ctx.arg_u32(0)?;
+    // A control or panel: `ShowWindow` is how an app hides part of a
+    // dialog it built from a template. Solitaire shows and hides its
+    // Time and Score readouts this way.
+    let cmd_show = ctx.arg_u32(1).unwrap_or(1);
+    let show = cmd_show != SW_HIDE;
+    if let Some(child) = ctx.kernel.controls.get_mut(hwnd) {
+        let id = child.id;
+        child.visible = show;
+        log::debug!("ShowWindow(control id={id}, cmd={cmd_show}) -> visible={show}");
+        repaint_controls(ctx);
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    if let Some(panel) = ctx.kernel.controls.panel_mut(hwnd) {
+        panel.visible = show;
+        if ctx.kernel.wnd_proc != 0 {
+            ctx.kernel.pending_message = Some((WM_PAINT, 0, 0));
+        }
+        repaint_controls(ctx);
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
     let wnd_proc = ctx.kernel.window_procs.get(&hwnd).copied().unwrap_or(0);
     // Only the first show of the main window needs the sizing pass, and
     // only once no other guest-callback detour is already in flight.
@@ -5307,6 +5327,13 @@ const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
 const WM_SIZE: u32 = 0x0005;
+
+// Window styles read off a `DLGTEMPLATE`.
+const WS_VISIBLE: u32 = 0x1000_0000;
+const WS_BORDER: u32 = 0x0080_0000;
+
+/// `ShowWindow(SW_HIDE)`.
+const SW_HIDE: u32 = 0;
 const WM_ACTIVATE: u32 = 0x0006;
 const WM_SETFOCUS: u32 = 0x0007;
 const WM_SHOWWINDOW: u32 = 0x0018;
@@ -5498,6 +5525,57 @@ fn move_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         child.w = w;
         child.h = h;
         log::debug!("MoveWindow(0x{hwnd:08x}) -> ({x},{y},{w},{h})");
+        repaint_controls(ctx);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `SetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags)`
+///
+/// The same repositioning as [`move_window`], reached by a different
+/// route: the caller may ask for the move only, the resize only, or
+/// neither, via `SWP_NOMOVE` / `SWP_NOSIZE`.
+fn set_window_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    /// `SWP_NOSIZE`.
+    const SWP_NOSIZE: u32 = 0x0001;
+    /// `SWP_NOMOVE`.
+    const SWP_NOMOVE: u32 = 0x0002;
+
+    let hwnd = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(2)? as i32;
+    let y = ctx.arg_u32(3)? as i32;
+    let w = ctx.arg_u32(4)? as i32;
+    let h = ctx.arg_u32(5)? as i32;
+    let flags = ctx.arg_u32(6).unwrap_or(0);
+    log::debug!("SetWindowPos(0x{hwnd:08x}, ({x},{y},{w},{h}), flags=0x{flags:04x})");
+    let moved = flags & SWP_NOMOVE == 0;
+    let sized = flags & SWP_NOSIZE == 0;
+    if let Some(child) = ctx.kernel.controls.get_mut(hwnd) {
+        if moved {
+            child.x = x;
+            child.y = y;
+        }
+        if sized {
+            child.w = w;
+            child.h = h;
+        }
+        repaint_controls(ctx);
+    } else if let Some(panel) = ctx.kernel.controls.panel_mut(hwnd) {
+        if moved {
+            panel.x = x;
+            panel.y = y;
+        }
+        if sized {
+            panel.w = w;
+            panel.h = h;
+        }
+        // Moving the panel moves its children with it and uncovers
+        // whatever it used to sit over, so the frame window has to
+        // repaint too — the controls alone would leave the old panel
+        // face behind.
+        if ctx.kernel.wnd_proc != 0 {
+            ctx.kernel.pending_message = Some((WM_PAINT, 0, 0));
+        }
         repaint_controls(ctx);
     }
     Ok(DispatchOutcome::ReturnedR0(1))
@@ -7640,10 +7718,15 @@ fn get_client_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 fn get_window_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
     let lp_rect = ctx.arg_u32(1)?;
-    // A control's window rect is where it sits in its parent — and since
-    // the parent is full-screen here, those are also screen coordinates.
-    if let Some(child) = ctx.kernel.controls.get(hwnd) {
-        let (x, y, w, h) = (child.x, child.y, child.w, child.h);
+    // A control's window rect is where it sits on screen, which for a
+    // control inside a dialog means through its panel's origin.
+    let rect = ctx.kernel.controls.screen_rect(hwnd).or_else(|| {
+        ctx.kernel
+            .controls
+            .panel(hwnd)
+            .map(|p| (p.x, p.y, p.w, p.h))
+    });
+    if let Some((x, y, w, h)) = rect {
         if lp_rect != 0 {
             let mut buf = [0u8; 16];
             buf[0..4].copy_from_slice(&x.to_le_bytes());
@@ -9666,6 +9749,133 @@ fn get_class_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// Strip the `&` mnemonic markers from a control caption.
+///
+/// Win32 underlines the following character instead of drawing the
+/// ampersand; our 6x8 font has no underline, so `E&xit` simply reads
+/// `Exit`. A literal ampersand is escaped as `&&`.
+fn strip_mnemonics(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '&' {
+            out.push(c);
+        } else if let Some('&') = chars.clone().next() {
+            chars.next();
+            out.push('&');
+        }
+    }
+    out
+}
+
+/// Create the panel and controls a `DLGTEMPLATE` describes.
+///
+/// On a device `USER` walks the template and creates every child before
+/// `WM_INITDIALOG` is delivered, so the `DialogProc` can already reach
+/// them with `GetDlgItem` — which is exactly what Solitaire does, calling
+/// `GetDlgItem` ten times and `SetDlgItemTextW` four times for its Time
+/// and Score readouts. Ignoring the template left the dialog an empty
+/// rectangle and those calls addressing nothing.
+fn build_dialog_from_template(ctx: &mut CallCtx<'_>, lp_template: u32) {
+    use crate::dlgtemplate::{class_ordinal, Dlu, ItemClass};
+    use pocket_kernel::controls::{ControlClass, DialogPanel};
+
+    /// How much of the blob to read. A template is variable-length and
+    /// nothing tells us where it ends, so take a window comfortably
+    /// larger than any real dialog and let the parser stop at `cdit`.
+    const TEMPLATE_WINDOW: u32 = 4096;
+
+    if lp_template == 0 {
+        return;
+    }
+    // Templates live in the resource section, which may end before the
+    // full window — back off until a read succeeds.
+    let mut bytes = None;
+    for len in [TEMPLATE_WINDOW, 1024, 256, 64] {
+        if let Ok(b) = ctx.cpu.read_mem(lp_template, len) {
+            bytes = Some(b);
+            break;
+        }
+    }
+    let Some(bytes) = bytes else {
+        log::debug!("CreateDialogIndirectParamW: template at 0x{lp_template:08x} unreadable");
+        return;
+    };
+    let Some(tmpl) = crate::dlgtemplate::parse(&bytes) else {
+        log::debug!("CreateDialogIndirectParamW: template at 0x{lp_template:08x} did not parse");
+        return;
+    };
+
+    let dlu = Dlu::default();
+    let (px, py, pw, ph) = dlu.to_px(tmpl.x as i32, tmpl.y as i32, tmpl.cx as i32, tmpl.cy as i32);
+    let border = tmpl.style & WS_BORDER != 0;
+    let frame = 2 * i32::from(border);
+    // The template's cx/cy describe the *client* area; the border sits
+    // outside it.
+    let (win_w, win_h) = (pw + frame, ph + frame);
+    // A template is authored against the screen its dialog was designed
+    // for. Solitaire's panel is positioned at 267 DLU, past the right
+    // edge of a 480 px screen, and the app corrects it immediately by
+    // reading the width back with `GetWindowRect` and `SetWindowPos`ing
+    // the panel against the edge. Clamp so the panel is on screen even
+    // if an app never does that.
+    let (screen_w, screen_h) = screen_dims(ctx);
+    let x = px.min(screen_w as i32 - win_w).max(0);
+    let y = py.min(screen_h as i32 - win_h).max(0);
+
+    // Clear a previous incarnation first: this also drops the old panel,
+    // so it has to happen before the new one is registered.
+    ctx.kernel.controls.destroy_children_of(FAKE_DIALOG_HWND);
+    ctx.kernel.controls.add_panel(DialogPanel {
+        hwnd: FAKE_DIALOG_HWND,
+        x,
+        y,
+        w: win_w,
+        h: win_h,
+        visible: tmpl.style & WS_VISIBLE != 0,
+        border,
+    });
+
+    for item in &tmpl.items {
+        let class = match &item.class {
+            ItemClass::Ordinal(class_ordinal::BUTTON) => ControlClass::Button,
+            ItemClass::Ordinal(class_ordinal::EDIT) => ControlClass::Edit,
+            ItemClass::Ordinal(class_ordinal::STATIC) => ControlClass::Static,
+            other => {
+                // Listboxes, combos, scrollbars and custom classes are
+                // not modelled; skipping one loses a control but keeps
+                // the rest of the dialog.
+                log::debug!("dialog item id={} class {other:?} not modelled", item.id);
+                continue;
+            }
+        };
+        let (ix, iy, iw, ih) =
+            dlu.to_px(item.x as i32, item.y as i32, item.cx as i32, item.cy as i32);
+        let hwnd = ctx.kernel.controls.create(
+            FAKE_DIALOG_HWND,
+            class,
+            item.id as u32,
+            strip_mnemonics(&item.title),
+            item.style,
+            ix,
+            iy,
+            iw,
+            ih,
+        );
+        log::debug!(
+            "dialog item id={} {:?} \"{}\" at ({ix},{iy},{iw},{ih}) -> hwnd=0x{hwnd:08x}",
+            item.id,
+            class,
+            strip_mnemonics(&item.title),
+        );
+    }
+    log::debug!(
+        "CreateDialogIndirectParamW: panel at ({x},{y},{win_w},{win_h}) with {} controls",
+        tmpl.items.len()
+    );
+    repaint_controls(ctx);
+}
+
 /// `CreateDialogIndirectParamW(hInstance, lpTemplate, hWndParent, lpDialogFunc, dwInitParam)`
 ///
 /// Creates the dialog *and* delivers `WM_INITDIALOG` to `lpDialogFunc`
@@ -9699,6 +9909,8 @@ fn create_dialog_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutco
     }
     let dialog_proc = ctx.arg_u32(3)?;
     let init_param = ctx.arg_u32(4).unwrap_or(0);
+    let lp_template = ctx.arg_u32(1)?;
+    build_dialog_from_template(ctx, lp_template);
     if dialog_proc == 0 {
         return Ok(DispatchOutcome::ReturnedR0(FAKE_DIALOG_HWND));
     }

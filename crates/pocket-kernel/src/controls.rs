@@ -57,6 +57,50 @@ const BS_AUTORADIOBUTTON: u32 = 0x0009;
 
 /// `WS_VISIBLE`.
 const WS_VISIBLE: u32 = 0x1000_0000;
+/// `WS_DISABLED`.
+const WS_DISABLED: u32 = 0x0800_0000;
+
+/// A dialog window that owns controls, positioned in screen space.
+///
+/// Dialogs built from a `DLGTEMPLATE` are containers: the template gives
+/// the panel a rectangle and every item a rectangle *inside* it. Keeping
+/// the panel here — rather than flattening its children to screen
+/// coordinates at creation — is what lets the application move the whole
+/// thing afterwards, which Solitaire does: it reads the panel's width
+/// back with `GetWindowRect` and `SetWindowPos`es it against the right
+/// edge of the screen.
+#[derive(Debug, Clone)]
+pub struct DialogPanel {
+    pub hwnd: u32,
+    /// Top-left of the *window*, in screen coordinates. Children are
+    /// laid out relative to the client area just inside the border.
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub visible: bool,
+    /// `WS_BORDER` — the one-pixel black frame around the panel.
+    pub border: bool,
+}
+
+impl DialogPanel {
+    /// Client origin: one pixel in from each edge when the panel has a
+    /// border, otherwise the window origin itself.
+    pub fn client_origin(&self) -> (i32, i32) {
+        let inset = i32::from(self.border);
+        (self.x + inset, self.y + inset)
+    }
+
+    fn render(&self, surf: &mut Surface<'_>) {
+        if !self.visible || self.w <= 0 || self.h <= 0 {
+            return;
+        }
+        surf.fill_rect(self.x, self.y, self.w, self.h, ChildWindow::FACE);
+        if self.border {
+            stroke(surf, self.x, self.y, self.w, self.h, ChildWindow::TEXT);
+        }
+    }
+}
 
 /// One built-in control owned by the HLE rather than by the guest.
 #[derive(Debug, Clone)]
@@ -81,6 +125,11 @@ pub struct ChildWindow {
     pub w: i32,
     pub h: i32,
     pub visible: bool,
+    /// `WS_DISABLED` clear. A disabled control draws its caption in the
+    /// etched grey Win32 uses, never takes the focus, and swallows taps
+    /// without notifying its parent — Solitaire ships its Undo button
+    /// disabled until there is a move to undo.
+    pub enabled: bool,
     /// Depressed while the stylus is held down inside a push button.
     pub pressed: bool,
     /// `BM_SETCHECK` state of a check box or radio button.
@@ -152,9 +201,25 @@ impl ChildWindow {
 
     /// Can this control take the input focus? Statics never do, which
     /// is what keeps a tap on a label from stealing the caret from an
-    /// edit field.
+    /// edit field, and neither does a disabled control.
     pub fn is_focusable(&self) -> bool {
-        self.class != ControlClass::Static
+        self.class != ControlClass::Static && self.enabled
+    }
+
+    /// Draw a caption, etched when the control is disabled.
+    ///
+    /// Win32 has no grey text colour for this: it embosses instead,
+    /// stamping the string in `COLOR_BTNHIGHLIGHT` one pixel down and
+    /// right and then in `COLOR_BTNSHADOW` on top. The result reads as
+    /// engraved into the face rather than merely faint, which is what
+    /// makes Solitaire's disabled Undo button obviously dead.
+    fn draw_caption(&self, surf: &mut Surface<'_>, x: i32, y: i32, right: i32) {
+        if self.enabled {
+            draw_clipped(surf, x, y, &self.text, Self::TEXT, right);
+            return;
+        }
+        draw_clipped(surf, x + 1, y + 1, &self.text, Self::LIGHT, right + 1);
+        draw_clipped(surf, x, y, &self.text, Self::SHADOW, right);
     }
 
     /// Paint the control. `focused` drives the focus rectangle and the
@@ -201,7 +266,7 @@ impl ChildWindow {
         let text_w = font::str_width(&self.text);
         let tx = x + ((w - text_w) / 2).max(1) + nudge;
         let ty = y + ((h - font::GLYPH_H) / 2).max(0) + nudge;
-        draw_clipped(surf, tx, ty, &self.text, Self::TEXT, x + w - 2);
+        self.draw_caption(surf, tx, ty, x + w - 2);
 
         if focused {
             dotted_rect(surf, x + 3, y + 3, w - 6, h - 6, Self::TEXT);
@@ -220,14 +285,22 @@ impl ChildWindow {
         }
         let tx = self.x + side + 4;
         let ty = self.y + ((self.h - font::GLYPH_H) / 2).max(0);
-        draw_clipped(surf, tx, ty, &self.text, Self::TEXT, self.x + self.w);
+        self.draw_caption(surf, tx, ty, self.x + self.w);
         if focused {
             dotted_rect(surf, tx - 2, self.y, self.w - side - 2, self.h, Self::TEXT);
         }
     }
 
     fn render_edit(&self, surf: &mut Surface<'_>, focused: bool) {
-        surf.fill_rect(self.x, self.y, self.w, self.h, Self::WINDOW);
+        // A disabled edit takes the button face rather than the window
+        // colour, which is how Win32 says "read-only" without changing
+        // the text.
+        let bg = if self.enabled {
+            Self::WINDOW
+        } else {
+            Self::FACE
+        };
+        surf.fill_rect(self.x, self.y, self.w, self.h, bg);
         // Sunken: shadow along the top/left, highlight along the
         // bottom/right — the inverse of a raised button.
         draw_edge(
@@ -264,7 +337,7 @@ impl ChildWindow {
 
     fn render_static(&self, surf: &mut Surface<'_>) {
         let ty = self.y + ((self.h - font::GLYPH_H) / 2).max(0);
-        draw_clipped(surf, self.x, ty, &self.text, Self::TEXT, self.x + self.w);
+        self.draw_caption(surf, self.x, ty, self.x + self.w);
     }
 }
 
@@ -338,6 +411,9 @@ pub enum ControlAction {
 #[derive(Debug, Clone)]
 pub struct Controls {
     children: Vec<ChildWindow>,
+    /// Dialog panels created from a `DLGTEMPLATE`. A child whose parent
+    /// is one of these is positioned relative to it.
+    panels: Vec<DialogPanel>,
     /// Handle of the control holding the input focus, or `0`.
     pub focus: u32,
     next_hwnd: u32,
@@ -351,6 +427,7 @@ impl Default for Controls {
     fn default() -> Self {
         Self {
             children: Vec::new(),
+            panels: Vec::new(),
             focus: 0,
             next_hwnd: Self::HWND_BASE,
             capture: 0,
@@ -405,10 +482,43 @@ impl Controls {
             w,
             h,
             visible: style & WS_VISIBLE != 0,
+            enabled: style & WS_DISABLED == 0,
             pressed: false,
             checked: false,
         });
         hwnd
+    }
+
+    /// Register a dialog panel, replacing any previous one with the same
+    /// handle — a guest that recreates a dialog gets a fresh panel
+    /// rather than two stacked on each other.
+    pub fn add_panel(&mut self, panel: DialogPanel) {
+        self.panels.retain(|p| p.hwnd != panel.hwnd);
+        self.panels.push(panel);
+    }
+
+    pub fn panel(&self, hwnd: u32) -> Option<&DialogPanel> {
+        self.panels.iter().find(|p| p.hwnd == hwnd)
+    }
+
+    pub fn panel_mut(&mut self, hwnd: u32) -> Option<&mut DialogPanel> {
+        self.panels.iter_mut().find(|p| p.hwnd == hwnd)
+    }
+
+    /// Screen-space origin a child's coordinates are relative to: its
+    /// panel's client origin, or `(0, 0)` for a control parented
+    /// straight to a full-screen frame window.
+    fn parent_origin(&self, parent: u32) -> (i32, i32) {
+        self.panel(parent)
+            .map(DialogPanel::client_origin)
+            .unwrap_or((0, 0))
+    }
+
+    /// A child's rectangle in screen coordinates.
+    pub fn screen_rect(&self, hwnd: u32) -> Option<(i32, i32, i32, i32)> {
+        let child = self.get(hwnd)?;
+        let (ox, oy) = self.parent_origin(child.parent);
+        Some((child.x + ox, child.y + oy, child.w, child.h))
     }
 
     pub fn get(&self, hwnd: u32) -> Option<&ChildWindow> {
@@ -426,8 +536,9 @@ impl Controls {
             .find(|c| c.parent == parent && c.id == id)
     }
 
+    /// Nothing to paint and nothing to hit.
     pub fn is_empty(&self) -> bool {
-        self.children.is_empty()
+        self.children.is_empty() && self.panels.is_empty()
     }
 
     /// Drop a control and anything that referred to it.
@@ -442,7 +553,7 @@ impl Controls {
     }
 
     /// Drop every control owned by `parent` — a top-level window going
-    /// away takes its children with it.
+    /// away takes its children with it, and a dialog takes its panel.
     pub fn destroy_children_of(&mut self, parent: u32) {
         let doomed: Vec<u32> = self
             .children
@@ -453,16 +564,26 @@ impl Controls {
         for hwnd in doomed {
             self.destroy(hwnd);
         }
+        self.panels.retain(|p| p.hwnd != parent);
     }
 
-    /// Topmost visible control under `(x, y)`, in parent-client
-    /// coordinates. Later-created controls sit on top, matching the
-    /// z-order a freshly built dialog has.
+    /// Is this control on screen — itself visible, and inside a panel
+    /// that is?
+    fn is_showing(&self, child: &ChildWindow) -> bool {
+        child.visible && self.panel(child.parent).map(|p| p.visible).unwrap_or(true)
+    }
+
+    /// Topmost visible control under `(x, y)`, in screen coordinates.
+    /// Later-created controls sit on top, matching the z-order a freshly
+    /// built dialog has.
     pub fn hit_test(&self, x: i32, y: i32) -> Option<u32> {
         self.children
             .iter()
             .rev()
-            .find(|c| c.visible && c.contains(x, y))
+            .find(|c| {
+                let (ox, oy) = self.parent_origin(c.parent);
+                self.is_showing(c) && c.contains(x - ox, y - oy)
+            })
             .map(|c| c.hwnd)
     }
 
@@ -491,9 +612,13 @@ impl Controls {
             return self.hit_test(x, y).map(|_| ControlAction::Consumed);
         }
         self.capture = 0;
+        let (ox, oy) = self
+            .get(captured)
+            .map(|c| self.parent_origin(c.parent))
+            .unwrap_or((0, 0));
         let child = self.get_mut(captured)?;
         child.pressed = false;
-        if !child.contains(x, y) {
+        if !child.contains(x - ox, y - oy) {
             return Some(ControlAction::Consumed);
         }
         if child.is_auto_check() {
@@ -518,6 +643,12 @@ impl Controls {
 
         let focus = self.focus;
         let child = self.get_mut(focus)?;
+        if !child.enabled {
+            // `SetFocus` on a disabled control is not something Win32
+            // does, but a guest can ask for it; the control still must
+            // not act on the key.
+            return Some(ControlAction::Consumed);
+        }
         match child.class {
             ControlClass::Edit => {
                 if vk == VK_BACK {
@@ -542,15 +673,34 @@ impl Controls {
         }
     }
 
-    /// Paint every visible control over `surf`.
+    /// Paint every visible panel and control over `surf`.
     ///
     /// Called once the application's own `WM_PAINT` has finished: on a
     /// device the controls are sibling windows that paint after the
     /// parent has filled its client area, and an app that blits over
     /// the whole client rect would otherwise erase them.
+    ///
+    /// Panels go down first — a dialog's face is behind its children —
+    /// and each child is translated into its panel's client space.
     pub fn render(&self, surf: &mut Surface<'_>) {
+        for panel in &self.panels {
+            panel.render(surf);
+        }
         for child in &self.children {
-            child.render(surf, child.hwnd == self.focus);
+            if !self.is_showing(child) {
+                continue;
+            }
+            let (ox, oy) = self.parent_origin(child.parent);
+            let focused = child.hwnd == self.focus;
+            if (ox, oy) == (0, 0) {
+                child.render(surf, focused);
+            } else {
+                // Cheap: the translated copy lives only for the call.
+                let mut moved = child.clone();
+                moved.x += ox;
+                moved.y += oy;
+                moved.render(surf, focused);
+            }
         }
     }
 }
@@ -799,6 +949,74 @@ mod tests {
             .pixels()
             .chunks_exact(2)
             .all(|p| u16::from_le_bytes([p[0], p[1]]) == 0x07E0));
+    }
+
+    #[test]
+    fn a_disabled_button_neither_focuses_nor_notifies() {
+        let mut ctrls = Controls::default();
+        // Solitaire's Undo button: WS_DISABLED until there is a move.
+        let undo = ctrls.create(
+            PARENT,
+            ControlClass::Button,
+            1002,
+            "&Undo".into(),
+            WS_VISIBLE | WS_DISABLED,
+            10,
+            10,
+            77,
+            22,
+        );
+        assert!(!ctrls.get(undo).unwrap().enabled);
+        // The tap is swallowed — it must not reach the card table
+        // underneath — but it takes neither the focus nor the press.
+        assert_eq!(ctrls.pointer_down(20, 15), Some(ControlAction::Consumed));
+        assert_eq!(ctrls.focus, 0);
+        assert!(!ctrls.get(undo).unwrap().pressed);
+        assert_eq!(ctrls.pointer_up(20, 15), Some(ControlAction::Consumed));
+
+        // Nor does it answer a key, even if something forced the focus.
+        ctrls.focus = undo;
+        assert_eq!(ctrls.key_down(0x0D), Some(ControlAction::Consumed));
+    }
+
+    #[test]
+    fn a_disabled_caption_is_etched_rather_than_plain_black() {
+        let render = |style: u32| -> Vec<u16> {
+            let mut bm = Bitmap::new(120, 40);
+            let mut surf = Surface::Bitmap(&mut bm);
+            // A static draws no background of its own, and a fresh
+            // bitmap is all zeroes — which is `TEXT`. Lay down the
+            // dialog face it would really sit on so "is there black
+            // here" means something.
+            surf.fill_rect(0, 0, 120, 40, ChildWindow::FACE);
+            let mut ctrls = Controls::default();
+            ctrls.create(
+                PARENT,
+                ControlClass::Static,
+                1004,
+                "Time:".into(),
+                style,
+                4,
+                4,
+                80,
+                12,
+            );
+            ctrls.render(&mut surf);
+            surf.pixels()
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect()
+        };
+        let on = render(WS_VISIBLE);
+        let off = render(WS_VISIBLE | WS_DISABLED);
+        assert_ne!(on, off);
+        // Enabled: pure black glyphs, no highlight. Disabled: the
+        // shadow/highlight pair and no black at all.
+        assert!(on.contains(&ChildWindow::TEXT));
+        assert!(!on.contains(&ChildWindow::SHADOW));
+        assert!(off.contains(&ChildWindow::SHADOW));
+        assert!(off.contains(&ChildWindow::LIGHT));
+        assert!(!off.contains(&ChildWindow::TEXT));
     }
 
     #[test]

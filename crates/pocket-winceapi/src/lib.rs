@@ -18,6 +18,7 @@ pub mod aygshell;
 pub mod commctrl;
 pub mod coredll;
 pub mod ddraw;
+pub mod dlgtemplate;
 pub mod game_dlls;
 pub mod gx;
 pub mod hss;
