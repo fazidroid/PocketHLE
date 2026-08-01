@@ -241,14 +241,9 @@ impl Dispatcher for WinCeDispatcher {
             .map(|(_, name)| name.clone())
             .collect();
         for ordinal in 0..=4095u16 {
-            if let Some(name) = ordinals::lookup("coredll.dll", ordinal) {
+            if ordinals::lookup("coredll.dll", ordinal).is_some() {
                 names.push(format!("ord:{ordinal}"));
-                if self
-                    .by_name
-                    .contains_key(&("coredll.dll".to_string(), name.clone()))
-                {
-                    names.push(format!("#{ordinal}"));
-                }
+                names.push(format!("#{ordinal}"));
             }
         }
         names.sort();

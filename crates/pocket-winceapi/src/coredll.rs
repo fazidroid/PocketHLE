@@ -141,6 +141,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_strncmpi", strnicmp);
     d.register_handler(dll, "atoi", atoi_handler);
     d.register_handler(dll, "atol", atoi_handler);
+    d.register_handler(dll, "atof", atof_handler);
     d.register_handler(dll, "_itoa", itoa_handler);
     d.register_handler(dll, "_isctype", isctype);
     d.register_handler(dll, "strchr", strchr);
@@ -436,6 +437,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     );
     d.register_handler(dll, "IsWindow", is_window);
     d.register_handler(dll, "CreateMutexW", create_mutex_w);
+    d.register_handler(dll, "CreateSemaphoreW", create_semaphore_w);
+    d.register_constant(dll, "ReleaseSemaphore", 1, one_returning);
     d.register_handler(dll, "TlsCall", tls_call);
     d.register_handler(dll, "CeSetThreadQuantum", ce_set_thread_quantum);
     d.register_constant(dll, "ClientToScreen", 1, one_returning);
@@ -2493,6 +2496,16 @@ fn strnicmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// `int atoi(const char *s)` / `long atol(const char *s)`. C semantics:
 /// skip leading whitespace, optional sign, then as many digits as
 /// parse; anything else yields `0` rather than an error.
+fn atof_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    let text = read_cstr_string(ctx, p, 0x1000)?;
+    let value = text.trim().parse::<f64>().unwrap_or(0.0);
+    let bits = value.to_bits();
+    ctx.cpu.write_reg(ArmReg::R0, bits as u32)?;
+    ctx.cpu.write_reg(ArmReg::R1, (bits >> 32) as u32)?;
+    Ok(DispatchOutcome::ReturnedR0(bits as u32))
+}
+
 fn atoi_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let p = ctx.arg_u32(0)?;
     let text = read_cstr_string(ctx, p, 0x1000)?;
@@ -2503,8 +2516,7 @@ fn atoi_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     while let Some(c) = it.peek() {
         if c.is_ascii_digit() {
-            digits.push(*c);
-            it.next();
+            digits.push(it.next().unwrap());
         } else {
             break;
         }
@@ -8826,11 +8838,28 @@ fn virtual_query(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     if info == 0 || size < 16 {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
+    let (base, region_size, state, protect, kind): (u32, u32, u32, u32, u32) =
+        if address < 0x0001_0000 {
+            (0, 0x0001_0000, 0x0001_0000, 0, 0)
+        } else if address < 0x0010_0000 {
+            (0x0001_0000, 0x000f_0000, 0x0000_1000, 0x20, 0x0002_0000)
+        } else {
+            (address & !0x000f_ffff, 0x0010_0000, 0x0001_0000, 0, 0)
+        };
     let mut buf = vec![0u8; size.min(48) as usize];
-    buf[0..4].copy_from_slice(&address.to_le_bytes());
-    buf[4..8].copy_from_slice(&address.to_le_bytes());
-    buf[8..12].copy_from_slice(&0x1000u32.to_le_bytes());
-    buf[12..16].copy_from_slice(&0x1000u32.to_le_bytes());
+    buf[0..4].copy_from_slice(&base.to_le_bytes());
+    buf[4..8].copy_from_slice(&base.to_le_bytes());
+    buf[8..12].copy_from_slice(&protect.to_le_bytes());
+    buf[12..16].copy_from_slice(&region_size.to_le_bytes());
+    if buf.len() >= 20 {
+        buf[16..20].copy_from_slice(&state.to_le_bytes());
+    }
+    if buf.len() >= 24 {
+        buf[20..24].copy_from_slice(&protect.to_le_bytes());
+    }
+    if buf.len() >= 28 {
+        buf[24..28].copy_from_slice(&kind.to_le_bytes());
+    }
     ctx.cpu.write_mem(info, &buf)?;
     Ok(DispatchOutcome::ReturnedR0(buf.len() as u32))
 }
@@ -8954,6 +8983,10 @@ fn is_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(
         (hwnd == FAKE_HWND || hwnd == FAKE_DESKTOP_HWND) as u32,
     ))
+}
+
+fn create_semaphore_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0xDEAD_E301))
 }
 
 fn create_mutex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
