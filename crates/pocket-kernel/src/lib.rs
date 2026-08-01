@@ -31,6 +31,7 @@ use pocket_cpu::{
 use pocket_pe::{machine, ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
 pub mod audio;
+pub mod controls;
 pub mod font;
 pub mod framebuffer;
 pub mod gapi;
@@ -660,6 +661,16 @@ pub struct KernelState {
     pub wnd_proc: u32,
     /// WndProc addresses keyed by the registered class name.
     pub window_class_procs: HashMap<String, u32>,
+    /// `WNDCLASS::hbrBackground` of the class the guest registered.
+    ///
+    /// `BeginPaint` erases the client area with this brush before it
+    /// hands the DC over, which is what `DefWindowProc` does for
+    /// `WM_ERASEBKGND` on a device. An app that paints only its
+    /// controls — HelloWorld draws nothing but a `STATIC` and a
+    /// `BUTTON` — relies on the class brush for every other pixel, and
+    /// without it the window stays whatever the framebuffer was
+    /// cleared to (black).
+    pub window_background: Option<u32>,
     /// WndProc and CREATESTRUCT for synthetic window creation messages.
     pub pending_create: Option<(u32, u32)>,
     /// Window messages a real Pocket PC shell posts right after a
@@ -729,6 +740,14 @@ pub struct KernelState {
     /// `SB_SETTEXT` and paint it ourselves at the bottom of the screen.
     /// `None` until the guest actually asks for a status window.
     pub status_bar: Option<StatusBar>,
+    /// Built-in child controls (`BUTTON`, `EDIT`, `STATIC`) the guest
+    /// created through `CreateWindowExW`.
+    ///
+    /// On a device these window classes live inside coredll: the OS owns
+    /// their pixels, their text and their focus, and turns a tap into a
+    /// `WM_COMMAND` for the parent. The application never draws them, so
+    /// neither can we leave them to the guest — see [`controls`].
+    pub controls: controls::Controls,
     /// Input events queued by the host frontend (mouse / D-pad /
     /// keyboard). Drained by `GetMessageW` / `PeekMessageW` before
     /// any synthetic timer / paint message is fabricated, so real
@@ -837,6 +856,32 @@ pub struct KernelState {
 }
 
 impl KernelState {
+    /// Paint the built-in child controls on top of whatever the guest
+    /// last drew, so the frame the host is about to show has them.
+    ///
+    /// `EndPaint` already repaints the controls, but the guest's
+    /// `WM_PAINT` is several dirtying steps long — CERF BlankApp does
+    /// `FillRect(white)`, then `BitBlt`s its logo, then `EndPaint` —
+    /// and a frontend snapshots on *every* `frame_counter` change. A
+    /// snapshot landing between the white fill and `EndPaint` shows a
+    /// window with no children, which reads as flicker.
+    ///
+    /// A device has no such window: the display driver composites the
+    /// child windows over the parent's pixels on the way to the panel,
+    /// so a half-finished parent repaint can never hide them. This is
+    /// that composite step, and it deliberately does *not* call
+    /// [`Framebuffer::mark_dirty`] — it runs at the presentation
+    /// boundary, and dirtying there would ask for another frame
+    /// forever.
+    pub fn composite_controls(&mut self) {
+        if self.controls.is_empty() {
+            return;
+        }
+        let controls = self.controls.clone();
+        let mut surf = gdi::Surface::Screen(&mut self.framebuffer);
+        controls.render(&mut surf);
+    }
+
     /// Look up an already-loaded runtime module by its `HMODULE`.
     pub fn module_by_handle(&self, handle: u32) -> Option<&LoadedModule> {
         self.modules.iter().find(|m| m.handle == handle)
@@ -1592,6 +1637,7 @@ impl Process {
                 synthetic_message_budget: 240,
                 wnd_proc: 0,
                 window_class_procs: HashMap::new(),
+                window_background: None,
                 pending_create: None,
                 find_handles: HashMap::new(),
                 next_find_handle: 0,
@@ -1611,6 +1657,7 @@ impl Process {
                 create_stage: CreateStage::Idle,
                 dialog_frame: None,
                 status_bar: None,
+                controls: Default::default(),
                 pending_input: VecDeque::new(),
                 gapi_keys_queried: false,
                 pending_message: None,
@@ -2017,6 +2064,7 @@ pub fn run_main_loop_with_hook(
             StopReason::Requested | StopReason::OutOfBounds => return Ok(()),
         }
         if let Some(hook) = frame_hook.as_deref_mut() {
+            process.state.composite_controls();
             if hook.on_frame(&mut process.state) == FrameAction::Stop {
                 log::info!("frame hook requested stop");
                 return Ok(());

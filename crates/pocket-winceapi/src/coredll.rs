@@ -23,6 +23,7 @@
 
 use pocket_cpu::regs::ArmReg;
 use pocket_cpu::Prot;
+use pocket_kernel::controls::{ControlAction, ControlClass, Controls};
 use pocket_kernel::framebuffer::colorref_to_rgb565;
 use pocket_kernel::gdi::{
     rop3, Surface, GDI_SCREEN_DC, STOCK_BLACK_BRUSH, STOCK_BLACK_PEN, STOCK_DKGRAY_BRUSH,
@@ -68,6 +69,7 @@ fn is_live_hwnd(hwnd: u32) -> bool {
         || hwnd == FAKE_DIALOG_HWND
         || hwnd == FAKE_DESKTOP_HWND
         || hwnd == FAKE_STATUSBAR_HWND
+        || Controls::is_child_hwnd(hwnd)
 }
 const PAINTSTRUCT_BYTES: u32 = 32;
 
@@ -361,7 +363,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetVersion", get_version);
     d.register_handler(dll, "ShowWindow", show_window);
     d.register_handler(dll, "UpdateWindow", update_window);
-    d.register_constant(dll, "MoveWindow", 1, one_returning);
+    d.register_handler(dll, "MoveWindow", move_window);
     d.register_constant(dll, "SetForegroundWindow", 1, one_returning);
     // PPC2002 apps disable the IME on the very first line of WinMain.
     // There is no IME here, so "already disabled" is the honest answer.
@@ -374,7 +376,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetCapture", get_capture);
     d.register_constant(dll, "SetCapture", FAKE_HWND, one_returning);
     d.register_constant(dll, "ReleaseCapture", 1, one_returning);
-    d.register_constant(dll, "SetFocus", 1, one_returning);
+    d.register_handler(dll, "SetFocus", set_focus);
     d.register_constant(dll, "SetWindowPos", 1, one_returning);
     d.register_constant(dll, "AdjustWindowRectEx", 1, one_returning);
     d.register_constant(dll, "MapWindowPoints", 1, one_returning);
@@ -389,7 +391,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetWindowTextA", get_window_text_w);
     d.register_constant(dll, "GetWindowTextLengthW", 0, zero_returning);
     d.register_constant(dll, "GetWindowTextLengthA", 0, zero_returning);
-    d.register_constant(dll, "DefWindowProcW", 0, zero_returning);
+    d.register_handler(dll, "DefWindowProcW", def_window_proc_w);
+    d.register_handler(dll, "DefWindowProcA", def_window_proc_w);
     d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
     d.register_handler(dll, "CallWindowProcW", call_window_proc_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
@@ -4423,6 +4426,13 @@ fn register_class_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     // can trampoline into the guest WndProc.
     let lpwc = ctx.arg_u32(0)?;
     if lpwc != 0 {
+        // hbrBackground sits at +28, between hCursor and lpszMenuName.
+        // It is either a real HBRUSH or the `COLOR_xxx + 1` shorthand,
+        // which is how apps ask for a system colour without creating an
+        // object; the two are told apart by magnitude, since a genuine
+        // brush handle is one of our `0xDEAD_xxxx` values.
+        let hbr = ctx.cpu.read_u32_le(lpwc + 28).unwrap_or(0);
+        ctx.kernel.window_background = class_background_color(ctx, hbr);
         if let Ok(buf) = ctx.cpu.read_mem(lpwc + 4, 4) {
             let proc_va = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
             if proc_va != 0 {
@@ -4439,9 +4449,11 @@ fn register_class_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
                     }
                 }
                 log::info!(
-                    "RegisterClassW captured WndProc=0x{:08x} from WNDCLASS at 0x{:08x}",
+                    "RegisterClassW captured WndProc=0x{:08x} from WNDCLASS at 0x{:08x} (hbrBackground=0x{:08x} -> {:?})",
                     proc_va,
-                    lpwc
+                    lpwc,
+                    hbr,
+                    ctx.kernel.window_background,
                 );
             }
         }
@@ -4481,6 +4493,42 @@ fn create_window_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     } else {
         String::new()
     };
+    // A built-in control class: on a device the window procedure lives
+    // inside coredll, not in the application. Hand back a handle of its
+    // own and let `controls` own the pixels — crucially *without*
+    // touching `window_procs`, `pending_create` or `pending_startup`,
+    // because routing a child onto the parent's `WndProc` made every
+    // child re-enter the parent's WM_CREATE, which creates the children,
+    // and CERF BlankApp looped there forever.
+    if let Some(class) = ControlClass::from_class_name(&class_name) {
+        let window_name = ctx.arg_u32(2)?;
+        let text = if window_name != 0 {
+            String::from_utf16_lossy(&read_wstr(ctx, window_name, 256).unwrap_or_default())
+                .trim_end_matches('\0')
+                .to_string()
+        } else {
+            String::new()
+        };
+        let style = ctx.arg_u32(3)?;
+        let x = ctx.arg_u32(4)? as i32;
+        let y = ctx.arg_u32(5)? as i32;
+        let cx = ctx.arg_u32(6)? as i32;
+        let cy = ctx.arg_u32(7)? as i32;
+        let parent = ctx.arg_u32(8)?;
+        // For a child window `hMenu` is the control id — what
+        // `GetDlgItem` looks up and what the parent matches in
+        // `LOWORD(wParam)` of `WM_COMMAND`.
+        let id = ctx.arg_u32(9)?;
+        let parent = if parent != 0 { parent } else { FAKE_HWND };
+        let hwnd = ctx
+            .kernel
+            .controls
+            .create(parent, class, id, text.clone(), style, x, y, cx, cy);
+        log::debug!(
+            "CreateWindowExW(class={class_name:?}, id={id}, text={text:?}) -> child hwnd=0x{hwnd:08x}"
+        );
+        return Ok(DispatchOutcome::ReturnedR0(hwnd));
+    }
     let wnd_proc = ctx
         .kernel
         .window_class_procs
@@ -5035,6 +5083,102 @@ fn repaint_status_bar(ctx: &mut CallCtx<'_>) {
     ctx.kernel.framebuffer.mark_dirty();
 }
 
+/// Repaint every built-in control over whatever the guest just drew.
+///
+/// Same reasoning as [`repaint_status_bar`]: the controls are sibling
+/// windows that paint *after* the parent has filled its client area, so
+/// an application that fills the whole client rect on `WM_PAINT` — which
+/// is exactly what CERF BlankApp does — would otherwise erase them.
+fn repaint_controls(ctx: &mut CallCtx<'_>) {
+    if ctx.kernel.controls.is_empty() {
+        return;
+    }
+    let controls = ctx.kernel.controls.clone();
+    let mut surf = Surface::Screen(&mut ctx.kernel.framebuffer);
+    controls.render(&mut surf);
+    ctx.kernel.framebuffer.mark_dirty();
+}
+
+/// The window messages a built-in control answers itself.
+///
+/// Only the handful real Pocket PC code sends: the text pair an app uses
+/// to read an `EDIT` back or relabel a `STATIC`, the check-state pair,
+/// and `WM_SETFONT`, which we accept and ignore because our renderer has
+/// exactly one font. Anything else returns `0`, the same as a control
+/// that does not handle a message.
+fn control_message(
+    ctx: &mut CallCtx<'_>,
+    hwnd: u32,
+    message: u32,
+    wparam: u32,
+    lparam: u32,
+) -> Result<u32, KernelError> {
+    const WM_SETTEXT: u32 = 0x000C;
+    const WM_GETTEXT: u32 = 0x000D;
+    const WM_GETTEXTLENGTH: u32 = 0x000E;
+    const WM_SETFONT: u32 = 0x0030;
+    const BM_GETCHECK: u32 = 0x00F0;
+    const BM_SETCHECK: u32 = 0x00F1;
+    const EM_SETSEL: u32 = 0x00B1;
+    const EM_REPLACESEL: u32 = 0x00C2;
+
+    match message {
+        WM_SETTEXT | EM_REPLACESEL => {
+            let text = if lparam != 0 {
+                String::from_utf16_lossy(&read_wstr(ctx, lparam, 512).unwrap_or_default())
+                    .trim_end_matches('\0')
+                    .to_string()
+            } else {
+                String::new()
+            };
+            set_control_text(ctx, hwnd, &text);
+            Ok(1)
+        }
+        WM_GETTEXT => {
+            let text = ctx
+                .kernel
+                .controls
+                .get(hwnd)
+                .map(|c| c.text.clone())
+                .unwrap_or_default();
+            if lparam == 0 || wparam == 0 {
+                return Ok(0);
+            }
+            let room = (wparam as usize).saturating_sub(1);
+            let units: Vec<u16> = text.encode_utf16().take(room).collect();
+            let mut bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+            bytes.extend_from_slice(&[0u8, 0u8]);
+            let _ = ctx.cpu.write_mem(lparam, &bytes);
+            Ok(units.len() as u32)
+        }
+        WM_GETTEXTLENGTH => Ok(ctx
+            .kernel
+            .controls
+            .get(hwnd)
+            .map(|c| c.text.encode_utf16().count() as u32)
+            .unwrap_or(0)),
+        BM_GETCHECK => Ok(ctx
+            .kernel
+            .controls
+            .get(hwnd)
+            .map(|c| u32::from(c.checked))
+            .unwrap_or(0)),
+        BM_SETCHECK => {
+            if let Some(child) = ctx.kernel.controls.get_mut(hwnd) {
+                child.checked = wparam != 0;
+                repaint_controls(ctx);
+            }
+            Ok(0)
+        }
+        // Accepted and ignored: one font, and no selection model.
+        WM_SETFONT | EM_SETSEL => Ok(1),
+        _ => {
+            log::debug!("control 0x{hwnd:08x} ignoring message 0x{message:04x}");
+            Ok(0)
+        }
+    }
+}
+
 fn send_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
     let message = ctx.arg_u32(1)?;
@@ -5047,6 +5191,13 @@ fn send_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
             return Ok(DispatchOutcome::ReturnedR0(r));
         }
         return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    // Likewise a built-in control: its window procedure lives in coredll,
+    // so a message aimed at it must be answered here rather than handed
+    // to the application.
+    if Controls::is_child_hwnd(hwnd) {
+        let r = control_message(ctx, hwnd, message, wparam, lparam)?;
+        return Ok(DispatchOutcome::ReturnedR0(r));
     }
     let proc = ctx
         .kernel
@@ -5148,6 +5299,7 @@ fn write_synthetic_msg_for_hwnd(
 const WM_CREATE: u32 = 0x0001;
 const WM_QUIT: u32 = 0x0012;
 const WM_PAINT: u32 = 0x000F;
+const WM_ERASEBKGND: u32 = 0x0014;
 const WM_TIMER: u32 = 0x0113;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -5159,7 +5311,13 @@ const WM_ACTIVATE: u32 = 0x0006;
 const WM_SETFOCUS: u32 = 0x0007;
 const WM_SHOWWINDOW: u32 = 0x0018;
 const WM_INITDIALOG: u32 = 0x0110;
+const WM_DESTROY: u32 = 0x0002;
+const WM_COMMAND: u32 = 0x0111;
 const MK_LBUTTON: u32 = 0x0001;
+/// `BN_CLICKED` — the notification code a button packs into the high
+/// half of `WM_COMMAND`'s `wParam`. Zero, so `LOWORD(wParam)` is the
+/// bare control id, which is what BlankApp's handler switches on.
+const BN_CLICKED: u32 = 0;
 
 /// Convert a host-driven [`pocket_kernel::InputEvent`] into the
 /// `(msg, wParam, lParam)` triple a real Win32 window message
@@ -5180,6 +5338,52 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
         }
         pocket_kernel::InputEvent::KeyDown { vk } => Some((WM_KEYDOWN, vk as u32, 1)),
         pocket_kernel::InputEvent::KeyUp { vk } => Some((WM_KEYUP, vk as u32, 0xC000_0001)),
+    }
+}
+
+/// Give the built-in controls first refusal on a host input event.
+///
+/// On a device the tap never reaches the application at all: it goes to
+/// the control's own window, and what the parent sees is the
+/// `WM_COMMAND` the control chooses to send. So:
+///
+/// * `Some(Some(triple))` — a control turned the event into a message
+///   for the parent (a button was clicked).
+/// * `Some(None)` — a control swallowed the event (focus moved, a
+///   character was typed); the application must not see it.
+/// * `None` — no control was involved, so the event carries on to the
+///   application unchanged. This is the path every full-screen game
+///   takes, which is why a title with no controls is unaffected.
+#[allow(clippy::option_option)]
+fn controls_take_input(
+    ctx: &mut CallCtx<'_>,
+    ev: pocket_kernel::InputEvent,
+) -> Option<Option<(u32, u32, u32)>> {
+    if ctx.kernel.controls.is_empty() {
+        return None;
+    }
+    let action = match ev {
+        pocket_kernel::InputEvent::PointerDown { x, y } => {
+            ctx.kernel.controls.pointer_down(x as i32, y as i32)
+        }
+        pocket_kernel::InputEvent::PointerUp { x, y } => {
+            ctx.kernel.controls.pointer_up(x as i32, y as i32)
+        }
+        pocket_kernel::InputEvent::KeyDown { vk } => ctx.kernel.controls.key_down(vk),
+        // Moves and key releases are not control input; a release only
+        // matters through the press that captured it.
+        _ => None,
+    }?;
+    // The control's appearance changed (pressed, focused, new text), and
+    // on a device it would have invalidated itself.
+    repaint_controls(ctx);
+    match action {
+        ControlAction::Clicked { parent, id, hwnd } => {
+            log::debug!("control id={id} clicked -> WM_COMMAND to 0x{parent:08x}");
+            let wparam = (id & 0xFFFF) | (BN_CLICKED << 16);
+            Some(Some((WM_COMMAND, wparam, hwnd)))
+        }
+        ControlAction::Consumed => Some(None),
     }
 }
 
@@ -5235,8 +5439,68 @@ fn get_async_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk)))
 }
 
-fn get_focus(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
+/// `HWND GetFocus()` — the focused control if the user has tapped one,
+/// otherwise the top-level window.
+fn get_focus(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let focus = ctx.kernel.controls.focus;
+    Ok(DispatchOutcome::ReturnedR0(if focus != 0 {
+        focus
+    } else {
+        FAKE_HWND
+    }))
+}
+
+/// `HWND SetFocus(HWND hWnd)` — returns the previously focused window.
+///
+/// This used to be a constant `1` thunk. A dialog that focuses its edit
+/// field on `WM_INITDIALOG` depends on it landing somewhere real, or the
+/// caret sits on nothing and typed keys go to the application instead.
+fn set_focus(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let previous = ctx.kernel.controls.focus;
+    if ctx
+        .kernel
+        .controls
+        .get(hwnd)
+        .is_some_and(|c| c.is_focusable())
+    {
+        ctx.kernel.controls.focus = hwnd;
+        repaint_controls(ctx);
+    } else if hwnd == 0 || is_live_hwnd(hwnd) {
+        // Focus moved off the controls onto the top-level window.
+        ctx.kernel.controls.focus = 0;
+        if previous != 0 {
+            repaint_controls(ctx);
+        }
+    }
+    Ok(DispatchOutcome::ReturnedR0(if previous != 0 {
+        previous
+    } else {
+        FAKE_HWND
+    }))
+}
+
+/// `BOOL MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bRepaint)`.
+///
+/// Controls are routinely created `0x0` and positioned from the parent's
+/// `WM_SIZE` handler, which is exactly what CERF BlankApp does — so
+/// without this the buttons and the edit field would never acquire a
+/// rectangle and nothing would be drawn or hit-tested.
+fn move_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    let w = ctx.arg_u32(3)? as i32;
+    let h = ctx.arg_u32(4)? as i32;
+    if let Some(child) = ctx.kernel.controls.get_mut(hwnd) {
+        child.x = x;
+        child.y = y;
+        child.w = w;
+        child.h = h;
+        log::debug!("MoveWindow(0x{hwnd:08x}) -> ({x},{y},{w},{h})");
+        repaint_controls(ctx);
+    }
+    Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn get_capture(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -5354,8 +5618,19 @@ fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
 /// queue is empty we fall back to fabricated traffic so games never
 /// see an idle window.
 fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
-    if let Some(ev) = take_pending_input(ctx) {
+    while let Some(ev) = take_pending_input(ctx) {
         update_key_state(ctx, ev);
+        // The built-in controls get the event first, exactly as the OS
+        // would hand it to the control's own window procedure.
+        if let Some(handled) = controls_take_input(ctx, ev) {
+            match handled {
+                Some(triple) => return triple,
+                // Swallowed by a control: loop round for the next event
+                // rather than handing the application a tap it never
+                // would have seen.
+                None => continue,
+            }
+        }
         if let Some(triple) = input_to_message(ev) {
             return triple;
         }
@@ -5425,8 +5700,14 @@ fn take_posted_message(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
 }
 
 fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
-    if let Some(ev) = take_pending_input(ctx) {
+    while let Some(ev) = take_pending_input(ctx) {
         update_key_state(ctx, ev);
+        if let Some(handled) = controls_take_input(ctx, ev) {
+            match handled {
+                Some(triple) => return Some(triple),
+                None => continue,
+            }
+        }
         if let Some(triple) = input_to_message(ev) {
             return Some(triple);
         }
@@ -5710,6 +5991,61 @@ fn get_dc(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(GDI_SCREEN_DC))
 }
 
+/// `DefWindowProcW(hwnd, msg, wParam, lParam)`.
+///
+/// Used to be a constant `0`, which is the right answer for nearly
+/// every message but a lie for the two that paint. `DefWindowProc` is
+/// where a window with no `WM_PAINT` handler of its own gets its
+/// background: it erases the client area with the class brush and
+/// leaves the child controls to draw themselves. HelloWorld has no
+/// paint handler at all — its `WndProc` only answers `WM_COMMAND` —
+/// so before this every pixel it didn't own stayed black, including
+/// the ones under its black `STATIC` caption.
+///
+/// The erase is deliberately conditional on the class having asked for
+/// a background: `hbrBackground = NULL` means "the app paints it all",
+/// and a GAPI title that writes the framebuffer straight through
+/// [`crate::gx`] must never have its frame wiped out from under it.
+fn def_window_proc_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _hwnd = ctx.arg_u32(0)?;
+    let message = ctx.arg_u32(1)?;
+    match message {
+        WM_PAINT | WM_ERASEBKGND => {
+            erase_window_background(ctx);
+            // WM_ERASEBKGND returns "I erased it"; WM_PAINT returns 0.
+            let r0 = u32::from(message == WM_ERASEBKGND);
+            Ok(DispatchOutcome::ReturnedR0(r0))
+        }
+        _ => Ok(DispatchOutcome::ReturnedR0(0)),
+    }
+}
+
+/// Fill the client area with the registered class background brush and
+/// let the controls repaint on top, as a device's `DefWindowProc` plus
+/// display driver would.
+fn erase_window_background(ctx: &mut CallCtx<'_>) {
+    let Some(cr) = ctx.kernel.window_background else {
+        return;
+    };
+    // A guest holding the GAPI framebuffer owns every pixel; erasing
+    // would fight its own back-buffer.
+    if ctx.kernel.fb_mapped {
+        return;
+    }
+    let rgb = colorref_to_rgb565(cr);
+    let (w, h) = (
+        ctx.kernel.framebuffer.width as i32,
+        ctx.kernel.framebuffer.height as i32,
+    );
+    {
+        let mut surf = Surface::Screen(&mut ctx.kernel.framebuffer);
+        surf.fill_rect(0, 0, w, h, rgb);
+    }
+    repaint_controls(ctx);
+    repaint_status_bar(ctx);
+    ctx.kernel.framebuffer.mark_dirty();
+}
+
 fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // BeginPaint(hwnd, lpPaint) -> HDC. Fill the PAINTSTRUCT enough
     // for the caller (most games only read .hdc / .rcPaint).
@@ -5733,6 +6069,10 @@ fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn end_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // The guest has finished filling its client area; the child controls
+    // paint on top, as sibling windows would on a device.
+    repaint_controls(ctx);
+    repaint_status_bar(ctx);
     ctx.kernel.framebuffer.mark_dirty();
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -6771,14 +7111,22 @@ fn get_object_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 /// `GetDlgItem(hDlg, nIDDlgItem)`
 ///
-/// We have no real control hierarchy, so every child resolves to its
-/// parent. That keeps `SetFocus` / `IsWindowVisible` / `SendMessageW` on
-/// the result routed at the proc that owns the dialog, which is where
-/// the guest's own handling lives anyway. Returning `NULL` instead makes
-/// callers assume the dialog failed to build and bail out.
+/// A built-in control created through `CreateWindowExW` is looked up by
+/// its id — that is how BlankApp finds the three children it lays out
+/// from `WM_SIZE`.
+///
+/// For anything else we have no real control hierarchy, so the child
+/// resolves to its parent. That keeps `SetFocus` / `IsWindowVisible` /
+/// `SendMessageW` on the result routed at the proc that owns the dialog,
+/// which is where the guest's own handling lives anyway. Returning
+/// `NULL` instead makes callers assume the dialog failed to build and
+/// bail out.
 fn get_dlg_item(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
-    let _id = ctx.arg_u32(1)?;
+    let id = ctx.arg_u32(1)?;
+    if let Some(child) = ctx.kernel.controls.by_id(hwnd, id) {
+        return Ok(DispatchOutcome::ReturnedR0(child.hwnd));
+    }
     Ok(DispatchOutcome::ReturnedR0(if is_live_hwnd(hwnd) {
         hwnd
     } else {
@@ -6843,7 +7191,27 @@ fn output_debug_string_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
-fn destroy_window(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+/// `BOOL DestroyWindow(HWND hWnd)`.
+///
+/// Destroying a control just drops it. Destroying the top-level window
+/// is how a Pocket PC app quits — CERF BlankApp's "Exit" button calls it
+/// and expects the `WM_DESTROY` that follows to reach its `WndProc`,
+/// which is where its `PostQuitMessage` lives.
+fn destroy_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    if Controls::is_child_hwnd(hwnd) {
+        ctx.kernel.controls.destroy(hwnd);
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    if is_live_hwnd(hwnd) {
+        ctx.kernel.controls.destroy_children_of(hwnd);
+        if ctx.kernel.posted_messages.len() < 256 {
+            ctx.kernel
+                .posted_messages
+                .push_back((hwnd, WM_DESTROY, 0, 0));
+        }
+        log::debug!("DestroyWindow(0x{hwnd:08x}) -> WM_DESTROY queued");
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -6908,18 +7276,26 @@ fn get_window_long_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 /// Solitaire uses it to refresh the score / time labels on its status
 /// dialog. We draw no real controls, so log the text and report success.
 fn set_dlg_item_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _hwnd = ctx.arg_u32(0)?;
+    let hwnd = ctx.arg_u32(0)?;
     let id = ctx.arg_u32(1)?;
     let p = ctx.arg_u32(2)?;
-    if p != 0 {
-        let chars = read_wstr(ctx, p, 256).unwrap_or_default();
-        let s: String = chars
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8 as char)
-            .collect();
-        log::debug!("SetDlgItemTextW({id}, {s:?})");
+    let text = if p != 0 {
+        String::from_utf16_lossy(&read_wstr(ctx, p, 256).unwrap_or_default())
+            .trim_end_matches('\0')
+            .to_string()
+    } else {
+        String::new()
+    };
+    if let Some(child) = ctx.kernel.controls.by_id(hwnd, id) {
+        let child_hwnd = child.hwnd;
+        if let Some(c) = ctx.kernel.controls.get_mut(child_hwnd) {
+            c.text = text.clone();
+            repaint_controls(ctx);
+        }
+        log::debug!("SetDlgItemTextW(id={id}, text={text:?}) -> control updated");
+        return Ok(DispatchOutcome::ReturnedR0(1));
     }
+    log::debug!("SetDlgItemTextW(id={id}, {text:?})");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -6929,42 +7305,70 @@ fn set_dlg_item_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
 /// just log the new caption when DEBUG tracing is enabled and report
 /// success. Returns TRUE.
 fn set_window_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _hwnd = ctx.arg_u32(0)?;
+    let hwnd = ctx.arg_u32(0)?;
     let p = ctx.arg_u32(1)?;
-    if p != 0 {
-        let chars = read_wstr(ctx, p, 256).unwrap_or_default();
-        let s: String = chars
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8 as char)
-            .collect();
-        log::debug!("SetWindowTextW({s:?})");
-    }
+    let text = if p != 0 {
+        String::from_utf16_lossy(&read_wstr(ctx, p, 256).unwrap_or_default())
+            .trim_end_matches('\0')
+            .to_string()
+    } else {
+        String::new()
+    };
+    set_control_text(ctx, hwnd, &text);
+    log::debug!("SetWindowTextW(hwnd=0x{hwnd:08x}, {text:?})");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 /// `BOOL SetWindowTextA(HWND hWnd, LPCSTR lpString)` — ANSI variant.
 fn set_window_text_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _hwnd = ctx.arg_u32(0)?;
+    let hwnd = ctx.arg_u32(0)?;
     let p = ctx.arg_u32(1)?;
-    if p != 0 {
-        let s = read_cstr(ctx, p, 256).unwrap_or_default();
-        log::debug!("SetWindowTextA({s:?})");
-    }
+    let text = if p != 0 {
+        read_cstr_string(ctx, p, 256).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    set_control_text(ctx, hwnd, &text);
+    log::debug!("SetWindowTextA(hwnd=0x{hwnd:08x}, {text:?})");
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-/// `int GetWindowTextW(HWND hWnd, LPWSTR lpString, int nMaxCount)` —
-/// we don't track per-window captions, so return an empty string.
+/// Point a built-in control at new text and repaint it.
+///
+/// Nothing happens for a top-level window: that text is the title-bar
+/// caption, which our shell-less framebuffer has nowhere to show.
+fn set_control_text(ctx: &mut CallCtx<'_>, hwnd: u32, text: &str) {
+    if let Some(child) = ctx.kernel.controls.get_mut(hwnd) {
+        child.text = text.to_string();
+        repaint_controls(ctx);
+    }
+}
+
+/// `int GetWindowTextW(HWND hWnd, LPWSTR lpString, int nMaxCount)`.
+///
+/// A control hands back the text it holds — for an `EDIT` that is
+/// whatever the user typed, which is the whole point of a working input
+/// field. Anything else has no caption we track, so it reads back empty.
 fn get_window_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _hwnd = ctx.arg_u32(0)?;
+    let hwnd = ctx.arg_u32(0)?;
     let p = ctx.arg_u32(1)?;
     let n = ctx.arg_u32(2)?;
-    if p != 0 && n > 0 {
-        // Write a single NUL terminator (UTF-16 or ANSI both fit in 2 zero bytes).
-        let _ = ctx.cpu.write_mem(p, &[0u8, 0u8]);
+    if p == 0 || n == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    Ok(DispatchOutcome::ReturnedR0(0))
+    let text = ctx
+        .kernel
+        .controls
+        .get(hwnd)
+        .map(|c| c.text.clone())
+        .unwrap_or_default();
+    // Reserve one unit for the terminator, as the real API does.
+    let room = (n as usize).saturating_sub(1);
+    let units: Vec<u16> = text.encode_utf16().take(room).collect();
+    let mut bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    bytes.extend_from_slice(&[0u8, 0u8]);
+    let _ = ctx.cpu.write_mem(p, &bytes);
+    Ok(DispatchOutcome::ReturnedR0(units.len() as u32))
 }
 
 /// `BOOL PlaySoundW(LPCWSTR pszSound, HMODULE hmod, DWORD fdwSound)`.
@@ -7218,17 +7622,38 @@ fn screen_dims(ctx: &CallCtx<'_>) -> (u32, u32) {
 }
 
 fn get_client_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // GetClientRect(hWnd, lpRect) -> BOOL.
-    let _hwnd = ctx.arg_u32(0)?;
+    // GetClientRect(hWnd, lpRect) -> BOOL. A control's client rect is
+    // its own size with the origin at zero, not the whole screen.
+    let hwnd = ctx.arg_u32(0)?;
     let lp_rect = ctx.arg_u32(1)?;
-    let (w, h) = screen_dims(ctx);
-    write_rect(ctx, lp_rect, w as i32, h as i32)?;
+    let (w, h) = match ctx.kernel.controls.get(hwnd) {
+        Some(child) => (child.w, child.h),
+        None => {
+            let (w, h) = screen_dims(ctx);
+            (w as i32, h as i32)
+        }
+    };
+    write_rect(ctx, lp_rect, w, h)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
 fn get_window_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let _hwnd = ctx.arg_u32(0)?;
+    let hwnd = ctx.arg_u32(0)?;
     let lp_rect = ctx.arg_u32(1)?;
+    // A control's window rect is where it sits in its parent — and since
+    // the parent is full-screen here, those are also screen coordinates.
+    if let Some(child) = ctx.kernel.controls.get(hwnd) {
+        let (x, y, w, h) = (child.x, child.y, child.w, child.h);
+        if lp_rect != 0 {
+            let mut buf = [0u8; 16];
+            buf[0..4].copy_from_slice(&x.to_le_bytes());
+            buf[4..8].copy_from_slice(&y.to_le_bytes());
+            buf[8..12].copy_from_slice(&(x + w).to_le_bytes());
+            buf[12..16].copy_from_slice(&(y + h).to_le_bytes());
+            ctx.cpu.write_mem(lp_rect, &buf)?;
+        }
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
     let (w, h) = screen_dims(ctx);
     write_rect(ctx, lp_rect, w as i32, h as i32)?;
     Ok(DispatchOutcome::ReturnedR0(1))
@@ -10172,7 +10597,12 @@ fn set_pixel(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// silver.
 fn get_sys_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let idx = ctx.arg_u32(0)? as i32;
-    let cr = match idx {
+    Ok(DispatchOutcome::ReturnedR0(sys_color(idx)))
+}
+
+/// The system palette, as a `COLORREF`.
+fn sys_color(idx: i32) -> u32 {
+    match idx {
         // COLOR_SCROLLBAR / COLOR_BACKGROUND / COLOR_INACTIVECAPTION
         0..=2 => 0x00C8C8C8,
         // COLOR_ACTIVECAPTION / COLOR_MENU
@@ -10195,8 +10625,40 @@ fn get_sys_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         17 => 0x00808080,
         // Anything else — silver.
         _ => 0x00C8C8C8,
-    };
-    Ok(DispatchOutcome::ReturnedR0(cr))
+    }
+}
+
+/// Resolve a `WNDCLASS::hbrBackground` to the `COLORREF` the client
+/// area should be erased with, or `None` for "the app paints it all".
+///
+/// The field is allowed to be a real `HBRUSH` or the integer
+/// `COLOR_xxx + 1`, and the two are told apart by magnitude — every
+/// handle we hand out is a `0xDEAD_xxxx` value, far above the couple
+/// dozen system colour indices.
+///
+/// HelloWorld hardcodes a third form, `0x4000_0006`: the shorthand
+/// with bit 30 set as a "this is not a pointer" tag. Its own
+/// `RegisterClassW` never calls `GetStockObject`, so the constant is
+/// baked in at compile time by whatever SDK header it was built
+/// against. Masking the tag off gives `COLOR_WINDOW + 1` — white,
+/// which is what the reference screenshot shows.
+fn class_background_color(ctx: &CallCtx<'_>, hbr: u32) -> Option<u32> {
+    /// The largest `COLOR_xxx` index any Pocket PC SDK defines, with
+    /// room to spare; the `+ 1` shorthand can reach one past it.
+    const MAX_SYS_COLOR: u32 = 32;
+    match hbr {
+        0 => None,
+        1..=MAX_SYS_COLOR => Some(sys_color(hbr as i32 - 1)),
+        _ => {
+            if let Some(b) = ctx.kernel.gdi.brush(hbr) {
+                return Some(b.color);
+            }
+            // Not a handle we issued — try the tagged shorthand.
+            let untagged = hbr & !0x4000_0000;
+            (untagged != hbr && (1..=MAX_SYS_COLOR).contains(&untagged))
+                .then(|| sys_color(untagged as i32 - 1))
+        }
+    }
 }
 
 /// `HBRUSH GetSysColorBrush(int nIndex)` — return a stable stock
@@ -10685,6 +11147,7 @@ mod tests {
             synthetic_message_budget: 240,
             wnd_proc: 0,
             window_class_procs: std::collections::HashMap::new(),
+            window_background: None,
             pending_create: None,
             window_procs: std::collections::HashMap::new(),
             window_userdata: std::collections::HashMap::new(),
@@ -10700,6 +11163,7 @@ mod tests {
             create_stage: pocket_kernel::CreateStage::Idle,
             dialog_frame: None,
             status_bar: None,
+            controls: Default::default(),
             pending_input: std::collections::VecDeque::new(),
             gapi_keys_queried: false,
             pending_message: None,
@@ -11186,6 +11650,73 @@ mod tests {
         };
         let r = get_file_attributes_w(&mut c).unwrap();
         assert_eq!(r, DispatchOutcome::ReturnedR0(0x0000_0080));
+    }
+
+    #[test]
+    fn class_background_resolves_every_hbrbackground_form() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let green = kernel.gdi.create_solid_brush(0x0000_8000);
+        let t = dummy_thunk();
+        let c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+
+        // NULL means "the app paints the whole client area".
+        assert_eq!(class_background_color(&c, 0), None);
+        // A real brush handle keeps its own colour (Solitaire's felt).
+        assert_eq!(class_background_color(&c, green), Some(0x0000_8000));
+        // COLOR_WINDOW + 1, the documented shorthand.
+        assert_eq!(class_background_color(&c, 6), Some(0x00FF_FFFF));
+        // The same shorthand with HelloWorld's bit-30 tag.
+        assert_eq!(class_background_color(&c, 0x4000_0006), Some(0x00FF_FFFF));
+        // A handle we never issued and cannot read as a shorthand.
+        assert_eq!(class_background_color(&c, 0x1234_5678), None);
+    }
+
+    #[test]
+    fn def_window_proc_erases_background_and_reports_it() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        kernel.window_background = Some(0x00FF_FFFF);
+        cpu.write_reg(ArmReg::Sp, 0x4000).unwrap();
+        // WM_ERASEBKGND must answer "handled" so DefWindowProc's caller
+        // doesn't erase a second time.
+        cpu.write_reg(ArmReg::R1, WM_ERASEBKGND).unwrap();
+        let t = dummy_thunk();
+        {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            assert_eq!(
+                def_window_proc_w(&mut c).unwrap(),
+                DispatchOutcome::ReturnedR0(1)
+            );
+        }
+        // White, little-endian RGB565.
+        assert_eq!(&kernel.framebuffer.pixels[0..2], &[0xff, 0xff]);
+
+        // A guest holding the GAPI framebuffer owns every pixel, so the
+        // erase has to stay out of its way.
+        kernel.framebuffer.pixels[0..2].copy_from_slice(&[0x00, 0x00]);
+        kernel.fb_mapped = true;
+        cpu.write_reg(ArmReg::R1, WM_PAINT).unwrap();
+        {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            assert_eq!(
+                def_window_proc_w(&mut c).unwrap(),
+                DispatchOutcome::ReturnedR0(0)
+            );
+        }
+        assert_eq!(&kernel.framebuffer.pixels[0..2], &[0x00, 0x00]);
     }
 
     #[test]
