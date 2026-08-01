@@ -1610,7 +1610,7 @@ impl Process {
                 create_frame: None,
                 create_stage: CreateStage::Idle,
                 dialog_frame: None,
-            status_bar: None,
+                status_bar: None,
                 pending_input: VecDeque::new(),
                 gapi_keys_queried: false,
                 pending_message: None,

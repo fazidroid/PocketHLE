@@ -4999,10 +4999,8 @@ fn status_bar_message(
                 .unwrap_or_default();
             if lparam != 0 {
                 if message == sb::GETTEXTW {
-                    let mut buf: Vec<u8> = text
-                        .encode_utf16()
-                        .flat_map(|u| u.to_le_bytes())
-                        .collect();
+                    let mut buf: Vec<u8> =
+                        text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
                     buf.extend_from_slice(&[0, 0]);
                     ctx.cpu.write_mem(lparam, &buf)?;
                 } else {

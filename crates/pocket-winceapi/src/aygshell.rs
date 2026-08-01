@@ -72,9 +72,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // real handlers in the PPC2002 block below, which still answers
     // TRUE for 9 — so Pocket DeathMatch keeps the return value its
     // startup path checks.
-    for ord in [
-        12u16, 13, 14, 21, 40, 49, 50, 65, 71, 72, 80, 84, 341, 344,
-    ] {
+    for ord in [12u16, 13, 14, 21, 40, 49, 50, 65, 71, 72, 80, 84, 341, 344] {
         d.register_handler(dll, &format!("ord:{ord}"), ok);
     }
 
