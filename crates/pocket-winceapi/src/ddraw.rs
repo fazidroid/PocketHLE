@@ -198,7 +198,7 @@ fn ddraw_create_palette(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
         ctx.cpu.write_mem(out, &object.to_le_bytes())?;
     }
     Ok(DispatchOutcome::ReturnedR0(if object != 0 {
-        1
+        0
     } else {
         0x8000_4005
     }))
