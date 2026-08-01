@@ -141,6 +141,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_strncmpi", strnicmp);
     d.register_handler(dll, "atoi", atoi_handler);
     d.register_handler(dll, "atol", atoi_handler);
+    d.register_handler(dll, "_itoa", itoa_handler);
     d.register_handler(dll, "_isctype", isctype);
     d.register_handler(dll, "strchr", strchr);
     d.register_handler(dll, "strrchr", strrchr);
@@ -2515,6 +2516,37 @@ fn atoi_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// character satisfies. `isalpha`, `isdigit`, `isspace` and friends are
 /// macros that call straight into this, so returning 0 unconditionally
 /// broke every parser the guest CRT has.
+fn itoa_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let value = ctx.arg_u32(0)? as i32;
+    let dst = ctx.arg_u32(1)?;
+    let radix = ctx.arg_u32(2)?;
+    if dst == 0 || !(2..=36).contains(&radix) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let negative = value < 0 && radix == 10;
+    let mut magnitude = if value < 0 && radix == 10 {
+        (value as i64).unsigned_abs()
+    } else {
+        value as u32 as u64
+    };
+    let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = Vec::new();
+    loop {
+        digits.push(alphabet[(magnitude % radix as u64) as usize]);
+        magnitude /= radix as u64;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if negative {
+        digits.push(b'-');
+    }
+    digits.reverse();
+    digits.push(0);
+    ctx.cpu.write_mem(dst, &digits)?;
+    Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
 fn isctype(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     const UPPER: u32 = 0x0001;
     const LOWER: u32 = 0x0002;
@@ -8808,18 +8840,7 @@ fn get_proc_address_a(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     } else {
         read_cstr_string(ctx, raw_name, 256)?
     };
-    let address = ctx
-        .kernel
-        .dynamic_exports
-        .get(&module)
-        .and_then(|exports| exports.get(&name).copied())
-        .or_else(|| {
-            ctx.kernel
-                .dynamic_exports
-                .get(&module)
-                .and_then(|exports| exports.get(&name.to_ascii_lowercase()).copied())
-        })
-        .unwrap_or(0);
+    let address = resolve_dynamic_export(ctx, module, &name);
     log::debug!("GetProcAddressA(0x{module:08x}, {name:?}) -> 0x{address:08x}");
     Ok(DispatchOutcome::ReturnedR0(address))
 }
@@ -8841,16 +8862,37 @@ fn get_proc_address_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     } else {
         String::from_utf16_lossy(&read_wstr(ctx, name_p, 256).unwrap_or_default())
     };
-    let address = ctx
-        .kernel
+    let address = resolve_dynamic_export(ctx, module, &name);
+    log::debug!("GetProcAddressW(0x{module:08x}, {name:?}) -> 0x{address:08x}");
+    Ok(DispatchOutcome::ReturnedR0(address))
+}
+
+fn resolve_dynamic_export(ctx: &CallCtx<'_>, module: u32, name: &str) -> u32 {
+    ctx.kernel
         .dynamic_exports
         .get(&module)
-        .and_then(|exports| exports.get(&name).copied())
+        .and_then(|exports| exports.get(name).copied())
         .or_else(|| {
             ctx.kernel
                 .dynamic_exports
                 .get(&module)
                 .and_then(|exports| exports.get(&name.to_ascii_lowercase()).copied())
+        })
+        .or_else(|| {
+            if module == FAKE_MODULE_HANDLE {
+                ctx.kernel
+                    .dynamic_exports
+                    .get(&FAKE_MODULE_HANDLE)
+                    .and_then(|exports| exports.get(name).copied())
+                    .or_else(|| {
+                        ctx.kernel
+                            .dynamic_exports
+                            .get(&FAKE_MODULE_HANDLE)
+                            .and_then(|exports| exports.get(&name.to_ascii_lowercase()).copied())
+                    })
+            } else {
+                None
+            }
         })
         .unwrap_or_else(|| {
             if name.eq_ignore_ascii_case("InitCommonControlsEx") {
@@ -8858,9 +8900,7 @@ fn get_proc_address_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
             } else {
                 0
             }
-        });
-    log::debug!("GetProcAddressW(0x{module:08x}, {name:?}) -> 0x{address:08x}");
-    Ok(DispatchOutcome::ReturnedR0(address))
+        })
 }
 
 fn get_cursor_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
