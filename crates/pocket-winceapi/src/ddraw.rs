@@ -232,7 +232,7 @@ fn ddraw_qi(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn ddraw_create_palette(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let out = ctx.arg_u32(3)?;
+    let out = ctx.arg_u32(2)?;
     let object = alloc_object(ctx, &PALETTE_METHODS, FAKE_PALETTE)?;
     if out != 0 {
         ctx.cpu.write_mem(out, &object.to_le_bytes())?;
