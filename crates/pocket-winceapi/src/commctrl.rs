@@ -57,6 +57,12 @@ pub fn register(d: &mut WinCeDispatcher) {
         d.register_handler(dll, &format!("ord:{ord}"), ok);
     }
 
+    // #2, #4 and #5 are successful no-op common-control calls in the
+    // PPC2003 ordinal space used by Cubis.
+    d.register_handler(dll, "ord:2", ok);
+    d.register_handler(dll, "ord:4", ok);
+    d.register_handler(dll, "ord:5", ok);
+
     // #17 is `CreateStatusWindowW` in the PPC2002 ordinal space.
     // PPC2002 Solitaire calls it as
     //   (0x50000003, NULL, 0xdead0001, 45)

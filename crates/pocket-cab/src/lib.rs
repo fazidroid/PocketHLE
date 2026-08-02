@@ -433,7 +433,9 @@ impl WinCeSetupScript {
         for line in s.lines() {
             let line = line.trim();
             if let Some(name) = parm_value(line, "InstallDir") {
-                script.install_dir = Some(canonicalise_install_dir(&name));
+                if script.install_dir.is_none() && !name.eq_ignore_ascii_case("%InstallDir%") {
+                    script.install_dir = Some(canonicalise_install_dir(&name));
+                }
             } else if let Some(name) = parm_value(line, "AppName") {
                 script.app_name = Some(name);
             }
@@ -845,5 +847,15 @@ mod tests {
         let h = WinCeInstallHeader::parse_bytes(&[]).unwrap();
         assert!(h.app_name.is_none());
         assert!(h.files.is_empty());
+    }
+
+    #[test]
+    fn setup_install_dir_is_not_overwritten_by_registry_reference() {
+        let script = WinCeSetupScript::parse_bytes(
+            br#"<characteristic type="Install"><parm name="InstallDir" value="%CE1%\Astraware\Cubis" /></characteristic><characteristic type="Registry"><characteristic type="HKLM\SOFTWARE\Apps\Astraware Cubis"><parm name="InstallDir" value="%InstallDir%" datatype="string" /></characteristic></characteristic>"#,
+        );
+        assert_eq!(script.install_dir.as_deref(), Some(r"\Program Files\Astraware\Cubis\"));
+        assert_eq!(script.shortcut_target, None);
+        assert_eq!(script.registry[0].string.as_deref(), Some(r"\Program Files\Astraware\Cubis"));
     }
 }

@@ -1275,9 +1275,15 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
         } else if thunk.dll.eq_ignore_ascii_case("ddraw.dll") {
             ddraw.insert(name.clone(), thunk.thunk_va);
         } else if thunk.dll.eq_ignore_ascii_case("gx.dll") {
-            gx.insert(name, thunk.thunk_va);
+            gx.insert(name.clone(), thunk.thunk_va);
+            if let ImportBinding::Ordinal(ord) = &thunk.binding {
+                gx.insert(format!("#{}", ord), thunk.thunk_va);
+            }
         } else if thunk.dll.eq_ignore_ascii_case("commctrl.dll") {
             commctrl.insert(name.clone(), thunk.thunk_va);
+            if let ImportBinding::Ordinal(ord) = &thunk.binding {
+                commctrl.insert(format!("#{}", ord), thunk.thunk_va);
+            }
             if name == "#1" {
                 commctrl.insert("InitCommonControls".into(), thunk.thunk_va);
                 commctrl.insert("InitCommonControlsEx".into(), thunk.thunk_va);

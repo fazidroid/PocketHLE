@@ -9691,6 +9691,14 @@ fn get_proc_address_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
 }
 
 fn resolve_dynamic_export(ctx: &CallCtx<'_>, module: u32, name: &str) -> u32 {
+    if module == 0x1000_0001 && name.eq_ignore_ascii_case("?GXCloseInput@@YAHXZ") {
+        return ctx
+            .kernel
+            .dynamic_exports
+            .get(&module)
+            .and_then(|exports| exports.get("?GXOpenInput@@YAHXZ").copied())
+            .unwrap_or(0);
+    }
     ctx.kernel
         .dynamic_exports
         .get(&module)
