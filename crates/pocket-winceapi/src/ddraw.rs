@@ -363,12 +363,12 @@ fn write_surface_desc(ctx: &mut CallCtx<'_>, desc: u32, surface: u32) -> Result<
     bytes[12..16].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
     bytes[16..20].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
     bytes[36..40].copy_from_slice(&surface.to_le_bytes());
-    bytes[72..76].copy_from_slice(&32u32.to_le_bytes());
-    bytes[76..80].copy_from_slice(&0x40u32.to_le_bytes());
-    bytes[84..88].copy_from_slice(&16u32.to_le_bytes());
-    bytes[88..92].copy_from_slice(&0xf800u32.to_le_bytes());
-    bytes[92..96].copy_from_slice(&0x07e0u32.to_le_bytes());
-    bytes[96..100].copy_from_slice(&0x001fu32.to_le_bytes());
+    bytes[56..60].copy_from_slice(&32u32.to_le_bytes());
+    bytes[60..64].copy_from_slice(&0x40u32.to_le_bytes());
+    bytes[68..72].copy_from_slice(&16u32.to_le_bytes());
+    bytes[72..76].copy_from_slice(&0xf800u32.to_le_bytes());
+    bytes[76..80].copy_from_slice(&0x07e0u32.to_le_bytes());
+    bytes[80..84].copy_from_slice(&0x001fu32.to_le_bytes());
     ctx.cpu.write_mem(desc, &bytes)?;
     Ok(())
 }
