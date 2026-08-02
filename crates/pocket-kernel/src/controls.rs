@@ -53,7 +53,15 @@ const BS_DEFPUSHBUTTON: u32 = 0x0001;
 const BS_CHECKBOX: u32 = 0x0002;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 const BS_RADIOBUTTON: u32 = 0x0004;
+/// `BS_GROUPBOX` — not a button at all: an etched frame with its
+/// caption let into the top-left of the border. Solitaire's Options
+/// dialog uses three (Draw, Scoring, Card back), each enclosing the
+/// radio buttons it labels.
+const BS_GROUPBOX: u32 = 0x0007;
 const BS_AUTORADIOBUTTON: u32 = 0x0009;
+
+/// `IDOK`, reported when the caption bar's OK box is tapped.
+pub const IDOK: u32 = 1;
 
 /// `WS_VISIBLE`.
 const WS_VISIBLE: u32 = 0x1000_0000;
@@ -81,14 +89,97 @@ pub struct DialogPanel {
     pub visible: bool,
     /// `WS_BORDER` — the one-pixel black frame around the panel.
     pub border: bool,
+    /// Title shown in the caption bar, for a dialog that has one.
+    ///
+    /// `None` is a bare panel — Solitaire's button strip is a
+    /// `WS_CHILD` dialog with no caption, and drawing one over the card
+    /// table would be wrong. `Some` adds the Windows CE chrome: a
+    /// coloured bar above the client area carrying the OK box.
+    pub caption: Option<String>,
+    /// Is the OK box currently held down?
+    pub ok_pressed: bool,
 }
 
 impl DialogPanel {
+    /// Height of the caption bar. Our font is 8 px tall; a Pocket PC
+    /// caption is a little over twice that, and 14 px leaves 3 px of
+    /// padding above and below the text.
+    pub const CAPTION_H: i32 = 14;
+
+    /// Height of the boxes in the caption, and the width of the OK one.
+    ///
+    /// A device labels it with the word "OK", not a tick, so the box has
+    /// to be wide enough for two glyphs plus a pixel of padding either
+    /// side. The `?` box beside it is square.
+    const BOX_H: i32 = 11;
+    const OK_BOX: i32 = 2 * font::GLYPH_W + 4;
+    const HELP_BOX: i32 = Self::BOX_H;
+    /// Gap between the two boxes.
+    const BOX_GAP: i32 = 2;
+
+    /// Caption background — the CE title bar blue.
+    const CAPTION_BG: u16 = 0x0010;
+    /// Caption text, white on that blue.
+    const CAPTION_FG: u16 = 0xFFFF;
+    /// The OK label is drawn in the caption blue, as on a device.
+    const OK_FG: u16 = 0x0010;
+
+    /// Height the caption takes off the top of the window, or 0.
+    pub fn caption_h(&self) -> i32 {
+        if self.caption.is_some() {
+            Self::CAPTION_H
+        } else {
+            0
+        }
+    }
+
     /// Client origin: one pixel in from each edge when the panel has a
-    /// border, otherwise the window origin itself.
+    /// border, and below the caption bar when it has one.
     pub fn client_origin(&self) -> (i32, i32) {
         let inset = i32::from(self.border);
-        (self.x + inset, self.y + inset)
+        (self.x + inset, self.y + inset + self.caption_h())
+    }
+
+    /// Screen rectangle of the OK box, for a captioned dialog.
+    ///
+    /// Windows CE has no close button on a dialog: the shell puts a
+    /// single OK box at the right end of the caption, and tapping it is
+    /// how the user accepts the dialog. There is no Cancel — which is
+    /// why an app like Solitaire applies its Options as they are
+    /// toggled rather than on the way out.
+    pub fn ok_box(&self) -> Option<(i32, i32, i32, i32)> {
+        self.caption.as_ref()?;
+        let inset = i32::from(self.border);
+        let pad = (Self::CAPTION_H - Self::BOX_H) / 2;
+        Some((
+            self.x + self.w - inset - pad - Self::OK_BOX,
+            self.y + inset + pad,
+            Self::OK_BOX,
+            Self::BOX_H,
+        ))
+    }
+
+    /// Screen rectangle of the `?` box, immediately left of the OK one.
+    ///
+    /// Pocket PC puts context help here. We draw it because the caption
+    /// looks wrong without it, but it is inert: there is no help file to
+    /// show, and tapping it must not be mistaken for the OK box.
+    pub fn help_box(&self) -> Option<(i32, i32, i32, i32)> {
+        let (bx, by, _, bh) = self.ok_box()?;
+        Some((bx - Self::BOX_GAP - Self::HELP_BOX, by, Self::HELP_BOX, bh))
+    }
+
+    /// Is `(x, y)`, in screen coordinates, inside the OK box?
+    pub fn ok_box_contains(&self, x: i32, y: i32) -> bool {
+        match self.ok_box() {
+            Some((bx, by, bw, bh)) => x >= bx && x < bx + bw && y >= by && y < by + bh,
+            None => false,
+        }
+    }
+
+    /// Is `(x, y)` anywhere inside this panel's window rectangle?
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
 
     fn render(&self, surf: &mut Surface<'_>) {
@@ -99,6 +190,61 @@ impl DialogPanel {
         if self.border {
             stroke(surf, self.x, self.y, self.w, self.h, ChildWindow::TEXT);
         }
+        self.render_caption(surf);
+    }
+
+    /// Paint the caption bar and its OK box.
+    fn render_caption(&self, surf: &mut Surface<'_>) {
+        let Some(title) = self.caption.as_deref() else {
+            return;
+        };
+        let inset = i32::from(self.border);
+        let (cx, cy) = (self.x + inset, self.y + inset);
+        let cw = self.w - 2 * inset;
+        if cw <= 0 {
+            return;
+        }
+        surf.fill_rect(cx, cy, cw, Self::CAPTION_H, Self::CAPTION_BG);
+        let ty = cy + (Self::CAPTION_H - font::GLYPH_H) / 2;
+        // Stop the title before the boxes rather than under them.
+        let right = self
+            .help_box()
+            .map(|(bx, ..)| bx - 2)
+            .unwrap_or(cx + cw)
+            .min(cx + cw);
+        draw_clipped(surf, cx + 3, ty, title, Self::CAPTION_FG, right);
+
+        if let Some((bx, by, bw, bh)) = self.help_box() {
+            self.render_caption_box(surf, (bx, by, bw, bh), "?", false);
+        }
+        if let Some((bx, by, bw, bh)) = self.ok_box() {
+            self.render_caption_box(surf, (bx, by, bw, bh), "OK", self.ok_pressed);
+        }
+    }
+
+    /// One raised box in the caption bar, with its label centred.
+    ///
+    /// The label is drawn in the caption blue on the button face, which
+    /// is how a device renders both the `?` and the `OK`; pressing it
+    /// swaps the edge and nudges the label a pixel down and right.
+    fn render_caption_box(
+        &self,
+        surf: &mut Surface<'_>,
+        (bx, by, bw, bh): (i32, i32, i32, i32),
+        label: &str,
+        pressed: bool,
+    ) {
+        surf.fill_rect(bx, by, bw, bh, ChildWindow::FACE);
+        let (tl, br) = if pressed {
+            (ChildWindow::SHADOW, ChildWindow::LIGHT)
+        } else {
+            (ChildWindow::LIGHT, ChildWindow::SHADOW)
+        };
+        draw_edge(surf, bx, by, bw, bh, tl, br);
+        let nudge = i32::from(pressed);
+        let tx = bx + (bw - font::str_width(label)).max(0) / 2 + nudge;
+        let ty = by + (bh - font::GLYPH_H) / 2 + nudge;
+        draw_clipped(surf, tx, ty, label, Self::OK_FG, bx + bw - 1);
     }
 }
 
@@ -152,6 +298,9 @@ impl ChildWindow {
     /// Side of the square glyph box drawn for a check box / radio.
     const CHECK_BOX: i32 = 12;
 
+    /// How far in from the left edge a group box's caption starts.
+    const GROUP_LABEL_X: i32 = 7;
+
     /// Is `(px, py)`, in parent-client coordinates, inside this control?
     pub fn contains(&self, px: i32, py: i32) -> bool {
         px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
@@ -163,12 +312,23 @@ impl ChildWindow {
     }
 
     /// A push button — the kind that sends `BN_CLICKED` and pops back
-    /// up, as opposed to a check box or radio button that latches.
+    /// up, as opposed to a check box or radio button that latches, or a
+    /// group box that is not interactive at all.
     pub fn is_push_button(&self) -> bool {
         matches!(self.button_type(), Some(t) if t != BS_CHECKBOX
             && t != BS_AUTOCHECKBOX
             && t != BS_RADIOBUTTON
-            && t != BS_AUTORADIOBUTTON)
+            && t != BS_AUTORADIOBUTTON
+            && t != BS_GROUPBOX)
+    }
+
+    /// `BS_GROUPBOX` — a frame around a set of related controls.
+    ///
+    /// Rendered as an etched rectangle rather than a raised face: a
+    /// group box is the same size as everything it encloses, so drawing
+    /// it as a button would bury its own contents.
+    pub fn is_group_box(&self) -> bool {
+        self.button_type() == Some(BS_GROUPBOX)
     }
 
     /// A button that latches its check state when clicked. Only the
@@ -201,9 +361,9 @@ impl ChildWindow {
 
     /// Can this control take the input focus? Statics never do, which
     /// is what keeps a tap on a label from stealing the caret from an
-    /// edit field, and neither does a disabled control.
+    /// edit field, and neither does a disabled control nor a group box.
     pub fn is_focusable(&self) -> bool {
-        self.class != ControlClass::Static && self.enabled
+        self.class != ControlClass::Static && self.enabled && !self.is_group_box()
     }
 
     /// Draw a caption, etched when the control is disabled.
@@ -236,6 +396,9 @@ impl ChildWindow {
     }
 
     fn render_button(&self, surf: &mut Surface<'_>, focused: bool) {
+        if self.is_group_box() {
+            return self.render_group_box(surf);
+        }
         if self.is_check_like() {
             return self.render_check(surf, focused);
         }
@@ -271,6 +434,49 @@ impl ChildWindow {
         if focused {
             dotted_rect(surf, x + 3, y + 3, w - 6, h - 6, Self::TEXT);
         }
+    }
+
+    /// Paint a `BS_GROUPBOX`: an etched frame with its caption let into
+    /// the top edge.
+    ///
+    /// Win32 etches the frame the same way it etches disabled text —
+    /// shadow up and left, highlight down and right — and breaks the top
+    /// border for the caption rather than drawing the text over it. The
+    /// frame's top runs along the middle of the caption's line, so the
+    /// enclosed controls start below it.
+    fn render_group_box(&self, surf: &mut Surface<'_>) {
+        let top = self.y + font::GLYPH_H / 2;
+        let h = self.h - font::GLYPH_H / 2;
+        if h <= 0 || self.w <= 0 {
+            return;
+        }
+        // Etched: the shadow rectangle with a highlight one pixel
+        // down-right of it, which is what gives the groove its depth.
+        stroke(surf, self.x + 1, top + 1, self.w, h, Self::LIGHT);
+        stroke(surf, self.x, top, self.w, h, Self::SHADOW);
+
+        if self.text.is_empty() {
+            return;
+        }
+        // Break the border under the caption, then stamp the text into
+        // the gap. `Self::GROUP_LABEL_X` is Win32's indent.
+        let text_w = font::str_width(&self.text).min(self.w - Self::GROUP_LABEL_X - 2);
+        if text_w <= 0 {
+            return;
+        }
+        surf.fill_rect(
+            self.x + Self::GROUP_LABEL_X - 1,
+            top,
+            text_w + 3,
+            2,
+            Self::FACE,
+        );
+        self.draw_caption(
+            surf,
+            self.x + Self::GROUP_LABEL_X,
+            self.y,
+            self.x + self.w - 1,
+        );
     }
 
     fn render_check(&self, surf: &mut Surface<'_>, focused: bool) {
@@ -355,7 +561,7 @@ fn draw_clipped(surf: &mut Surface<'_>, x: i32, y: i32, text: &str, color: u16, 
 
 /// The classic Win32 3D edge: `tl` down the top and left, `br` up the
 /// bottom and right.
-fn draw_edge(surf: &mut Surface<'_>, x: i32, y: i32, w: i32, h: i32, tl: u16, br: u16) {
+pub(crate) fn draw_edge(surf: &mut Surface<'_>, x: i32, y: i32, w: i32, h: i32, tl: u16, br: u16) {
     if w <= 0 || h <= 0 {
         return;
     }
@@ -366,7 +572,7 @@ fn draw_edge(surf: &mut Surface<'_>, x: i32, y: i32, w: i32, h: i32, tl: u16, br
 }
 
 /// Solid one-pixel outline.
-fn stroke(surf: &mut Surface<'_>, x: i32, y: i32, w: i32, h: i32, color: u16) {
+pub(crate) fn stroke(surf: &mut Surface<'_>, x: i32, y: i32, w: i32, h: i32, color: u16) {
     draw_edge(surf, x, y, w, h, color, color);
 }
 
@@ -536,6 +742,27 @@ impl Controls {
             .find(|c| c.parent == parent && c.id == id)
     }
 
+    /// `CheckRadioButton`: check the control with id `check` and clear
+    /// every other control in `first..=last`, returning how many were
+    /// touched.
+    ///
+    /// The range is matched on id rather than on style, because that is
+    /// what the API contract says — an app is free to pass a range that
+    /// happens to include a static, and the real one clears it too.
+    /// `parent` is honoured so a dialog cannot reach into another one's
+    /// controls that happen to share ids.
+    pub fn check_radio_range(&mut self, parent: u32, first: u32, last: u32, check: u32) -> usize {
+        let mut hit = 0;
+        for child in &mut self.children {
+            if child.parent != parent || child.id < first || child.id > last {
+                continue;
+            }
+            child.checked = child.id == check;
+            hit += 1;
+        }
+        hit
+    }
+
     /// Nothing to paint and nothing to hit.
     pub fn is_empty(&self) -> bool {
         self.children.is_empty() && self.panels.is_empty()
@@ -573,16 +800,36 @@ impl Controls {
         child.visible && self.panel(child.parent).map(|p| p.visible).unwrap_or(true)
     }
 
+    /// `IsWindowVisible` for anything we own: a control, or a dialog
+    /// panel. `None` means the handle is not one of ours, and the caller
+    /// should answer for it however it answers for top-level windows.
+    ///
+    /// Answering this honestly matters more than it looks. Solitaire
+    /// builds its status readouts hidden, then asks whether they are
+    /// visible before showing them; a handle that always claims to be
+    /// visible makes the app skip its own `ShowWindow` and the Time and
+    /// Score fields never appear.
+    pub fn is_visible(&self, hwnd: u32) -> Option<bool> {
+        if let Some(child) = self.get(hwnd) {
+            return Some(self.is_showing(child));
+        }
+        self.panel(hwnd).map(|p| p.visible)
+    }
+
     /// Topmost visible control under `(x, y)`, in screen coordinates.
     /// Later-created controls sit on top, matching the z-order a freshly
     /// built dialog has.
+    ///
+    /// Group boxes are skipped: they enclose the controls they label, so
+    /// a frame that answered a hit test would shadow every radio inside
+    /// it whenever the z-order put it on top.
     pub fn hit_test(&self, x: i32, y: i32) -> Option<u32> {
         self.children
             .iter()
             .rev()
             .find(|c| {
                 let (ox, oy) = self.parent_origin(c.parent);
-                self.is_showing(c) && c.contains(x - ox, y - oy)
+                !c.is_group_box() && self.is_showing(c) && c.contains(x - ox, y - oy)
             })
             .map(|c| c.hwnd)
     }
@@ -629,6 +876,93 @@ impl Controls {
             id: child.id,
             hwnd: child.hwnd,
         })
+    }
+
+    /// [`Self::pointer_down`] restricted to the children of `parent`.
+    ///
+    /// A modal dialog owns the stylus for as long as it is up: a tap
+    /// outside it does nothing at all, rather than reaching the window
+    /// underneath. Every event is still reported as consumed for that
+    /// reason.
+    ///
+    /// The caption's OK box is tested first: it sits above the client
+    /// area, so no control can be under it, and it has to arm even
+    /// though it is chrome rather than a child window.
+    pub fn pointer_down_in(&mut self, parent: u32, x: i32, y: i32) -> Option<ControlAction> {
+        if let Some(panel) = self.panel_mut(parent) {
+            if panel.ok_box_contains(x, y) {
+                panel.ok_pressed = true;
+                return Some(ControlAction::Consumed);
+            }
+        }
+        match self.hit_test(x, y) {
+            Some(hwnd) if self.get(hwnd).map(|c| c.parent) == Some(parent) => {
+                self.pointer_down(x, y)
+            }
+            _ => Some(ControlAction::Consumed),
+        }
+    }
+
+    /// [`Self::pointer_up`] restricted to the children of `parent`.
+    pub fn pointer_up_in(&mut self, parent: u32, x: i32, y: i32) -> Option<ControlAction> {
+        // Releasing the caption's OK box is the dialog's accept: report
+        // it as `IDOK` from the panel itself, which is what the shell
+        // sends on a device.
+        if let Some(panel) = self.panel_mut(parent) {
+            if panel.ok_pressed {
+                panel.ok_pressed = false;
+                let hit = panel.ok_box_contains(x, y);
+                let hwnd = panel.hwnd;
+                return Some(if hit {
+                    ControlAction::Clicked {
+                        parent,
+                        id: IDOK,
+                        hwnd,
+                    }
+                } else {
+                    ControlAction::Consumed
+                });
+            }
+        }
+        // The press that captured has to belong to the dialog too, or a
+        // release could fire a click on the window behind it.
+        let captured_elsewhere =
+            self.capture != 0 && self.get(self.capture).map(|c| c.parent) != Some(parent);
+        if captured_elsewhere {
+            self.capture = 0;
+            return Some(ControlAction::Consumed);
+        }
+        match self.pointer_up(x, y) {
+            Some(ControlAction::Clicked {
+                parent: p,
+                id,
+                hwnd,
+            }) if p == parent => Some(ControlAction::Clicked {
+                parent: p,
+                id,
+                hwnd,
+            }),
+            Some(_) | None => Some(ControlAction::Consumed),
+        }
+    }
+
+    /// [`Self::key_down`] restricted to the children of `parent`.
+    pub fn key_down_in(&mut self, parent: u32, vk: u16) -> Option<ControlAction> {
+        if self.get(self.focus).map(|c| c.parent) != Some(parent) {
+            return Some(ControlAction::Consumed);
+        }
+        match self.key_down(vk) {
+            Some(ControlAction::Clicked {
+                parent: p,
+                id,
+                hwnd,
+            }) if p == parent => Some(ControlAction::Clicked {
+                parent: p,
+                id,
+                hwnd,
+            }),
+            Some(_) | None => Some(ControlAction::Consumed),
+        }
     }
 
     /// Feed a virtual-key press to the focused control.
@@ -680,26 +1014,53 @@ impl Controls {
     /// parent has filled its client area, and an app that blits over
     /// the whole client rect would otherwise erase them.
     ///
-    /// Panels go down first — a dialog's face is behind its children —
-    /// and each child is translated into its panel's client space.
+    /// Each window is painted as a unit — a panel's face immediately
+    /// followed by its own children — rather than every panel first and
+    /// every child after. Otherwise a dialog that opens over another
+    /// one covers its face but not its buttons, and Solitaire's Exit /
+    /// Help strip shows through the Options dialog on top of it.
+    ///
+    /// Controls parented straight to a frame window go down first, below
+    /// every dialog; panels then follow in creation order, so the most
+    /// recently created dialog — the modal — ends up on top.
+    ///
+    /// Group boxes go down before their siblings. A template lists a
+    /// group box *before* the radios it encloses and gives it a
+    /// rectangle large enough to contain them, so painting in template
+    /// order is right, but only as long as nothing later re-orders
+    /// them — the separate pass makes the "frames are backdrop" rule
+    /// explicit rather than incidental.
     pub fn render(&self, surf: &mut Surface<'_>) {
+        // Children of a frame window, which no panel owns.
+        self.render_children_of(surf, |parent| self.panel(parent).is_none());
         for panel in &self.panels {
             panel.render(surf);
+            self.render_children_of(surf, |parent| parent == panel.hwnd);
         }
-        for child in &self.children {
-            if !self.is_showing(child) {
-                continue;
-            }
-            let (ox, oy) = self.parent_origin(child.parent);
-            let focused = child.hwnd == self.focus;
-            if (ox, oy) == (0, 0) {
-                child.render(surf, focused);
-            } else {
-                // Cheap: the translated copy lives only for the call.
-                let mut moved = child.clone();
-                moved.x += ox;
-                moved.y += oy;
-                moved.render(surf, focused);
+    }
+
+    /// Paint every visible child whose parent satisfies `owned`, group
+    /// boxes first.
+    fn render_children_of(&self, surf: &mut Surface<'_>, owned: impl Fn(u32) -> bool) {
+        for group_pass in [true, false] {
+            for child in &self.children {
+                if child.is_group_box() != group_pass
+                    || !owned(child.parent)
+                    || !self.is_showing(child)
+                {
+                    continue;
+                }
+                let (ox, oy) = self.parent_origin(child.parent);
+                let focused = child.hwnd == self.focus;
+                if (ox, oy) == (0, 0) {
+                    child.render(surf, focused);
+                } else {
+                    // Cheap: the translated copy lives only for the call.
+                    let mut moved = child.clone();
+                    moved.x += ox;
+                    moved.y += oy;
+                    moved.render(surf, focused);
+                }
             }
         }
     }
@@ -1017,6 +1378,292 @@ mod tests {
         assert!(off.contains(&ChildWindow::SHADOW));
         assert!(off.contains(&ChildWindow::LIGHT));
         assert!(!off.contains(&ChildWindow::TEXT));
+    }
+
+    /// A dialog panel with the Windows CE caption, sized and placed the
+    /// way Solitaire's Options dialog is.
+    fn captioned_panel(hwnd: u32) -> DialogPanel {
+        DialogPanel {
+            hwnd,
+            x: 20,
+            y: 24,
+            w: 200,
+            h: 100,
+            visible: true,
+            border: true,
+            caption: Some("Options".into()),
+            ok_pressed: false,
+        }
+    }
+
+    #[test]
+    fn a_caption_pushes_the_client_origin_below_it() {
+        let bare = DialogPanel {
+            caption: None,
+            ..captioned_panel(0xDEAD_0002)
+        };
+        assert_eq!(bare.caption_h(), 0);
+        assert_eq!(bare.client_origin(), (21, 25));
+
+        let titled = captioned_panel(0xDEAD_0002);
+        assert_eq!(titled.caption_h(), DialogPanel::CAPTION_H);
+        assert_eq!(titled.client_origin(), (21, 25 + DialogPanel::CAPTION_H));
+        // The OK box sits inside the caption, hard against the right
+        // edge — never over the client area.
+        let (bx, by, bw, bh) = titled.ok_box().expect("captioned");
+        assert!(bx + bw < titled.x + titled.w);
+        assert!(by > titled.y);
+        assert!(by + bh <= titled.y + 1 + DialogPanel::CAPTION_H);
+        assert!(titled.ok_box_contains(bx + bw / 2, by + bh / 2));
+        assert!(!titled.ok_box_contains(bx - 4, by + bh / 2));
+        assert!(bare.ok_box().is_none());
+        assert!(!bare.ok_box_contains(bx + bw / 2, by + bh / 2));
+    }
+
+    #[test]
+    fn tapping_the_caption_ok_box_reports_idok_from_the_panel() {
+        const MODAL: u32 = 0xDEAD_0002;
+        let mut ctrls = Controls::default();
+        ctrls.add_panel(captioned_panel(MODAL));
+        let (bx, by, bw, bh) = ctrls.panel(MODAL).unwrap().ok_box().unwrap();
+        let (cx, cy) = (bx + bw / 2, by + bh / 2);
+
+        assert_eq!(
+            ctrls.pointer_down_in(MODAL, cx, cy),
+            Some(ControlAction::Consumed)
+        );
+        assert!(ctrls.panel(MODAL).unwrap().ok_pressed);
+        assert_eq!(
+            ctrls.pointer_up_in(MODAL, cx, cy),
+            Some(ControlAction::Clicked {
+                parent: MODAL,
+                id: IDOK,
+                hwnd: MODAL,
+            })
+        );
+        assert!(!ctrls.panel(MODAL).unwrap().ok_pressed);
+
+        // Released off the box: armed, then cancelled, like any button.
+        ctrls.pointer_down_in(MODAL, cx, cy);
+        assert_eq!(
+            ctrls.pointer_up_in(MODAL, cx - 40, cy),
+            Some(ControlAction::Consumed)
+        );
+        assert!(!ctrls.panel(MODAL).unwrap().ok_pressed);
+    }
+
+    #[test]
+    fn the_help_box_sits_left_of_the_ok_box_and_is_not_part_of_it() {
+        const MODAL: u32 = 0xDEAD_0002;
+        let panel = captioned_panel(MODAL);
+        let (ox, oy, ow, oh) = panel.ok_box().unwrap();
+        let (hx, hy, hw, hh) = panel.help_box().unwrap();
+
+        // Same row, to the left, not overlapping.
+        assert_eq!((hy, hh), (oy, oh));
+        assert!(hx + hw < ox);
+        // The OK box is wide enough for the word, which is the whole
+        // reason it is not square like the `?` beside it.
+        assert!(ow >= font::str_width("OK"));
+        assert_eq!(hw, hh);
+        // Tapping the `?` is not tapping OK.
+        assert!(!panel.ok_box_contains(hx + hw / 2, hy + hh / 2));
+    }
+
+    #[test]
+    fn the_caption_ok_box_is_labelled_rather_than_left_blank() {
+        const MODAL: u32 = 0xDEAD_0002;
+        let mut bm = Bitmap::new(120, 40);
+        let mut surf = Surface::Bitmap(&mut bm);
+        let mut panel = captioned_panel(MODAL);
+        (panel.x, panel.y, panel.w, panel.h) = (0, 0, 120, 40);
+        panel.render(&mut surf);
+
+        let (bx, by, bw, bh) = panel.ok_box().unwrap();
+        let px = |x: i32, y: i32| -> u16 {
+            let o = (y * 120 + x) as usize * 2;
+            let p = surf.pixels();
+            u16::from_le_bytes([p[o], p[o + 1]])
+        };
+        // Some pixel inside the box carries the label colour, and it is
+        // neither the face nor the caption background behind it.
+        let labelled = (by..by + bh).any(|y| (bx..bx + bw).any(|x| px(x, y) == DialogPanel::OK_FG));
+        assert!(labelled, "the OK box drew no label");
+        assert_ne!(DialogPanel::OK_FG, ChildWindow::FACE);
+    }
+
+    #[test]
+    fn check_radio_button_selects_one_and_clears_the_rest_of_the_range() {
+        const DLG: u32 = 0xDEAD_0002;
+        const OTHER: u32 = 0xDEAD_0003;
+        let mut ctrls = Controls::default();
+        // Three radios in one group, plus a same-id control belonging to
+        // a different dialog that must not be disturbed.
+        let radio = |ctrls: &mut Controls, parent: u32, id: u32| {
+            ctrls.create(
+                parent,
+                ControlClass::Button,
+                id,
+                String::new(),
+                WS_VISIBLE | BS_AUTORADIOBUTTON,
+                0,
+                0,
+                10,
+                10,
+            )
+        };
+        for id in 100..103 {
+            let h = radio(&mut ctrls, DLG, id);
+            ctrls.get_mut(h).unwrap().checked = id == 100;
+        }
+        let stranger = radio(&mut ctrls, OTHER, 101);
+        ctrls.get_mut(stranger).unwrap().checked = true;
+
+        assert_eq!(ctrls.check_radio_range(DLG, 100, 102, 101), 3);
+        assert!(!ctrls.by_id(DLG, 100).unwrap().checked);
+        assert!(ctrls.by_id(DLG, 101).unwrap().checked);
+        assert!(!ctrls.by_id(DLG, 102).unwrap().checked);
+        // The other dialog's control kept its state.
+        assert!(ctrls.get(stranger).unwrap().checked);
+        // A range that matches nothing reports so rather than panicking.
+        assert_eq!(ctrls.check_radio_range(DLG, 900, 999, 950), 0);
+    }
+
+    #[test]
+    fn a_dialog_on_top_hides_the_buttons_of_the_one_below() {
+        const STRIP: u32 = 0xDEAD_0002;
+        const MODAL: u32 = 0xDEAD_0003;
+        let mut bm = Bitmap::new(120, 60);
+        let mut surf = Surface::Bitmap(&mut bm);
+        let mut ctrls = Controls::default();
+
+        // A button strip along the right, then a modal over the top of
+        // it — the Solitaire layout that exposed this.
+        ctrls.add_panel(DialogPanel {
+            hwnd: STRIP,
+            x: 80,
+            y: 0,
+            w: 40,
+            h: 60,
+            visible: true,
+            border: false,
+            caption: None,
+            ok_pressed: false,
+        });
+        ctrls.create(
+            STRIP,
+            ControlClass::Button,
+            1000,
+            "Exit".into(),
+            WS_VISIBLE,
+            0,
+            0,
+            38,
+            20,
+        );
+        ctrls.add_panel(DialogPanel {
+            hwnd: MODAL,
+            x: 10,
+            y: 5,
+            w: 100,
+            h: 50,
+            visible: true,
+            border: true,
+            caption: Some("Options".into()),
+            ok_pressed: false,
+        });
+        ctrls.render(&mut surf);
+
+        let px = |x: usize, y: usize| -> u16 {
+            let o = (y * 120 + x) * 2;
+            let p = surf.pixels();
+            u16::from_le_bytes([p[o], p[o + 1]])
+        };
+        // Inside the modal's caption, over where Exit sits: the caption
+        // colour, not the button's face or its text.
+        assert_eq!(px(90, 8), DialogPanel::CAPTION_BG);
+        // The strip's button is still painted where the modal does not
+        // reach it.
+        assert_ne!(px(112, 2), DialogPanel::CAPTION_BG);
+    }
+
+    #[test]
+    fn a_group_box_frames_its_radios_without_covering_them() {
+        const MODAL: u32 = 0xDEAD_0002;
+        const BS_AUTORADIO: u32 = 0x0009;
+        let mut ctrls = Controls::default();
+        // Solitaire's "Draw" group and the two radios inside it, at the
+        // sizes the template really gives them.
+        let group = ctrls.create(
+            MODAL,
+            ControlClass::Button,
+            1009,
+            "Draw".into(),
+            WS_VISIBLE | BS_GROUPBOX,
+            5,
+            0,
+            113,
+            84,
+        );
+        let one = ctrls.create(
+            MODAL,
+            ControlClass::Button,
+            1010,
+            "One".into(),
+            WS_VISIBLE | BS_AUTORADIO,
+            15,
+            24,
+            75,
+            21,
+        );
+
+        // The frame is not a button: it never takes the focus, and a tap
+        // inside it reaches the radio rather than the frame.
+        assert!(ctrls.get(group).unwrap().is_group_box());
+        assert!(!ctrls.get(group).unwrap().is_push_button());
+        assert!(!ctrls.get(group).unwrap().is_focusable());
+        assert_eq!(ctrls.hit_test(20, 30), Some(one));
+        // A point inside the frame but on no radio hits nothing at all.
+        assert_eq!(ctrls.hit_test(20, 75), None);
+    }
+
+    #[test]
+    fn a_group_box_is_an_etched_frame_not_a_raised_face() {
+        let render = |style: u32| -> Vec<u16> {
+            let mut bm = Bitmap::new(120, 60);
+            let mut surf = Surface::Bitmap(&mut bm);
+            surf.fill_rect(0, 0, 120, 60, ChildWindow::FACE);
+            let mut ctrls = Controls::default();
+            ctrls.create(
+                PARENT,
+                ControlClass::Button,
+                1009,
+                "Draw".into(),
+                style,
+                4,
+                4,
+                100,
+                50,
+            );
+            ctrls.render(&mut surf);
+            surf.pixels()
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect()
+        };
+        let group = render(WS_VISIBLE | BS_GROUPBOX);
+        let push = render(WS_VISIBLE);
+        assert_ne!(group, push);
+        // Etched: both groove colours are present, and the caption is
+        // still drawn in black.
+        assert!(group.contains(&ChildWindow::SHADOW));
+        assert!(group.contains(&ChildWindow::LIGHT));
+        assert!(group.contains(&ChildWindow::TEXT));
+        // The middle of a group box is untouched face — a push button
+        // would have stamped its caption across the centre.
+        let centre = 30 * 120 + 54;
+        assert_eq!(group[centre], ChildWindow::FACE);
+        assert_ne!(push[centre], ChildWindow::FACE);
     }
 
     #[test]

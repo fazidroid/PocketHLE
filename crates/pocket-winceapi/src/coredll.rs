@@ -30,10 +30,11 @@ use pocket_kernel::gdi::{
     STOCK_GRAY_BRUSH, STOCK_LTGRAY_BRUSH, STOCK_NULL_BRUSH, STOCK_NULL_PEN, STOCK_SYSTEM_FONT,
     STOCK_WHITE_BRUSH, STOCK_WHITE_PEN,
 };
+use pocket_kernel::msgbox::MessageBox;
 use pocket_kernel::{
     module_file_name, CreateStage, DispatchOutcome, GuestCallFrame, GuestThread, InputEvent,
-    KernelError, KernelState, LoadedModule, QsortFrame, VectorIterFrame, WaveCallbackKind,
-    FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE, MODULE_REGION_END,
+    KernelError, KernelState, LoadedModule, ModalDialog, QsortFrame, VectorIterFrame,
+    WaveCallbackKind, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE, MODULE_REGION_END,
     MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
     USER_KDATA_TLS_ARRAY_VA,
 };
@@ -52,6 +53,13 @@ const FAKE_HWND: u32 = 0xDEAD_0001;
 /// in two different globals and drives them independently — a shared
 /// handle makes `GetWindowRect` on one return the other's geometry.
 const FAKE_DIALOG_HWND: u32 = 0xDEAD_0002;
+/// Handle for a *modal* dialog running under `DialogBoxIndirectParamW`.
+///
+/// Distinct from [`FAKE_DIALOG_HWND`] because a modal dialog is
+/// routinely raised *over* a modeless one — Solitaire's Options dialog
+/// goes up while its docked button strip is still on screen — and the
+/// two sets of controls must not be mistaken for each other.
+const FAKE_MODAL_HWND: u32 = 0xDEAD_0003;
 /// Handle for the commctrl status bar docked to the bottom of the main
 /// window (`CreateStatusWindow{A,W}`). The guest addresses it only
 /// through `SendMessage`, and those `SB_*` messages must be consumed by
@@ -67,6 +75,7 @@ const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
 fn is_live_hwnd(hwnd: u32) -> bool {
     hwnd == FAKE_HWND
         || hwnd == FAKE_DIALOG_HWND
+        || hwnd == FAKE_MODAL_HWND
         || hwnd == FAKE_DESKTOP_HWND
         || hwnd == FAKE_STATUSBAR_HWND
         || Controls::is_child_hwnd(hwnd)
@@ -221,6 +230,19 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_vsnwprintf", vsnwprintf);
     d.register_handler(dll, "wcstombs", wcstombs);
     d.register_handler(dll, "mbstowcs", mbstowcs);
+    // strsafe.h — the bounded printers Microsoft told CE developers to
+    // use instead of the CRT ones. Solitaire formats its Time and Score
+    // readouts with `StringCbPrintfW`, so leaving it unimplemented wrote
+    // nothing into the buffer and both fields came out blank.
+    d.register_handler(dll, "StringCbPrintfW", string_cb_printf_w);
+    d.register_handler(dll, "StringCchPrintfW", string_cch_printf_w);
+    d.register_handler(dll, "StringCbVPrintfW", string_cb_vprintf_w);
+    d.register_handler(dll, "StringCchVPrintfW", string_cch_vprintf_w);
+    // `NKDbgPrintfW` is the kernel debug printer. It has no observable
+    // effect for the guest, but it is variadic, so a stub that returns
+    // without consuming its arguments is fine while an unimplemented
+    // call is not — the warning alone hid the missing printer above.
+    d.register_handler(dll, "NKDbgPrintfW", nk_dbg_printf_w);
 
     // ---- File I/O backed by the VFS ----
     d.register_handler(dll, "CreateFileW", create_file_w);
@@ -352,6 +374,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetWindowLongA", get_window_long_w);
     d.register_handler(dll, "GetClassNameW", get_class_name_w);
     d.register_handler(dll, "GetDlgItem", get_dlg_item);
+    d.register_handler(dll, "CheckRadioButton", check_radio_button);
     d.register_handler(dll, "EnumWindows", enum_windows);
     d.register_handler(dll, "IsWindowVisible", is_window_visible);
     d.register_handler(dll, "IsWindowEnabled", is_window_enabled);
@@ -489,7 +512,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "TranslateAcceleratorW", 0, zero_returning);
     d.register_handler(dll, "DialogBoxIndirectParamW", dialog_box_indirect_param_w);
     d.register_handler(dll, "DialogBoxParamW", dialog_box_indirect_param_w);
-    d.register_constant(dll, "EndDialog", 1, one_returning);
+    d.register_handler(dll, "EndDialog", end_dialog);
     d.register_handler(dll, "MessageBoxW", message_box_w);
     d.register_handler(dll, "SetTimer", set_timer);
     d.register_constant(dll, "KillTimer", 1, one_returning);
@@ -3412,6 +3435,100 @@ fn snwprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(wide.len() as u32 - 1))
 }
 
+/// `S_OK`, and the `STRSAFE_E_INSUFFICIENT_BUFFER` the strsafe
+/// functions answer with when the result had to be truncated.
+const S_OK: u32 = 0;
+const STRSAFE_E_INSUFFICIENT_BUFFER: u32 = 0x8007_007A;
+
+/// Write `text` into `dst` as a NUL-terminated wide string, truncating
+/// to `cap_chars` the way the strsafe family does: the terminator is
+/// always written as long as there is room for a single character, and
+/// truncation is reported rather than being silently successful.
+///
+/// This is the one behaviour that separates strsafe from `_snwprintf`,
+/// which leaves the buffer unterminated on overflow.
+fn write_wide_bounded(
+    ctx: &mut CallCtx<'_>,
+    dst: u32,
+    cap_chars: u32,
+    text: &str,
+) -> Result<u32, KernelError> {
+    if dst == 0 || cap_chars == 0 {
+        return Ok(STRSAFE_E_INSUFFICIENT_BUFFER);
+    }
+    let room = cap_chars as usize - 1;
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let truncated = units.len() > room;
+    let mut wide: Vec<u16> = units.into_iter().take(room).collect();
+    wide.push(0);
+    ctx.cpu.write_mem(dst, &wide_to_bytes(&wide))?;
+    Ok(if truncated {
+        STRSAFE_E_INSUFFICIENT_BUFFER
+    } else {
+        S_OK
+    })
+}
+
+/// `HRESULT StringCchPrintfW(LPWSTR dst, size_t cchDest, LPCWSTR fmt, ...)`
+/// — capacity counted in *characters*.
+fn string_cch_printf_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cch = ctx.arg_u32(1)?;
+    let fmt_p = ctx.arg_u32(2)?;
+    let fmt = String::from_utf16_lossy(&read_wstr(ctx, fmt_p, 0x4000)?);
+    let text = render_printf(ctx, &fmt, true, 3)?;
+    let hr = write_wide_bounded(ctx, dst, cch, &text)?;
+    Ok(DispatchOutcome::ReturnedR0(hr))
+}
+
+/// `HRESULT StringCbPrintfW(LPWSTR dst, size_t cbDest, LPCWSTR fmt, ...)`
+/// — capacity counted in *bytes*, hence the halving.
+fn string_cb_printf_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cb = ctx.arg_u32(1)?;
+    let fmt_p = ctx.arg_u32(2)?;
+    let fmt = String::from_utf16_lossy(&read_wstr(ctx, fmt_p, 0x4000)?);
+    let text = render_printf(ctx, &fmt, true, 3)?;
+    let hr = write_wide_bounded(ctx, dst, cb / 2, &text)?;
+    log::trace!("StringCbPrintfW({fmt:?}) -> {text:?}");
+    Ok(DispatchOutcome::ReturnedR0(hr))
+}
+
+/// `HRESULT StringCchVPrintfW(LPWSTR, size_t cch, LPCWSTR fmt, va_list)`.
+fn string_cch_vprintf_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cch = ctx.arg_u32(1)?;
+    let fmt_p = ctx.arg_u32(2)?;
+    let va_p = ctx.arg_u32(3)?;
+    let fmt = String::from_utf16_lossy(&read_wstr(ctx, fmt_p, 0x4000)?);
+    let text = render_printf_va(ctx, &fmt, true, va_p)?;
+    let hr = write_wide_bounded(ctx, dst, cch, &text)?;
+    Ok(DispatchOutcome::ReturnedR0(hr))
+}
+
+/// `HRESULT StringCbVPrintfW(LPWSTR, size_t cb, LPCWSTR fmt, va_list)`.
+fn string_cb_vprintf_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cb = ctx.arg_u32(1)?;
+    let fmt_p = ctx.arg_u32(2)?;
+    let va_p = ctx.arg_u32(3)?;
+    let fmt = String::from_utf16_lossy(&read_wstr(ctx, fmt_p, 0x4000)?);
+    let text = render_printf_va(ctx, &fmt, true, va_p)?;
+    let hr = write_wide_bounded(ctx, dst, cb / 2, &text)?;
+    Ok(DispatchOutcome::ReturnedR0(hr))
+}
+
+/// `int NKDbgPrintfW(LPCWSTR fmt, ...)` — debug output to the kernel
+/// serial port. We render it into the log at trace level and report the
+/// character count, which is what the real one returns.
+fn nk_dbg_printf_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let fmt_p = ctx.arg_u32(0)?;
+    let fmt = String::from_utf16_lossy(&read_wstr(ctx, fmt_p, 0x4000)?);
+    let text = render_printf(ctx, &fmt, true, 1)?;
+    log::trace!("NKDbgPrintfW: {}", text.trim_end());
+    Ok(DispatchOutcome::ReturnedR0(text.chars().count() as u32))
+}
+
 /// Variant of [`render_printf`] that pulls varargs out of the
 /// `va_list` pointer the caller passed instead of the current
 /// stack frame.
@@ -4763,7 +4880,7 @@ fn show_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if let Some(panel) = ctx.kernel.controls.panel_mut(hwnd) {
         panel.visible = show;
         if ctx.kernel.wnd_proc != 0 {
-            ctx.kernel.pending_message = Some((WM_PAINT, 0, 0));
+            ctx.kernel.pending_message = Some((FAKE_HWND, WM_PAINT, 0, 0));
         }
         repaint_controls(ctx);
         return Ok(DispatchOutcome::ReturnedR0(1));
@@ -4809,7 +4926,7 @@ fn show_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn update_window(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     if ctx.kernel.wnd_proc != 0 {
-        ctx.kernel.pending_message = Some((WM_PAINT, 0, 0));
+        ctx.kernel.pending_message = Some((FAKE_HWND, WM_PAINT, 0, 0));
     }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -5262,7 +5379,9 @@ fn control_message(
             .unwrap_or(0)),
         BM_SETCHECK => {
             if let Some(child) = ctx.kernel.controls.get_mut(hwnd) {
+                let id = child.id;
                 child.checked = wparam != 0;
+                log::debug!("BM_SETCHECK(id={id}) -> checked={}", wparam != 0);
                 repaint_controls(ctx);
             }
             Ok(0)
@@ -5451,8 +5570,10 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
 /// the control's own window, and what the parent sees is the
 /// `WM_COMMAND` the control chooses to send. So:
 ///
-/// * `Some(Some(triple))` — a control turned the event into a message
-///   for the parent (a button was clicked).
+/// * `Some(Some((hwnd, msg, wp, lp)))` — a control turned the event
+///   into a message for the parent (a button was clicked). `hwnd` is
+///   the window the message is addressed to, which for a dialog's
+///   control is the dialog, not the application's main window.
 /// * `Some(None)` — a control swallowed the event (focus moved, a
 ///   character was typed); the application must not see it.
 /// * `None` — no control was involved, so the event carries on to the
@@ -5462,7 +5583,7 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
 fn controls_take_input(
     ctx: &mut CallCtx<'_>,
     ev: pocket_kernel::InputEvent,
-) -> Option<Option<(u32, u32, u32)>> {
+) -> Option<Option<(u32, u32, u32, u32)>> {
     if ctx.kernel.controls.is_empty() {
         return None;
     }
@@ -5485,7 +5606,13 @@ fn controls_take_input(
         ControlAction::Clicked { parent, id, hwnd } => {
             log::debug!("control id={id} clicked -> WM_COMMAND to 0x{parent:08x}");
             let wparam = (id & 0xFFFF) | (BN_CLICKED << 16);
-            Some(Some((WM_COMMAND, wparam, hwnd)))
+            // Addressed to the control's *own* parent, not to the main
+            // window. Solitaire's button strip is a dialog, and its
+            // handlers live in the DialogProc registered for that panel;
+            // stamping the MSG with the main window instead delivered
+            // every `WM_COMMAND` to a proc that ignores these ids, which
+            // is why the buttons visibly pressed but did nothing.
+            Some(Some((parent, WM_COMMAND, wparam, hwnd)))
         }
         ControlAction::Consumed => Some(None),
     }
@@ -5651,7 +5778,7 @@ fn set_window_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         // repaint too — the controls alone would leave the old panel
         // face behind.
         if ctx.kernel.wnd_proc != 0 {
-            ctx.kernel.pending_message = Some((WM_PAINT, 0, 0));
+            ctx.kernel.pending_message = Some((FAKE_HWND, WM_PAINT, 0, 0));
         }
         repaint_controls(ctx);
     }
@@ -5772,30 +5899,31 @@ fn synthetic_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
 /// and D-pad presses always win over the synthetic pump; once the
 /// queue is empty we fall back to fabricated traffic so games never
 /// see an idle window.
-fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32) {
+fn next_message(ctx: &mut CallCtx<'_>) -> (u32, u32, u32, u32) {
     while let Some(ev) = take_pending_input(ctx) {
         update_key_state(ctx, ev);
         // The built-in controls get the event first, exactly as the OS
         // would hand it to the control's own window procedure.
         if let Some(handled) = controls_take_input(ctx, ev) {
             match handled {
-                Some(triple) => return triple,
+                Some(addressed) => return addressed,
                 // Swallowed by a control: loop round for the next event
                 // rather than handing the application a tap it never
                 // would have seen.
                 None => continue,
             }
         }
-        if let Some(triple) = input_to_message(ev) {
-            return triple;
+        if let Some((msg, wp, lp)) = input_to_message(ev) {
+            return (FAKE_HWND, msg, wp, lp);
         }
     }
     // Same ordering as `next_message_if_due`: posted driver / guest
     // messages before the synthetic paint pump.
-    if let Some((_hwnd, msg, wp, lp)) = take_posted_message(ctx) {
-        return (msg, wp, lp);
+    if let Some(posted) = take_posted_message(ctx) {
+        return posted;
     }
-    synthetic_message_for(ctx)
+    let (msg, wp, lp) = synthetic_message_for(ctx);
+    (FAKE_HWND, msg, wp, lp)
 }
 
 /// Pop one queued host input event, rewriting its virtual key for GAPI
@@ -5854,26 +5982,27 @@ fn take_posted_message(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
     ctx.kernel.posted_messages.pop_front()
 }
 
-fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32)> {
+fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
     while let Some(ev) = take_pending_input(ctx) {
         update_key_state(ctx, ev);
         if let Some(handled) = controls_take_input(ctx, ev) {
             match handled {
-                Some(triple) => return Some(triple),
+                Some(addressed) => return Some(addressed),
                 None => continue,
             }
         }
-        if let Some(triple) = input_to_message(ev) {
-            return Some(triple);
+        if let Some((msg, wp, lp)) = input_to_message(ev) {
+            return Some((FAKE_HWND, msg, wp, lp));
         }
     }
     // Driver notifications (`MM_WOM_DONE`) outrank the synthetic
     // paint/timer pump: a game streaming music refills its buffer from
     // this message and would otherwise run dry.
-    if let Some((_hwnd, msg, wp, lp)) = take_posted_message(ctx) {
-        return Some((msg, wp, lp));
+    if let Some(posted) = take_posted_message(ctx) {
+        return Some(posted);
     }
-    synthetic_message_if_due(ctx)
+    let (msg, wp, lp) = synthetic_message_if_due(ctx)?;
+    Some((FAKE_HWND, msg, wp, lp))
 }
 
 /// `BOOL GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)`
@@ -5934,12 +6063,12 @@ fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         ctx.kernel.synthetic_message_count = count + 1;
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let (msg, wp, lp) = ctx
+    let (hwnd, msg, wp, lp) = ctx
         .kernel
         .pending_message
         .take()
         .unwrap_or_else(|| next_message(ctx));
-    write_synthetic_msg(ctx.cpu, lp_msg, msg, wp, lp)?;
+    write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, msg, wp, lp)?;
     ctx.kernel.synthetic_message_count += 1;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
@@ -5980,17 +6109,17 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         write_synthetic_msg_for_hwnd(ctx.cpu, lp_msg, hwnd, WM_CREATE, 0, create_lparam)?;
         ctx.kernel.synthetic_message_count = count + 1;
         if remove_mode != 0x0001 {
-            ctx.kernel.pending_message = Some((WM_CREATE, 0, 0));
+            ctx.kernel.pending_message = Some((hwnd, WM_CREATE, 0, create_lparam));
         }
         return Ok(DispatchOutcome::ReturnedR0(1));
     }
-    let triple = match ctx
-        .kernel
-        .pending_message
-        .take()
-        .or_else(|| ctx.kernel.pending_startup.pop_front())
-    {
-        Some(triple) => triple,
+    let addressed = match ctx.kernel.pending_message.take().or_else(|| {
+        ctx.kernel
+            .pending_startup
+            .pop_front()
+            .map(|(msg, wp, lp)| (FAKE_HWND, msg, wp, lp))
+    }) {
+        Some(addressed) => addressed,
         // Nothing pending and nothing due: report an empty queue so
         // the guest falls through to its idle / render branch. An
         // empty queue is also the natural scheduling point — the main
@@ -5998,7 +6127,7 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
         // thread) run, and conversely park a worker that has drained
         // its own queue.
         None => match next_message_if_due(ctx) {
-            Some(triple) => triple,
+            Some(addressed) => addressed,
             None => {
                 if let Some(outcome) = park_worker(ctx, 0)? {
                     return Ok(outcome);
@@ -6010,9 +6139,16 @@ fn peek_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
             }
         },
     };
-    write_synthetic_msg(ctx.cpu, lp_msg, triple.0, triple.1, triple.2)?;
+    write_synthetic_msg_for_hwnd(
+        ctx.cpu,
+        lp_msg,
+        addressed.0,
+        addressed.1,
+        addressed.2,
+        addressed.3,
+    )?;
     if remove_mode != 0x0001 {
-        ctx.kernel.pending_message = Some(triple);
+        ctx.kernel.pending_message = Some(addressed);
     } else {
         ctx.kernel.synthetic_message_count += 1;
     }
@@ -7280,13 +7416,38 @@ fn get_dlg_item(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
     let id = ctx.arg_u32(1)?;
     if let Some(child) = ctx.kernel.controls.by_id(hwnd, id) {
-        return Ok(DispatchOutcome::ReturnedR0(child.hwnd));
+        let found = child.hwnd;
+        log::trace!("GetDlgItem(0x{hwnd:08x}, {id}) -> 0x{found:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(found));
     }
+    log::trace!("GetDlgItem(0x{hwnd:08x}, {id}) -> no such control");
     Ok(DispatchOutcome::ReturnedR0(if is_live_hwnd(hwnd) {
         hwnd
     } else {
         0
     }))
+}
+
+/// `CheckRadioButton(hDlg, nIDFirst, nIDLast, nIDCheckButton)`
+///
+/// Checks one radio button in an id range and clears every other button
+/// in that range. Solitaire calls this from `WM_INITDIALOG` to reflect
+/// the stored Draw and Scoring settings, so without it the Options
+/// dialog opens with no radio selected in either group.
+fn check_radio_button(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let first = ctx.arg_u32(1)?;
+    let last = ctx.arg_u32(2)?;
+    let check = ctx.arg_u32(3)?;
+    let hit = ctx
+        .kernel
+        .controls
+        .check_radio_range(hwnd, first, last, check);
+    log::debug!("CheckRadioButton(ids {first}..={last}, check {check}) -> {hit} affected");
+    if hit > 0 {
+        repaint_controls(ctx);
+    }
+    Ok(DispatchOutcome::ReturnedR0(u32::from(hit > 0)))
 }
 
 fn enum_windows(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -7302,9 +7463,25 @@ fn enum_windows(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `IsWindowVisible(hwnd)`
+///
+/// For a control or a dialog panel this is the real answer, tracked by
+/// `ShowWindow`. For a top-level window it stays "yes if it exists",
+/// since we never hide the game's own window.
+///
+/// Solitaire depends on the distinction. It creates the Time and Score
+/// statics hidden, and its status-line updater shows them only after
+/// checking `IsWindowVisible` first — so a handle that always claimed to
+/// be visible made the app skip its own `ShowWindow(SW_SHOW)` and left
+/// both readouts permanently blank.
 fn is_window_visible(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let hwnd = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0(is_live_hwnd(hwnd) as u32))
+    let visible = ctx
+        .kernel
+        .controls
+        .is_visible(hwnd)
+        .unwrap_or_else(|| is_live_hwnd(hwnd));
+    Ok(DispatchOutcome::ReturnedR0(u32::from(visible)))
 }
 
 /// `IsWindowEnabled(hwnd)`
@@ -7778,15 +7955,23 @@ fn screen_dims(ctx: &CallCtx<'_>) -> (u32, u32) {
 
 fn get_client_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // GetClientRect(hWnd, lpRect) -> BOOL. A control's client rect is
-    // its own size with the origin at zero, not the whole screen.
+    // its own size with the origin at zero, not the whole screen — and a
+    // dialog's is its window less the border and caption, which is what
+    // a DialogProc laying itself out asks for.
     let hwnd = ctx.arg_u32(0)?;
     let lp_rect = ctx.arg_u32(1)?;
     let (w, h) = match ctx.kernel.controls.get(hwnd) {
         Some(child) => (child.w, child.h),
-        None => {
-            let (w, h) = screen_dims(ctx);
-            (w as i32, h as i32)
-        }
+        None => match ctx.kernel.controls.panel(hwnd) {
+            Some(panel) => {
+                let frame = 2 * i32::from(panel.border);
+                (panel.w - frame, panel.h - frame - panel.caption_h())
+            }
+            None => {
+                let (w, h) = screen_dims(ctx);
+                (w as i32, h as i32)
+            }
+        },
     };
     write_rect(ctx, lp_rect, w, h)?;
     Ok(DispatchOutcome::ReturnedR0(1))
@@ -7831,15 +8016,298 @@ fn load_accelerators_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
     Ok(DispatchOutcome::ReturnedR0(FAKE_ACCEL))
 }
 
-fn dialog_box_indirect_param_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // Treat any modal dialog as immediately cancelled. Real games use
-    // these for splash / about screens; cancelling is harmless.
+/// `DialogBoxIndirectParamW(hInstance, lpTemplate, hWndParent, lpDialogFunc, dwInitParam)`
+/// and `DialogBoxParamW`, which reaches us with the template already
+/// resolved to a pointer.
+///
+/// A *modal* dialog. Like `MessageBoxW` this call blocks: on a device it
+/// runs its own message pump and returns only when the `DialogProc`
+/// calls `EndDialog`, whose `nResult` is the return value. So the guest
+/// is parked in its own API thunk while the host presents frames and the
+/// dialog's controls take the stylus — see [`message_box_w`] for the
+/// same technique spelled out.
+///
+/// This used to return `1` immediately without drawing anything, which
+/// reads as "the user cancelled instantly". Solitaire's Options dialog
+/// is one of these, and it is the only way to switch its Time and Score
+/// readouts on: the app hides those statics with `ShowWindow(SW_HIDE)`
+/// and shows them again when the dialog's checkboxes say so.
+fn dialog_box_indirect_param_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // First pass: materialise the template and register the DialogProc.
+    if ctx.kernel.modal_dialog.is_none() {
+        let lp_template = ctx.arg_u32(1)?;
+        let dialog_proc = ctx.arg_u32(3)?;
+        if dialog_proc == 0 {
+            // Nothing to pump: behave as the old stub did rather than
+            // park forever on a dialog that can never call `EndDialog`.
+            return Ok(DispatchOutcome::ReturnedR0(1));
+        }
+        build_dialog_from_template_for(ctx, lp_template, FAKE_MODAL_HWND, true);
+        // A template we could not parse leaves no panel behind; without
+        // controls the dialog can never be answered.
+        if ctx.kernel.controls.panel(FAKE_MODAL_HWND).is_none() {
+            log::debug!("DialogBoxIndirectParamW: no panel materialised, reporting cancelled");
+            return Ok(DispatchOutcome::ReturnedR0(1));
+        }
+        ctx.kernel.modal_dialog = Some(ModalDialog {
+            hwnd: FAKE_MODAL_HWND,
+            proc: dialog_proc,
+            result: None,
+            initialised: false,
+            dispatched: None,
+            spins: 0,
+        });
+        // Route `SendMessageW` / `DispatchMessageW` for this handle at
+        // the DialogProc rather than the frame window's WndProc.
+        ctx.kernel.window_procs.insert(FAKE_MODAL_HWND, dialog_proc);
+        ctx.kernel.framebuffer.mark_dirty();
+        log::debug!("DialogBoxIndirectParamW: modal dialog up, proc=0x{dialog_proc:08x}");
+    }
+
+    // `WM_INITDIALOG` first, exactly once: the app fills its checkboxes
+    // in from its preferences there, so the dialog is wrong until it has
+    // run.
+    let pending_init = matches!(ctx.kernel.modal_dialog.as_ref(), Some(d) if !d.initialised);
+    if pending_init {
+        let (hwnd, proc) = {
+            let d = ctx.kernel.modal_dialog.as_mut().expect("checked above");
+            d.initialised = true;
+            (d.hwnd, d.proc)
+        };
+        let init_param = ctx.arg_u32(4).unwrap_or(0);
+        // Re-enter this handler when the DialogProc returns, so the pump
+        // below picks up from the next pass.
+        let thunk_va = ctx.thunk.thunk_va;
+        ctx.cpu.write_reg(ArmReg::R0, hwnd)?;
+        ctx.cpu.write_reg(ArmReg::R1, WM_INITDIALOG)?;
+        ctx.cpu.write_reg(ArmReg::R2, 0)?;
+        ctx.cpu.write_reg(ArmReg::R3, init_param)?;
+        ctx.cpu.write_reg(ArmReg::Lr, thunk_va)?;
+        log::debug!("DialogBoxIndirectParamW -> WM_INITDIALOG at 0x{proc:08x}");
+        return Ok(DispatchOutcome::JumpTo(proc));
+    }
+
+    // Feed the dialog's controls every queued input event. It is modal,
+    // so nothing here may reach the application underneath.
+    let modal_hwnd = ctx
+        .kernel
+        .modal_dialog
+        .as_ref()
+        .map(|d| d.hwnd)
+        .unwrap_or(FAKE_MODAL_HWND);
+    while let Some(ev) = take_pending_input(ctx) {
+        update_key_state(ctx, ev);
+        let action = match ev {
+            InputEvent::PointerDown { x, y } => ctx
+                .kernel
+                .controls
+                .pointer_down_in(modal_hwnd, x as i32, y as i32),
+            InputEvent::PointerUp { x, y } => ctx
+                .kernel
+                .controls
+                .pointer_up_in(modal_hwnd, x as i32, y as i32),
+            InputEvent::KeyDown { vk } => ctx.kernel.controls.key_down_in(modal_hwnd, vk),
+            _ => None,
+        };
+        log::trace!("modal dialog input {ev:?} -> {action:?}");
+        repaint_controls(ctx);
+        ctx.kernel.framebuffer.mark_dirty();
+        // A click on one of the dialog's buttons is a `WM_COMMAND` for
+        // its own DialogProc — which is where `EndDialog` gets called.
+        if let Some(ControlAction::Clicked { parent, id, hwnd }) = action {
+            let wparam = (id & 0xFFFF) | (BN_CLICKED << 16);
+            let proc = ctx
+                .kernel
+                .modal_dialog
+                .as_ref()
+                .map(|d| d.proc)
+                .unwrap_or(0);
+            if proc != 0 {
+                let thunk_va = ctx.thunk.thunk_va;
+                // The caption's OK box is chrome, not a child window:
+                // the shell reports it with a null `lParam`, the same as
+                // a menu command, and only a control passes its handle.
+                let from_caption = hwnd == parent;
+                let lparam = if from_caption { 0 } else { hwnd };
+                log::debug!("modal dialog control id={id} clicked -> WM_COMMAND to DialogProc");
+                if let Some(d) = ctx.kernel.modal_dialog.as_mut() {
+                    d.dispatched = Some(id);
+                }
+                ctx.cpu.write_reg(ArmReg::R0, parent)?;
+                ctx.cpu.write_reg(ArmReg::R1, WM_COMMAND)?;
+                ctx.cpu.write_reg(ArmReg::R2, wparam)?;
+                ctx.cpu.write_reg(ArmReg::R3, lparam)?;
+                ctx.cpu.write_reg(ArmReg::Lr, thunk_va)?;
+                return Ok(DispatchOutcome::JumpTo(proc));
+            }
+        }
+    }
+
+    // `EndDialog` was called: tear the dialog down and return its result.
+    if let Some(result) = ctx.kernel.modal_dialog.as_ref().and_then(|d| d.result) {
+        log::debug!("DialogBoxIndirectParamW answered with {result}");
+        close_modal_dialog(ctx);
+        return Ok(DispatchOutcome::ReturnedR0(result));
+    }
+
+    // `DefDlgProc` behaviour: an `IDOK` / `IDCANCEL` the DialogProc did
+    // not act on ends the dialog with that id. Solitaire's Options
+    // applies each setting as it is toggled and returns FALSE from
+    // `WM_COMMAND(IDOK)` — on a device the default handler is what
+    // actually closes it, so without this the dialog stays up forever.
+    if let Some(id) = ctx
+        .kernel
+        .modal_dialog
+        .as_mut()
+        .and_then(|d| d.dispatched.take())
+    {
+        if id == pocket_kernel::msgbox::id::OK || id == pocket_kernel::msgbox::id::CANCEL {
+            log::debug!("DialogBoxIndirectParamW: DefDlgProc ends the dialog with {id}");
+            close_modal_dialog(ctx);
+            return Ok(DispatchOutcome::ReturnedR0(id));
+        }
+    }
+
+    // Still up. Bound the wait so a headless run cannot spin forever.
+    let spins = {
+        let d = ctx.kernel.modal_dialog.as_mut().expect("still present");
+        d.spins = d.spins.saturating_add(1);
+        d.spins
+    };
+    if spins >= MESSAGE_BOX_MAX_SPINS {
+        log::debug!("DialogBoxIndirectParamW unanswered after {spins} spins, reporting cancelled");
+        close_modal_dialog(ctx);
+        // IDCANCEL, the same answer dismissing the dialog would give.
+        return Ok(DispatchOutcome::ReturnedR0(2));
+    }
+    Ok(DispatchOutcome::JumpTo(ctx.thunk.thunk_va))
+}
+
+/// Drop a finished modal dialog: its controls, its panel, its proc
+/// registration, and the repaint that reveals what it was covering.
+fn close_modal_dialog(ctx: &mut CallCtx<'_>) {
+    let hwnd = match ctx.kernel.modal_dialog.take() {
+        Some(d) => d.hwnd,
+        None => return,
+    };
+    ctx.kernel.controls.destroy_children_of(hwnd);
+    ctx.kernel.window_procs.remove(&hwnd);
+    repaint_controls(ctx);
+    ctx.kernel.framebuffer.mark_dirty();
+}
+
+/// `EndDialog(hDlg, nResult)`
+///
+/// Closes the modal dialog a parked [`dialog_box_indirect_param_w`] is
+/// pumping, and hands it `nResult` to return. This was a
+/// `register_constant` — a dispatcher-bypassing thunk that could never
+/// have any effect — which is why a modal dialog had no way to close.
+fn end_dialog(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hwnd = ctx.arg_u32(0)?;
+    let result = ctx.arg_u32(1)?;
+    log::debug!("EndDialog(hwnd=0x{hwnd:08x}, result={result})");
+    if let Some(dialog) = ctx.kernel.modal_dialog.as_mut() {
+        dialog.result = Some(result);
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-fn message_box_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // IDOK = 1
-    Ok(DispatchOutcome::ReturnedR0(1))
+/// How many times `MessageBoxW` may re-dispatch before it gives up and
+/// answers itself.
+///
+/// A modal box on a device waits forever, and so would this one — which
+/// is right in front of a user and wrong in a headless run, where there
+/// is nobody to tap Yes and the emulator would spin until it was killed.
+/// The cap keeps `--max-frames` runs and the test suite finite; at the
+/// frontends' frame rate it is several seconds of real waiting, far
+/// longer than a person needs to see the box and answer it.
+const MESSAGE_BOX_MAX_SPINS: u32 = 100_000;
+
+/// `MessageBoxW` — a real, modal message box.
+///
+/// This is a *blocking* API: on a device it does not return until the
+/// user has answered, and the answer is its return value. The guest is
+/// therefore parked inside its own API thunk — the same trick
+/// [`park_worker_and_retry`] uses — so each pass through here either
+/// finds the box still unanswered and re-dispatches, or takes the
+/// answer down and returns it. Meanwhile the host keeps presenting
+/// frames, and [`KernelState::composite_controls`] draws the box on top
+/// of them, so the user actually sees what they are answering.
+///
+/// The returned id matters: Solitaire's Exit button only calls
+/// `PostQuitMessage` when it gets `IDYES` back, so the old stub's
+/// blanket `IDOK` meant Exit did nothing at all.
+fn message_box_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // First pass: build the box from the arguments and show it.
+    if ctx.kernel.modal.is_none() {
+        let text_p = ctx.arg_u32(1)?;
+        let caption_p = ctx.arg_u32(2)?;
+        let u_type = ctx.arg_u32(3)?;
+        let text = String::from_utf16_lossy(&read_wstr(ctx, text_p, 1024)?);
+        let caption = if caption_p == 0 {
+            String::new()
+        } else {
+            String::from_utf16_lossy(&read_wstr(ctx, caption_p, 260)?)
+        };
+        let (sw, sh) = (
+            ctx.kernel.framebuffer.width as i32,
+            ctx.kernel.framebuffer.height as i32,
+        );
+        log::debug!("MessageBoxW(text={text:?}, caption={caption:?}, type=0x{u_type:08x})");
+        ctx.kernel.modal = Some(MessageBox::new(&text, &caption, u_type, sw, sh));
+        ctx.kernel.message_box_spins = 0;
+        ctx.kernel.framebuffer.mark_dirty();
+    }
+
+    // Feed the box every input event the host has queued. These must not
+    // reach the application: it is modal, and on a device its window
+    // owns the stylus until it closes.
+    while let Some(ev) = take_pending_input(ctx) {
+        update_key_state(ctx, ev);
+        let Some(modal) = ctx.kernel.modal.as_mut() else {
+            break;
+        };
+        match ev {
+            InputEvent::PointerDown { x, y } => modal.pointer_down(x as i32, y as i32),
+            InputEvent::PointerUp { x, y } => modal.pointer_up(x as i32, y as i32),
+            InputEvent::KeyDown { vk } => modal.key_down(vk),
+            _ => {}
+        }
+        ctx.kernel.framebuffer.mark_dirty();
+    }
+
+    // Answered — take the box down and hand the id back.
+    if let Some(result) = ctx.kernel.modal.as_ref().and_then(|m| m.result) {
+        log::debug!("MessageBoxW answered with {result}");
+        ctx.kernel.modal = None;
+        // The box was covering guest pixels; the frame after this one has
+        // to be drawn without it.
+        repaint_controls(ctx);
+        ctx.kernel.framebuffer.mark_dirty();
+        return Ok(DispatchOutcome::ReturnedR0(result));
+    }
+
+    // Still waiting. Give up rather than hang a headless run forever.
+    ctx.kernel.message_box_spins = ctx.kernel.message_box_spins.saturating_add(1);
+    if ctx.kernel.message_box_spins >= MESSAGE_BOX_MAX_SPINS {
+        let fallback = ctx
+            .kernel
+            .modal
+            .as_ref()
+            .map(|m| m.default_result())
+            .unwrap_or(1);
+        log::debug!(
+            "MessageBoxW unanswered after {MESSAGE_BOX_MAX_SPINS} spins, taking {fallback}"
+        );
+        ctx.kernel.modal = None;
+        repaint_controls(ctx);
+        ctx.kernel.framebuffer.mark_dirty();
+        return Ok(DispatchOutcome::ReturnedR0(fallback));
+    }
+
+    // Re-enter our own thunk: the call blocks, exactly as it does on the
+    // device, and the run loop gets to present a frame in between.
+    Ok(DispatchOutcome::JumpTo(ctx.thunk.thunk_va))
 }
 
 fn register_hot_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -9862,6 +10330,24 @@ fn strip_mnemonics(s: &str) -> String {
 /// and Score readouts. Ignoring the template left the dialog an empty
 /// rectangle and those calls addressing nothing.
 fn build_dialog_from_template(ctx: &mut CallCtx<'_>, lp_template: u32) {
+    build_dialog_from_template_for(ctx, lp_template, FAKE_DIALOG_HWND, false)
+}
+
+/// Materialise a `DLGTEMPLATE` as a panel owned by `owner_hwnd`.
+///
+/// `modal` marks a `DialogBox*` dialog rather than a `CreateDialog*`
+/// one, which changes three things. It is centred on screen: a modal
+/// dialog is authored against the screen it was designed for, and unlike
+/// Solitaire's docked button strip it has no code of its own to
+/// reposition itself afterwards. It is shown whether or not the template
+/// says `WS_VISIBLE`. And it gets the Windows CE caption bar, with the
+/// OK box that is the only way to dismiss a dialog on that shell.
+fn build_dialog_from_template_for(
+    ctx: &mut CallCtx<'_>,
+    lp_template: u32,
+    owner_hwnd: u32,
+    modal: bool,
+) {
     use crate::dlgtemplate::{class_ordinal, Dlu, ItemClass};
     use pocket_kernel::controls::{ControlClass, DialogPanel};
 
@@ -9893,11 +10379,19 @@ fn build_dialog_from_template(ctx: &mut CallCtx<'_>, lp_template: u32) {
 
     let dlu = Dlu::default();
     let (px, py, pw, ph) = dlu.to_px(tmpl.x as i32, tmpl.y as i32, tmpl.cx as i32, tmpl.cy as i32);
-    let border = tmpl.style & WS_BORDER != 0;
+    // A modal dialog always gets a caption, titled from the template or
+    // left blank — the OK box is what closes it, so a dialog without one
+    // could only ever be dismissed by our own spin limit.
+    let caption = modal.then(|| tmpl.title.clone());
+    let caption_h = i32::from(modal) * DialogPanel::CAPTION_H;
+    // `DialogBox*` draws a frame around its dialog whether or not the
+    // template asks for one; a `WS_CHILD` panel takes the style at its
+    // word.
+    let border = modal || tmpl.style & WS_BORDER != 0;
     let frame = 2 * i32::from(border);
-    // The template's cx/cy describe the *client* area; the border sits
-    // outside it.
-    let (win_w, win_h) = (pw + frame, ph + frame);
+    // The template's cx/cy describe the *client* area; the border and
+    // caption sit outside it.
+    let (win_w, win_h) = (pw + frame, ph + frame + caption_h);
     // A template is authored against the screen its dialog was designed
     // for. Solitaire's panel is positioned at 267 DLU, past the right
     // edge of a 480 px screen, and the app corrects it immediately by
@@ -9905,20 +10399,33 @@ fn build_dialog_from_template(ctx: &mut CallCtx<'_>, lp_template: u32) {
     // the panel against the edge. Clamp so the panel is on screen even
     // if an app never does that.
     let (screen_w, screen_h) = screen_dims(ctx);
-    let x = px.min(screen_w as i32 - win_w).max(0);
-    let y = py.min(screen_h as i32 - win_h).max(0);
+    let (x, y) = if modal {
+        (
+            ((screen_w as i32 - win_w) / 2).max(0),
+            ((screen_h as i32 - win_h) / 2).max(0),
+        )
+    } else {
+        (
+            px.min(screen_w as i32 - win_w).max(0),
+            py.min(screen_h as i32 - win_h).max(0),
+        )
+    };
 
     // Clear a previous incarnation first: this also drops the old panel,
     // so it has to happen before the new one is registered.
-    ctx.kernel.controls.destroy_children_of(FAKE_DIALOG_HWND);
+    ctx.kernel.controls.destroy_children_of(owner_hwnd);
     ctx.kernel.controls.add_panel(DialogPanel {
-        hwnd: FAKE_DIALOG_HWND,
+        hwnd: owner_hwnd,
         x,
         y,
         w: win_w,
         h: win_h,
-        visible: tmpl.style & WS_VISIBLE != 0,
+        // `DialogBox*` shows its dialog whether or not the template says
+        // `WS_VISIBLE`; only a `CreateDialog*` panel starts hidden.
+        visible: modal || tmpl.style & WS_VISIBLE != 0,
         border,
+        caption,
+        ok_pressed: false,
     });
 
     for item in &tmpl.items {
@@ -9937,7 +10444,7 @@ fn build_dialog_from_template(ctx: &mut CallCtx<'_>, lp_template: u32) {
         let (ix, iy, iw, ih) =
             dlu.to_px(item.x as i32, item.y as i32, item.cx as i32, item.cy as i32);
         let hwnd = ctx.kernel.controls.create(
-            FAKE_DIALOG_HWND,
+            owner_hwnd,
             class,
             item.id as u32,
             strip_mnemonics(&item.title),
@@ -11484,6 +11991,9 @@ mod tests {
             menus: std::collections::HashMap::new(),
             next_menu_handle: 0xDEAD_2000,
             sub_menus: std::collections::HashMap::new(),
+            modal: None,
+            message_box_spins: 0,
+            modal_dialog: None,
         }
     }
 
@@ -12135,5 +12645,70 @@ mod tests {
         // little-endian on the wire).
         let off = (7 * pocket_kernel::framebuffer::FB_WIDTH as usize + 5) * 2;
         assert_ne!(kernel.framebuffer.pixels[off], 0);
+    }
+
+    #[test]
+    fn is_window_visible_follows_show_window_for_controls() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let t = dummy_thunk();
+
+        // A hidden control reports invisible, and a visible one reports
+        // visible — never a blanket "exists means shown".
+        let hidden = kernel.controls.create(
+            FAKE_MODAL_HWND,
+            ControlClass::Static,
+            1004,
+            String::new(),
+            0,
+            0,
+            0,
+            77,
+            17,
+        );
+        let shown = kernel.controls.create(
+            FAKE_MODAL_HWND,
+            ControlClass::Static,
+            1006,
+            String::new(),
+            WS_VISIBLE,
+            0,
+            0,
+            77,
+            17,
+        );
+
+        let call = |cpu: &mut StubCpu, kernel: &mut KernelState, hwnd: u32| -> DispatchOutcome {
+            cpu.write_reg(ArmReg::R0, hwnd).unwrap();
+            is_window_visible(&mut CallCtx {
+                cpu,
+                thunk: &t,
+                kernel,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            call(&mut cpu, &mut kernel, hidden),
+            DispatchOutcome::ReturnedR0(0)
+        );
+        assert_eq!(
+            call(&mut cpu, &mut kernel, shown),
+            DispatchOutcome::ReturnedR0(1)
+        );
+
+        // Showing the hidden one flips the answer, as Solitaire's status
+        // updater expects.
+        cpu.write_reg(ArmReg::R0, hidden).unwrap();
+        cpu.write_reg(ArmReg::R1, 5).unwrap(); // SW_SHOW
+        show_window(&mut CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        })
+        .unwrap();
+        assert_eq!(
+            call(&mut cpu, &mut kernel, hidden),
+            DispatchOutcome::ReturnedR0(1)
+        );
     }
 }

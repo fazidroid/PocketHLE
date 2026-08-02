@@ -36,6 +36,7 @@ pub mod font;
 pub mod framebuffer;
 pub mod gapi;
 pub mod gdi;
+pub mod msgbox;
 pub mod native_thunks;
 pub mod registry;
 pub mod vfs;
@@ -294,6 +295,40 @@ pub struct WaveOutState {
     /// knows to restore the interrupted call's registers when the
     /// callback returns.
     pub function_frame: Option<GuestCallFrame>,
+}
+
+/// A modal dialog put up by `DialogBoxIndirectParamW` / `DialogBoxParamW`.
+///
+/// These APIs block: they run their own message pump and do not return
+/// until the dialog's procedure calls `EndDialog`, whose `nResult`
+/// becomes the return value. The HLE keeps the guest parked inside the
+/// API thunk for the duration — the same technique `MessageBoxW` uses —
+/// so this records what the parked call is waiting for.
+#[derive(Debug, Clone)]
+pub struct ModalDialog {
+    /// Synthetic `HWND` the dialog's panel and controls are registered
+    /// under, so its children are addressed separately from a
+    /// `CreateDialog*` panel that may already be on screen.
+    pub hwnd: u32,
+    /// The guest's `DialogProc`.
+    pub proc: u32,
+    /// `EndDialog`'s `nResult` once it has been called. `None` means the
+    /// dialog is still up.
+    pub result: Option<u32>,
+    /// Set once `WM_INITDIALOG` has been delivered, so the parked call
+    /// does not send it again on every re-dispatch.
+    pub initialised: bool,
+    /// Control id of the `WM_COMMAND` most recently handed to the
+    /// `DialogProc`, cleared as soon as it has been examined.
+    ///
+    /// This is how `DefDlgProc`'s behaviour is reproduced: an `IDOK` or
+    /// `IDCANCEL` the application does not act on itself ends the dialog
+    /// anyway, and the only way to know it did not act is to look once
+    /// its handler has returned.
+    pub dispatched: Option<u32>,
+    /// Re-dispatch counter, bounding a headless run the same way
+    /// [`KernelState::message_box_spins`] does.
+    pub spins: u32,
 }
 
 /// A commctrl status bar created via `CreateStatusWindow{A,W}`.
@@ -755,6 +790,32 @@ pub struct KernelState {
     /// `WM_COMMAND` for the parent. The application never draws them, so
     /// neither can we leave them to the guest — see [`controls`].
     pub controls: controls::Controls,
+    /// The modal message box currently on screen, if any.
+    ///
+    /// `MessageBoxW` does not return until the user has answered, so the
+    /// guest is parked inside its own API thunk while this is `Some` and
+    /// every stylus event goes to the box instead of to the application —
+    /// see [`msgbox`]. It lives beside [`KernelState::controls`] rather
+    /// than inside them because it is not a child of the guest's window:
+    /// it owns its own frame, its own caption bar and the input focus.
+    pub modal: Option<msgbox::MessageBox>,
+    /// Re-dispatch counter for the parked `MessageBoxW`.
+    ///
+    /// A modal box on a device waits forever, which is right in front of
+    /// a user and wrong in a headless `--max-frames` run where nobody can
+    /// answer. This cap keeps the test suite finite without visibly
+    /// rushing an interactive session.
+    pub message_box_spins: u32,
+    /// The modal dialog a `DialogBoxIndirectParamW` is currently running,
+    /// if any.
+    ///
+    /// `DialogBox*` blocks exactly as `MessageBoxW` does — it does not
+    /// return until the dialog calls `EndDialog` — so the same parking
+    /// trick applies: the guest sits in its own API thunk pumping the
+    /// dialog while the host presents frames. `Some(result)` in the inner
+    /// option is `EndDialog`'s `nResult`, which becomes the blocking
+    /// call's return value.
+    pub modal_dialog: Option<ModalDialog>,
     /// Input events queued by the host frontend (mouse / D-pad /
     /// keyboard). Drained by `GetMessageW` / `PeekMessageW` before
     /// any synthetic timer / paint message is fabricated, so real
@@ -767,8 +828,10 @@ pub struct KernelState {
     pub gapi_keys_queried: bool,
     /// Message previewed by `PeekMessageW` with PM_NOREMOVE. The next
     /// `GetMessageW` must return the same message instead of advancing
-    /// the synthetic queue a second time.
-    pub pending_message: Option<(u32, u32, u32)>,
+    /// the synthetic queue a second time. Carries the target `hwnd`
+    /// alongside the message so a dialog control's `WM_COMMAND` is
+    /// still addressed to its own dialog when it is replayed.
+    pub pending_message: Option<(u32, u32, u32, u32)>,
     /// Cooperative guest threads created through `CreateThread`. The host
     /// scheduler runs one ready thread at a time between API boundaries.
     pub threads: Vec<GuestThread>,
@@ -881,12 +944,18 @@ impl KernelState {
     /// boundary, and dirtying there would ask for another frame
     /// forever.
     pub fn composite_controls(&mut self) {
-        if self.controls.is_empty() {
+        if self.controls.is_empty() && self.modal.is_none() {
             return;
         }
         let controls = self.controls.clone();
+        let modal = self.modal.clone();
         let mut surf = gdi::Surface::Screen(&mut self.framebuffer);
         controls.render(&mut surf);
+        // The modal goes last: it is a separate top-level window and
+        // has to cover whatever the application and its children drew.
+        if let Some(modal) = modal {
+            modal.render(&mut surf);
+        }
     }
 
     /// Look up an already-loaded runtime module by its `HMODULE`.
@@ -1681,6 +1750,9 @@ impl Process {
                 dialog_frame: None,
                 status_bar: None,
                 controls: Default::default(),
+                modal: None,
+                message_box_spins: 0,
+                modal_dialog: None,
                 pending_input: VecDeque::new(),
                 gapi_keys_queried: false,
                 pending_message: None,

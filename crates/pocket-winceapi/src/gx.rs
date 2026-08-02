@@ -331,6 +331,9 @@ mod tests {
             menus: std::collections::HashMap::new(),
             next_menu_handle: 0xDEAD_2000,
             sub_menus: std::collections::HashMap::new(),
+            modal: None,
+            message_box_spins: 0,
+            modal_dialog: None,
         }
     }
 
