@@ -232,19 +232,19 @@ impl Dispatcher for WinCeDispatcher {
     }
 
     fn dynamic_names(&self, dll: &str) -> Vec<String> {
-        if !dll.eq_ignore_ascii_case("coredll.dll") {
-            return Vec::new();
-        }
+        let dll_key = dll.to_ascii_lowercase();
         let mut names: Vec<String> = self
             .by_name
             .keys()
-            .filter(|(registered_dll, _)| registered_dll == "coredll.dll")
+            .filter(|(registered_dll, _)| registered_dll == &dll_key)
             .map(|(_, name)| name.clone())
             .collect();
-        for ordinal in 0..=4095u16 {
-            if ordinals::lookup("coredll.dll", ordinal).is_some() {
-                names.push(format!("ord:{ordinal}"));
-                names.push(format!("#{ordinal}"));
+        if dll_key == "coredll.dll" {
+            for ordinal in 0..=4095u16 {
+                if ordinals::lookup("coredll.dll", ordinal).is_some() {
+                    names.push(format!("ord:{ordinal}"));
+                    names.push(format!("#{ordinal}"));
+                }
             }
         }
         names.sort();

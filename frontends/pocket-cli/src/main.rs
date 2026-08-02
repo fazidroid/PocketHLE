@@ -605,6 +605,27 @@ fn cmd_run(
         );
         emu.set_registry_value(&entry.key, &entry.name, value);
     }
+    let has_save_dir = _launcher
+        .registry
+        .iter()
+        .any(|entry| entry.name.eq_ignore_ascii_case("SaveDir"));
+    if !has_save_dir {
+        if let Some(install_dir) = _launcher
+            .registry
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case("InstallDir"))
+            .and_then(|entry| entry.string.clone())
+        {
+            println!(
+                "CAB has no SaveDir; using InstallDir {install_dir:?} for the app registry fallback"
+            );
+            emu.set_registry_value(
+                r"HKLM\SOFTWARE\Apps\Astraware Cubis",
+                "SaveDir",
+                pocket_core::kernel::registry::RegistryValue::Sz(install_dir),
+            );
+        }
+    }
     emu.set_synthetic_message_budget(message_budget);
     let (fb_w, fb_h) = emu
         .process()

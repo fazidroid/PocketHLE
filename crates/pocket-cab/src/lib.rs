@@ -514,18 +514,13 @@ impl WinCeSetupScript {
         for raw in s.split('<') {
             let tag = raw.trim();
             if tag.starts_with("/characteristic") {
-                if current_key.is_some() {
-                    current_key = None;
-                } else {
-                    in_registry = false;
-                }
                 continue;
             }
             if let Some(t) = tag.strip_prefix("characteristic").and_then(type_attribute) {
                 if t.eq_ignore_ascii_case("Registry") {
                     in_registry = true;
                     current_key = None;
-                } else if in_registry {
+                } else if in_registry && t.to_ascii_uppercase().starts_with("HK") {
                     current_key = Some(canonicalise_registry_key(&t));
                 }
                 continue;

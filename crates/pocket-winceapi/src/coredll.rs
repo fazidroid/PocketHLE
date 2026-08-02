@@ -227,6 +227,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "CloseHandle", close_handle);
     d.register_handler(dll, "GetFileSize", get_file_size);
     d.register_handler(dll, "GlobalMemoryStatus", global_memory_status);
+    d.register_handler(dll, "GetStoreInformation", get_store_information);
+    d.register_handler(dll, "#323", get_store_information);
     d.register_handler(dll, "SetFilePointer", set_file_pointer);
     d.register_handler(dll, "FindFirstFileW", find_first_file_w);
     d.register_handler(dll, "FindNextFileW", find_next_file_w);
@@ -1697,6 +1699,16 @@ fn create_process_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
         ctx.cpu.write_mem(process_info + 8, &1u32.to_le_bytes())?;
         ctx.cpu.write_mem(process_info + 12, &1u32.to_le_bytes())?;
     }
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+fn get_store_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let info = ctx.arg_u32(0)?;
+    if info == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    ctx.cpu.write_mem(info, &(64u32 * 1024 * 1024).to_le_bytes())?;
+    ctx.cpu.write_mem(info + 4, &(48u32 * 1024 * 1024).to_le_bytes())?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -11808,6 +11820,23 @@ mod tests {
             remove_directory_w(&mut c).unwrap(),
             DispatchOutcome::ReturnedR0(0)
         );
+    }
+
+    #[test]
+    fn get_store_information_writes_store_size_and_free_size() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1000).unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(get_store_information(&mut c).unwrap(), DispatchOutcome::ReturnedR0(1));
+        assert_eq!(cpu.read_u32_le(0x1000).unwrap(), 64 * 1024 * 1024);
+        assert_eq!(cpu.read_u32_le(0x1004).unwrap(), 48 * 1024 * 1024);
     }
 
     #[test]

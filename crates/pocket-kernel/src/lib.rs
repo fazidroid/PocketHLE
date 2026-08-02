@@ -1283,10 +1283,8 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             commctrl.insert(name.clone(), thunk.thunk_va);
             if let ImportBinding::Ordinal(ord) = &thunk.binding {
                 commctrl.insert(format!("#{}", ord), thunk.thunk_va);
-            }
-            if name == "#1" {
-                commctrl.insert("InitCommonControls".into(), thunk.thunk_va);
-                commctrl.insert("InitCommonControlsEx".into(), thunk.thunk_va);
+            } else if let Some(ord) = name.strip_prefix("ord:") {
+                commctrl.insert(format!("#{ord}"), thunk.thunk_va);
             }
         }
     }
@@ -1453,16 +1451,24 @@ impl Process {
             thunk_by_va.insert(thunk_va, i);
         }
 
-        let dynamic_names = dispatcher.dynamic_names("coredll.dll");
+        let mut dynamic_exports_to_add = Vec::new();
+        for dll in ["coredll.dll", "commctrl.dll", "gx.dll", "ddraw.dll"] {
+            dynamic_exports_to_add.extend(
+                dispatcher
+                    .dynamic_names(dll)
+                    .into_iter()
+                    .map(|name| (dll.to_string(), name)),
+            );
+        }
         let dynamic_base = THUNK_REGION_BASE + thunk_size + 0x1000;
         let dynamic_size = pocket_cpu::round_up_to_page(
-            (dynamic_names.len() as u32)
+            (dynamic_exports_to_add.len() as u32)
                 .saturating_mul(THUNK_STRIDE)
                 .max(0x1000),
         );
-        if !dynamic_names.is_empty() {
+        if !dynamic_exports_to_add.is_empty() {
             cpu.map_region(dynamic_base, dynamic_size, Prot::READ | Prot::EXEC)?;
-            for (index, name) in dynamic_names.iter().enumerate() {
+            for (index, (dll, name)) in dynamic_exports_to_add.into_iter().enumerate() {
                 let thunk_va = dynamic_base + index as u32 * THUNK_STRIDE;
                 let mut buf = [0u8; THUNK_STRIDE as usize];
                 let stub = return_stub_bytes(cpu.arch());
@@ -1474,9 +1480,9 @@ impl Process {
                 thunks.push(Thunk {
                     thunk_va,
                     iat_va: 0,
-                    dll: "coredll.dll".to_string(),
+                    dll,
                     binding: ImportBinding::Name(name.clone()),
-                    friendly_name: Some(name.clone()),
+                    friendly_name: Some(name),
                 });
                 thunk_by_va.insert(thunk_va, thunks.len() - 1);
             }
