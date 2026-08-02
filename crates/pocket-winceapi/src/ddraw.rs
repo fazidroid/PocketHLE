@@ -8,15 +8,13 @@ const FAKE_SURFACE: u32 = 0xDEAD_DD02;
 const FAKE_PALETTE: u32 = 0xDEAD_DD03;
 const FAKE_MODULE_HANDLE: u32 = 0x1000_0003;
 
-const DDRAW_METHODS: [&str; 24] = [
+const DDRAW_METHODS: [&str; 22] = [
     "ddraw_qi",
     "ddraw_add_ref",
     "ddraw_release",
-    "ddraw_compact",
     "ddraw_create_clipper",
     "ddraw_create_palette",
     "ddraw_create_surface",
-    "ddraw_set_exclusive_mode",
     "ddraw_duplicate_surface",
     "ddraw_enum_display_modes",
     "ddraw_enum_surfaces",
@@ -43,6 +41,18 @@ const PALETTE_METHODS: [&str; 7] = [
     "palette_get_entries",
     "palette_initialize",
     "palette_set_entries",
+];
+
+const CLIPPER_METHODS: [&str; 9] = [
+    "clipper_qi",
+    "clipper_add_ref",
+    "clipper_release",
+    "clipper_get_clip_list",
+    "clipper_get_hwnd",
+    "clipper_initialize",
+    "clipper_is_clip_list_changed",
+    "clipper_set_clip_list",
+    "clipper_set_hwnd",
 ];
 
 const SURFACE_METHODS: [&str; 40] = [
@@ -94,6 +104,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     for name in DDRAW_METHODS
         .iter()
         .chain(PALETTE_METHODS.iter())
+        .chain(CLIPPER_METHODS.iter())
         .chain(SURFACE_METHODS.iter())
     {
         let handler = match *name {
@@ -102,7 +113,14 @@ pub fn register(d: &mut WinCeDispatcher) {
             "ddraw_release" => release,
             "ddraw_create_surface" => ddraw_create_surface,
             "ddraw_create_palette" => ddraw_create_palette,
-            "ddraw_set_exclusive_mode" => ddraw_ok,
+            "ddraw_create_clipper" => ddraw_create_clipper,
+            "ddraw_get_caps"
+            | "ddraw_get_fourcc_codes"
+            | "ddraw_get_gdi_surface"
+            | "ddraw_get_monitor_frequency"
+            | "ddraw_restore_display_mode"
+            | "ddraw_set_cooperative_level"
+            | "ddraw_set_display_mode" => ddraw_ok,
             "ddraw_get_vertical_blank_status" => ddraw_get_vertical_blank_status,
             "ddraw_get_scan_line" => ddraw_get_scan_line,
             "ddraw_enum_surfaces" => ddraw_enum_surfaces,
@@ -112,14 +130,18 @@ pub fn register(d: &mut WinCeDispatcher) {
             "palette_release" => release,
             "palette_get_caps" | "palette_get_entries" => palette_ok,
             "palette_initialize" | "palette_set_entries" => palette_ok,
+            "clipper_qi" => clipper_qi,
+            "clipper_add_ref" => add_ref,
+            "clipper_release" => release,
+            "clipper_set_hwnd" => clipper_set_hwnd,
+            _ if name.starts_with("clipper_") => clipper_ok,
             "surface_qi" => surface_qi,
             "surface_add_ref" => add_ref,
             "surface_release" => release,
             "surface_get_attached" => surface_get_attached,
             "surface_get_blt_status" | "surface_get_flip_status" => surface_status,
-            "surface_get_caps" | "surface_get_pixel_format" | "surface_get_surface_desc" => {
-                surface_desc
-            }
+            "surface_get_caps" | "surface_get_pixel_format" => surface_ok,
+            "surface_get_surface_desc" => surface_desc,
             "surface_get_dc" => surface_get_dc,
             "surface_is_lost" => surface_is_lost,
             "surface_lock" => surface_lock,
@@ -149,10 +171,10 @@ fn dynamic_address(ctx: &CallCtx<'_>, name: &str) -> u32 {
 
 fn write_vtable(ctx: &mut CallCtx<'_>, ptr: u32, names: &[&str]) -> Result<(), KernelError> {
     for (i, name) in names.iter().enumerate() {
-        ctx.cpu.write_mem(
-            ptr + i as u32 * 4,
-            &dynamic_address(ctx, name).to_le_bytes(),
-        )?;
+        let address = dynamic_address(ctx, name);
+        log::debug!("DirectDraw vtable[{i}] {name} -> 0x{address:08x}");
+        ctx.cpu
+            .write_mem(ptr + i as u32 * 4, &address.to_le_bytes())?;
     }
     Ok(())
 }
@@ -172,6 +194,19 @@ fn alloc_object(ctx: &mut CallCtx<'_>, vtable: &[&str], tag: u32) -> Result<u32,
 fn direct_draw_create(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let out = ctx.arg_u32(1)?;
     let object = alloc_object(ctx, &DDRAW_METHODS, FAKE_DDRAW)?;
+    if out != 0 {
+        ctx.cpu.write_mem(out, &object.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(if object != 0 {
+        0
+    } else {
+        0x8000_4005
+    }))
+}
+
+fn ddraw_create_clipper(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(2)?;
+    let object = alloc_object(ctx, &CLIPPER_METHODS, 0xDEAD_DD04)?;
     if out != 0 {
         ctx.cpu.write_mem(out, &object.to_le_bytes())?;
     }
@@ -217,6 +252,23 @@ fn ddraw_create_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
     }))
 }
 
+fn clipper_qi(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(2)?;
+    if out != 0 {
+        let object = ctx.arg_u32(0)?;
+        ctx.cpu.write_mem(out, &object.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn clipper_ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn clipper_set_hwnd(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 fn palette_qi(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let out = ctx.arg_u32(2)?;
     if out != 0 {
@@ -244,6 +296,14 @@ fn ddraw_enum_surfaces(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
 }
 
 fn ddraw_enum_display_modes(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+fn ddraw_get_display_mode(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let desc = ctx.arg_u32(1)?;
+    if desc != 0 && !(0x5000_0000..0x5f00_0000).contains(&desc) {
+        write_surface_desc(ctx, desc, SYNTHETIC_FRAMEBUFFER_BASE)?;
+    }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
@@ -284,16 +344,31 @@ fn surface_status(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
+fn write_surface_desc(ctx: &mut CallCtx<'_>, desc: u32, surface: u32) -> Result<(), KernelError> {
+    if desc == 0 {
+        return Ok(());
+    }
+    let mut bytes = [0u8; 124];
+    bytes[0..4].copy_from_slice(&124u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&0x0000_100fu32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
+    bytes[12..16].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
+    bytes[16..20].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
+    bytes[36..40].copy_from_slice(&surface.to_le_bytes());
+    bytes[72..76].copy_from_slice(&32u32.to_le_bytes());
+    bytes[76..80].copy_from_slice(&0x40u32.to_le_bytes());
+    bytes[84..88].copy_from_slice(&16u32.to_le_bytes());
+    bytes[88..92].copy_from_slice(&0xf800u32.to_le_bytes());
+    bytes[92..96].copy_from_slice(&0x07e0u32.to_le_bytes());
+    bytes[96..100].copy_from_slice(&0x001fu32.to_le_bytes());
+    ctx.cpu.write_mem(desc, &bytes)?;
+    Ok(())
+}
+
 fn surface_desc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let desc = ctx.arg_u32(1)?;
-    if desc != 0 {
-        let mut bytes = [0u8; 124];
-        bytes[0..4].copy_from_slice(&124u32.to_le_bytes());
-        bytes[8..12].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
-        bytes[12..16].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
-        bytes[16..20].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
-        bytes[36..40].copy_from_slice(&SYNTHETIC_FRAMEBUFFER_BASE.to_le_bytes());
-        ctx.cpu.write_mem(desc, &bytes)?;
+    if desc != 0 && !(0x5000_0000..0x5f00_0000).contains(&desc) {
+        write_surface_desc(ctx, desc, SYNTHETIC_FRAMEBUFFER_BASE)?;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }
@@ -334,13 +409,7 @@ fn surface_lock(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     ensure_framebuffer(ctx)?;
     let desc = ctx.arg_u32(2)?;
     if desc != 0 {
-        let mut bytes = [0u8; 124];
-        bytes[0..4].copy_from_slice(&124u32.to_le_bytes());
-        bytes[8..12].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
-        bytes[12..16].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
-        bytes[16..20].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
-        bytes[36..40].copy_from_slice(&SYNTHETIC_FRAMEBUFFER_BASE.to_le_bytes());
-        ctx.cpu.write_mem(desc, &bytes)?;
+        write_surface_desc(ctx, desc, SYNTHETIC_FRAMEBUFFER_BASE)?;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
 }

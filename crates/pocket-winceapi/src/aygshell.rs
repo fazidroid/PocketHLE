@@ -153,7 +153,21 @@ fn sh_create_menu_bar(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     if pmb == 0 {
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
-    let cb_size = ctx.cpu.read_u32_le(pmb).unwrap_or(0);
+    if pmb >= 0xDEAD_0000 {
+        log::debug!(
+            "SHCreateMenuBar received HWND-like argument 0x{pmb:08x}; treating it as the legacy shell fullscreen call"
+        );
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let cb_size = match ctx.cpu.read_u32_le(pmb) {
+        Ok(size) => size,
+        Err(_) => {
+            log::debug!(
+                "SHCreateMenuBar received non-pointer argument 0x{pmb:08x}; treating it as an alternate shell call"
+            );
+            return Ok(DispatchOutcome::ReturnedR0(1));
+        }
+    };
     // The 32-byte (WM5) layout puts hwndMB at +0x18, the 36-byte
     // (PPC2002) one at +0x1c. Pick by cbSize; for an unrecognised
     // size write both so the caller finds a handle either way.
