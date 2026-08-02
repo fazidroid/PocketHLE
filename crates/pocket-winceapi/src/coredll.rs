@@ -1761,7 +1761,11 @@ fn get_module_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let (base, image_size, entry) = if module == 0 || module == FAKE_MODULE_HANDLE {
-        (ctx.kernel.image_base, ctx.kernel.image_size, ctx.kernel.image_entry)
+        (
+            ctx.kernel.image_base,
+            ctx.kernel.image_size,
+            ctx.kernel.image_entry,
+        )
     } else if let Some(loaded) = ctx.kernel.module_by_handle(module) {
         (loaded.base, loaded.image_size, loaded.image_entry)
     } else {
