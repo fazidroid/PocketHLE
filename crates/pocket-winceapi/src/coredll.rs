@@ -87,6 +87,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetCommandLineW", get_command_line_w);
     d.register_handler(dll, "GetModuleHandleW", get_module_handle_w);
     d.register_handler(dll, "GetModuleFileNameW", get_module_file_name_w);
+    d.register_handler(dll, "GetModuleInformation", get_module_information);
     d.register_handler(dll, "GetProcAddress", get_proc_address_a);
     d.register_handler(dll, "GetProcAddressA", get_proc_address_a);
     d.register_handler(dll, "LoadLibraryW", load_library_w);
@@ -168,6 +169,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "atol", atoi_handler);
     d.register_handler(dll, "atof", atof_handler);
     d.register_handler(dll, "_itoa", itoa_handler);
+    d.register_handler(dll, "_itow", itow_handler);
     d.register_handler(dll, "_isctype", isctype);
     d.register_handler(dll, "strchr", strchr);
     d.register_handler(dll, "strrchr", strrchr);
@@ -181,6 +183,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "wcsncat", wcsncat);
     d.register_handler(dll, "wcscmp", wcscmp);
     d.register_handler(dll, "wcsncmp", wcsncmp);
+    d.register_handler(dll, "wcsnicmp", wcsnicmp);
     d.register_handler(dll, "_wcsnicmp", wcsnicmp);
     d.register_handler(dll, "_wcsicmp", wcsicmp);
     d.register_handler(dll, "_wcsdup", wcsdup);
@@ -1749,6 +1752,29 @@ fn get_module_handle_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     Ok(DispatchOutcome::ReturnedR0(handle))
 }
 
+fn get_module_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _ = ctx.arg_u32(0)?;
+    let module = ctx.arg_u32(1)?;
+    let out = ctx.arg_u32(2)?;
+    let size = ctx.arg_u32(3)?;
+    if out == 0 || size < 12 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let (base, image_size, entry) = if module == 0 || module == FAKE_MODULE_HANDLE {
+        (ctx.kernel.image_base, ctx.kernel.image_size, ctx.kernel.image_entry)
+    } else if let Some(loaded) = ctx.kernel.module_by_handle(module) {
+        (loaded.base, loaded.image_size, loaded.image_entry)
+    } else {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    };
+    let mut info = [0u8; 12];
+    info[0..4].copy_from_slice(&base.to_le_bytes());
+    info[4..8].copy_from_slice(&image_size.to_le_bytes());
+    info[8..12].copy_from_slice(&entry.to_le_bytes());
+    ctx.cpu.write_mem(out, &info)?;
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let path_p = ctx.arg_u32(0)?;
     let path = read_wstr(ctx, path_p, 260).unwrap_or_default();
@@ -1860,6 +1886,8 @@ fn load_resource_module(ctx: &mut CallCtx<'_>, request: &str) -> Result<Option<u
         handle: base,
         name,
         base,
+        image_size: image.size_of_image,
+        image_entry: base.wrapping_add(image.entry_point),
         resources: image.resources,
         refcount: 1,
     });
@@ -2580,6 +2608,37 @@ fn atoi_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// character satisfies. `isalpha`, `isdigit`, `isspace` and friends are
 /// macros that call straight into this, so returning 0 unconditionally
 /// broke every parser the guest CRT has.
+fn itow_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let value = ctx.arg_u32(0)? as i32;
+    let dst = ctx.arg_u32(1)?;
+    let radix = ctx.arg_u32(2)?;
+    if dst == 0 || !(2..=36).contains(&radix) {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let negative = value < 0 && radix == 10;
+    let mut magnitude = if negative {
+        (value as i64).unsigned_abs()
+    } else {
+        value as u32 as u64
+    };
+    let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = Vec::new();
+    loop {
+        digits.push(alphabet[(magnitude % radix as u64) as usize] as u16);
+        magnitude /= radix as u64;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if negative {
+        digits.push(b'-' as u16);
+    }
+    digits.reverse();
+    digits.push(0);
+    ctx.cpu.write_mem(dst, &wide_to_bytes(&digits))?;
+    Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
 fn itoa_handler(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let value = ctx.arg_u32(0)? as i32;
     let dst = ctx.arg_u32(1)?;
@@ -11363,6 +11422,8 @@ mod tests {
             gdi: GdiState::new(),
             resources: vec![],
             image_base: 0,
+            image_size: 0,
+            image_entry: 0,
             dynamic_exports: std::collections::HashMap::new(),
             next_module_handle: 0x1000_0001,
             modules: Vec::new(),

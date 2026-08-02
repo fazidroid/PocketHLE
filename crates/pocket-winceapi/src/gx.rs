@@ -273,6 +273,8 @@ mod tests {
             gdi: GdiState::new(),
             resources: vec![],
             image_base: 0,
+            image_size: 0,
+            image_entry: 0,
             dynamic_exports: std::collections::HashMap::new(),
             next_module_handle: 0x1000_0001,
             modules: Vec::new(),

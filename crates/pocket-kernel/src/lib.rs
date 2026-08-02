@@ -554,6 +554,10 @@ pub struct LoadedModule {
     pub name: String,
     /// Address the image was mapped at.
     pub base: u32,
+    /// PE SizeOfImage copied from the loaded module header.
+    pub image_size: u32,
+    /// PE entry point as a guest virtual address.
+    pub image_entry: u32,
     /// Flattened `.rsrc` directory of that image.
     pub resources: Vec<ResourceEntry>,
     /// `LoadLibrary` count, decremented by `FreeLibrary`. We never
@@ -588,6 +592,9 @@ pub struct KernelState {
     pub resources: Vec<ResourceEntry>,
     /// Image base for resource RVA → VA conversion.
     pub image_base: u32,
+    /// Size and entry point copied from the loaded PE header for module introspection APIs.
+    pub image_size: u32,
+    pub image_entry: u32,
     pub dynamic_exports: HashMap<u32, HashMap<String, u32>>,
     pub next_module_handle: u32,
     /// DLLs the guest brought in at runtime via `LoadLibraryW`, in load
@@ -1608,6 +1615,8 @@ impl Process {
 
         let resources = image.resources.clone();
         let img_base = image.image_base;
+        let img_size = image.size_of_image;
+        let img_entry = image.entry_va();
         // A game's satellite DLLs sit next to the EXE on a real device, so
         // the directory we loaded the EXE from is the natural search path
         // for `LoadLibraryW`. For a CAB/ZIP run that directory *is* the
@@ -1631,6 +1640,8 @@ impl Process {
                 gdi: GdiState::new(),
                 resources,
                 image_base: img_base,
+                image_size: img_size,
+                image_entry: img_entry,
                 dynamic_exports,
                 next_module_handle: 0x1000_0001,
                 modules: Vec::new(),
