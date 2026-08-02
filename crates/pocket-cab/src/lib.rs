@@ -849,8 +849,14 @@ mod tests {
         let script = WinCeSetupScript::parse_bytes(
             br#"<characteristic type="Install"><parm name="InstallDir" value="%CE1%\Astraware\Cubis" /></characteristic><characteristic type="Registry"><characteristic type="HKLM\SOFTWARE\Apps\Astraware Cubis"><parm name="InstallDir" value="%InstallDir%" datatype="string" /></characteristic></characteristic>"#,
         );
-        assert_eq!(script.install_dir.as_deref(), Some(r"\Program Files\Astraware\Cubis\"));
+        assert_eq!(
+            script.install_dir.as_deref(),
+            Some(r"\Program Files\Astraware\Cubis\")
+        );
         assert_eq!(script.shortcut_target, None);
-        assert_eq!(script.registry[0].string.as_deref(), Some(r"\Program Files\Astraware\Cubis"));
+        assert_eq!(
+            script.registry[0].string.as_deref(),
+            Some(r"\Program Files\Astraware\Cubis")
+        );
     }
 }
