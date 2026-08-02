@@ -112,6 +112,7 @@ pub fn register(d: &mut WinCeDispatcher) {
             "ddraw_add_ref" => add_ref,
             "ddraw_release" => release,
             "ddraw_create_surface" => ddraw_create_surface,
+            "ddraw_initialize" => ddraw_initialize,
             "ddraw_create_palette" => ddraw_create_palette,
             "ddraw_create_clipper" => ddraw_create_clipper,
             "ddraw_get_caps"
@@ -121,6 +122,7 @@ pub fn register(d: &mut WinCeDispatcher) {
             | "ddraw_restore_display_mode"
             | "ddraw_set_cooperative_level"
             | "ddraw_set_display_mode" => ddraw_ok,
+            "ddraw_get_display_mode" => ddraw_get_display_mode,
             "ddraw_get_vertical_blank_status" => ddraw_get_vertical_blank_status,
             "ddraw_get_scan_line" => ddraw_get_scan_line,
             "ddraw_enum_surfaces" => ddraw_enum_surfaces,
@@ -141,6 +143,7 @@ pub fn register(d: &mut WinCeDispatcher) {
             "surface_get_attached" => surface_get_attached,
             "surface_get_blt_status" | "surface_get_flip_status" => surface_status,
             "surface_get_caps" | "surface_get_pixel_format" => surface_ok,
+            "surface_get_color_key" => surface_get_color_key,
             "surface_get_surface_desc" => surface_desc,
             "surface_get_dc" => surface_get_dc,
             "surface_is_lost" => surface_is_lost,
@@ -237,6 +240,11 @@ fn ddraw_create_palette(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
     } else {
         0x8000_4005
     }))
+}
+
+fn ddraw_initialize(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    ensure_framebuffer(ctx)?;
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn ddraw_create_surface(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -363,6 +371,14 @@ fn write_surface_desc(ctx: &mut CallCtx<'_>, desc: u32, surface: u32) -> Result<
     bytes[96..100].copy_from_slice(&0x001fu32.to_le_bytes());
     ctx.cpu.write_mem(desc, &bytes)?;
     Ok(())
+}
+
+fn surface_get_color_key(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let color_key = ctx.arg_u32(3)?;
+    if color_key != 0 {
+        ctx.cpu.write_mem(color_key, &[0; 8])?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn surface_desc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
