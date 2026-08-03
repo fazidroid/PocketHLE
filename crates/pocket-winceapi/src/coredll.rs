@@ -225,6 +225,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_vsnprintf", vsnprintf);
     d.register_handler(dll, "vsnprintf", vsnprintf);
     d.register_handler(dll, "_snprintf", snprintf);
+    d.register_handler(dll, "sscanf", sscanf);
+    d.register_handler(dll, "swscanf", swscanf);
     d.register_handler(dll, "_snwprintf", snwprintf);
     d.register_handler(dll, "vswprintf", vswprintf);
     d.register_handler(dll, "_vsnwprintf", vsnwprintf);
@@ -1769,10 +1771,31 @@ fn get_module_handle_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
         0x1000_0001
     } else if name == "commctrl.dll" || name == "commctrl" {
         0x1000_0002
+    } else if let Some(h) = gles_module_handle(&name) {
+        h
     } else {
         FAKE_MODULE_HANDLE
     };
     Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+/// Map a `libGLES_*` module name to the handle
+/// [`pocket_kernel::build_dynamic_exports`] filed its thunks under.
+/// Returns `None` for anything that is not one of the two client
+/// libraries we emulate.
+pub(crate) fn gles_module_handle(name: &str) -> Option<u32> {
+    let stem = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    // Guests spell these every which way — `libGLES_CM.dll`,
+    // `libgles_cm`, `\Windows\libGLES_CL.dll`. WinCE filenames are
+    // case-insensitive, so fold before matching or the real-world
+    // spelling misses and `GetProcAddress` hands back null.
+    let stem = stem.to_ascii_lowercase();
+    let stem = stem.strip_suffix(".dll").unwrap_or(&stem);
+    match stem {
+        "libgles_cm" => Some(pocket_kernel::GLES_CM_MODULE_HANDLE),
+        "libgles_cl" => Some(pocket_kernel::GLES_CL_MODULE_HANDLE),
+        _ => None,
+    }
 }
 
 fn get_module_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -1826,6 +1849,19 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
             0
         };
         log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    if let Some(handle) = gles_module_handle(&name) {
+        // Only report success if the loader actually synthesized
+        // thunks for this library — otherwise `GetProcAddress` would
+        // hand back null for every entry point and the guest would be
+        // worse off than if the load had failed outright.
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&handle) {
+            handle
+        } else {
+            0
+        };
+        log::info!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE GLES)");
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
     // Already resident? CE hands back the same base and bumps the
@@ -3384,6 +3420,409 @@ fn snprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(bytes.len() as u32 - 1))
 }
 
+/// The shared engine behind `sscanf`. `input` is the subject string,
+/// `fmt` the format, and `next_arg` yields successive pointer
+/// arguments (register args then stack args, exactly like the
+/// printf side).
+///
+/// Returns the number of *assigned* conversions, or `-1` for an early
+/// input failure — the same `EOF`-vs-zero distinction real `sscanf`
+/// makes, which callers use to tell "nothing matched" from "the string
+/// ran out first".
+fn run_sscanf(
+    ctx: &mut CallCtx<'_>,
+    input: &str,
+    fmt: &str,
+    mut next_arg: impl FnMut(&mut CallCtx<'_>) -> Result<u32, KernelError>,
+) -> Result<i32, KernelError> {
+    let src = input.as_bytes();
+    let f = fmt.as_bytes();
+    let mut si = 0usize;
+    let mut fi = 0usize;
+    let mut assigned = 0i32;
+
+    while fi < f.len() {
+        let fc = f[fi];
+
+        // Whitespace in the format matches any run of input whitespace,
+        // including none at all.
+        if fc.is_ascii_whitespace() {
+            fi += 1;
+            while si < src.len() && src[si].is_ascii_whitespace() {
+                si += 1;
+            }
+            continue;
+        }
+
+        if fc != b'%' {
+            // Literal: must match exactly.
+            if si >= src.len() {
+                return Ok(if assigned == 0 { -1 } else { assigned });
+            }
+            if src[si] != fc {
+                return Ok(assigned);
+            }
+            si += 1;
+            fi += 1;
+            continue;
+        }
+
+        fi += 1;
+        if fi >= f.len() {
+            break;
+        }
+        if f[fi] == b'%' {
+            while si < src.len() && src[si].is_ascii_whitespace() {
+                si += 1;
+            }
+            if si >= src.len() || src[si] != b'%' {
+                return Ok(if assigned == 0 && si >= src.len() {
+                    -1
+                } else {
+                    assigned
+                });
+            }
+            si += 1;
+            fi += 1;
+            continue;
+        }
+
+        // `*` suppresses the assignment: the conversion still happens
+        // and still has to succeed, it just consumes no argument.
+        let suppress = f[fi] == b'*';
+        if suppress {
+            fi += 1;
+        }
+
+        // Field width.
+        let mut width = 0usize;
+        while fi < f.len() && f[fi].is_ascii_digit() {
+            width = width * 10 + (f[fi] - b'0') as usize;
+            fi += 1;
+        }
+        let width = if width == 0 { usize::MAX } else { width };
+
+        // Length modifiers. `ll` (and the MSVC `I64`) widen to 64 bits;
+        // `h` narrows to 16. `l` on a float means `double`.
+        let mut short_form = false;
+        let mut long_count = 0u32;
+        loop {
+            match f.get(fi) {
+                Some(b'h') => {
+                    short_form = true;
+                    fi += 1;
+                }
+                Some(b'l') | Some(b'L') => {
+                    long_count += 1;
+                    fi += 1;
+                }
+                Some(b'I') if f[fi..].starts_with(b"I64") => {
+                    long_count = 2;
+                    fi += 3;
+                }
+                _ => break,
+            }
+        }
+        let long_long = long_count >= 2;
+
+        let Some(&conv) = f.get(fi) else { break };
+        fi += 1;
+
+        // Every conversion except `%c`, `%[` and `%n` skips leading
+        // whitespace first.
+        if !matches!(conv, b'c' | b'[' | b'n') {
+            while si < src.len() && src[si].is_ascii_whitespace() {
+                si += 1;
+            }
+        }
+
+        match conv {
+            b'n' => {
+                // Not a conversion: reports how far we have read. Never
+                // counts toward the return value.
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    scanf_store_int(ctx, addr, si as i64, short_form, long_long)?;
+                }
+            }
+            b'd' | b'i' | b'u' | b'x' | b'X' | b'o' | b'p' => {
+                let start = si;
+                let mut neg = false;
+                if si < src.len() && (src[si] == b'+' || src[si] == b'-') {
+                    neg = src[si] == b'-';
+                    si += 1;
+                }
+                // `%i` sniffs the base from the prefix; `%x` accepts an
+                // optional `0x`; the rest are fixed.
+                let mut radix: u32 = match conv {
+                    b'x' | b'X' | b'p' => 16,
+                    b'o' => 8,
+                    b'i' => 0,
+                    _ => 10,
+                };
+                if (radix == 16 || radix == 0)
+                    && src.len() > si + 1
+                    && src[si] == b'0'
+                    && (src[si + 1] | 0x20) == b'x'
+                {
+                    si += 2;
+                    radix = 16;
+                } else if radix == 0 {
+                    radix = if src.get(si) == Some(&b'0') { 8 } else { 10 };
+                }
+                let digits_from = si;
+                let limit = start.saturating_add(width);
+                let mut acc: i64 = 0;
+                let mut any = false;
+                while si < src.len() && si < limit {
+                    let Some(d) = (src[si] as char).to_digit(radix) else {
+                        break;
+                    };
+                    acc = acc.wrapping_mul(radix as i64).wrapping_add(d as i64);
+                    any = true;
+                    si += 1;
+                }
+                if !any {
+                    // A lone `0x` with no hex digits still yields the 0.
+                    if radix == 16 && digits_from > start && digits_from - start >= 2 {
+                        si = digits_from - 1;
+                        acc = 0;
+                    } else {
+                        return Ok(if assigned == 0 { -1 } else { assigned });
+                    }
+                }
+                if neg {
+                    acc = acc.wrapping_neg();
+                }
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    scanf_store_int(ctx, addr, acc, short_form, long_long)?;
+                    assigned += 1;
+                }
+            }
+            b'f' | b'e' | b'E' | b'g' | b'G' | b'a' => {
+                let start = si;
+                let limit = start.saturating_add(width);
+                let mut end = si;
+                if end < src.len() && (src[end] == b'+' || src[end] == b'-') {
+                    end += 1;
+                }
+                while end < src.len() && end < limit && src[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end < src.len() && end < limit && src[end] == b'.' {
+                    end += 1;
+                    while end < src.len() && end < limit && src[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                }
+                // Only accept an exponent if it actually has digits, so
+                // "1e" parses as 1.0 and leaves the 'e' unread.
+                if end < src.len() && end < limit && (src[end] | 0x20) == b'e' {
+                    let mut probe = end + 1;
+                    if probe < src.len() && (src[probe] == b'+' || src[probe] == b'-') {
+                        probe += 1;
+                    }
+                    if probe < src.len() && src[probe].is_ascii_digit() {
+                        while probe < src.len() && probe < limit && src[probe].is_ascii_digit() {
+                            probe += 1;
+                        }
+                        end = probe;
+                    }
+                }
+                let text = std::str::from_utf8(&src[start..end]).unwrap_or("");
+                let Ok(value) = text.parse::<f64>() else {
+                    return Ok(if assigned == 0 { -1 } else { assigned });
+                };
+                si = end;
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    if addr != 0 {
+                        // Bare `%f` writes a 4-byte float; `%lf` a
+                        // double. Getting this backwards silently
+                        // corrupts the caller's next field.
+                        if long_count >= 1 {
+                            ctx.cpu.write_mem(addr, &value.to_bits().to_le_bytes())?;
+                        } else {
+                            ctx.cpu
+                                .write_mem(addr, &(value as f32).to_bits().to_le_bytes())?;
+                        }
+                    }
+                    assigned += 1;
+                }
+            }
+            b'c' => {
+                let n = if width == usize::MAX { 1 } else { width };
+                if si + n > src.len() {
+                    return Ok(if assigned == 0 { -1 } else { assigned });
+                }
+                let bytes = src[si..si + n].to_vec();
+                si += n;
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    if addr != 0 {
+                        // `%c` does *not* append a terminator.
+                        ctx.cpu.write_mem(addr, &bytes)?;
+                    }
+                    assigned += 1;
+                }
+            }
+            b's' => {
+                let start = si;
+                let limit = start.saturating_add(width);
+                while si < src.len() && si < limit && !src[si].is_ascii_whitespace() {
+                    si += 1;
+                }
+                if si == start {
+                    return Ok(if assigned == 0 { -1 } else { assigned });
+                }
+                let mut bytes = src[start..si].to_vec();
+                bytes.push(0);
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    if addr != 0 {
+                        ctx.cpu.write_mem(addr, &bytes)?;
+                    }
+                    assigned += 1;
+                }
+            }
+            b'[' => {
+                let (negated, members, next_fi) = scanf_scanset(f, fi);
+                fi = next_fi;
+                let start = si;
+                let limit = start.saturating_add(width);
+                while si < src.len() && si < limit {
+                    let hit = members.contains(&src[si]);
+                    if hit == negated {
+                        break;
+                    }
+                    si += 1;
+                }
+                if si == start {
+                    return Ok(if assigned == 0 { -1 } else { assigned });
+                }
+                let mut bytes = src[start..si].to_vec();
+                bytes.push(0);
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    if addr != 0 {
+                        ctx.cpu.write_mem(addr, &bytes)?;
+                    }
+                    assigned += 1;
+                }
+            }
+            other => {
+                log::warn!("sscanf: unsupported conversion %{}", other as char);
+                return Ok(assigned);
+            }
+        }
+    }
+
+    Ok(assigned)
+}
+
+/// `int sscanf(const char *src, const char *fmt, ...)`.
+///
+/// Games use this to parse their own config and asset text — Call of
+/// Duty 2 runs it ~40 times during startup on material and shader
+/// definitions. Returning a bogus value here leaves the parsed structs
+/// full of stack garbage, so it is worth doing properly.
+fn sscanf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let src_p = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    if src_p == 0 || fmt_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(-1i32 as u32));
+    }
+    let input = read_cstr_string(ctx, src_p, 0x4000)?;
+    let fmt = read_cstr_string(ctx, fmt_p, 0x4000)?;
+    let mut idx = 2u8;
+    let n = run_sscanf(ctx, &input, &fmt, move |c| {
+        let a = c.arg_u32(idx)?;
+        idx += 1;
+        Ok(a)
+    })?;
+    Ok(DispatchOutcome::ReturnedR0(n as u32))
+}
+
+/// `int swscanf(const wchar_t *src, const wchar_t *fmt, ...)`.
+/// Widens to the same engine: every conversion Pocket PC titles use is
+/// ASCII-representable, and the `%s` / `%c` stores are narrow because
+/// the guest asked for wide chars only in the format string.
+fn swscanf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let src_p = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    if src_p == 0 || fmt_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(-1i32 as u32));
+    }
+    let input = String::from_utf16_lossy(&read_wstr(ctx, src_p, 0x4000)?);
+    let fmt = String::from_utf16_lossy(&read_wstr(ctx, fmt_p, 0x4000)?);
+    let mut idx = 2u8;
+    let n = run_sscanf(ctx, &input, &fmt, move |c| {
+        let a = c.arg_u32(idx)?;
+        idx += 1;
+        Ok(a)
+    })?;
+    Ok(DispatchOutcome::ReturnedR0(n as u32))
+}
+
+/// Store an integer conversion result through a guest pointer,
+/// honouring the `h` / `ll` length modifiers that decide how wide the
+/// destination actually is.
+fn scanf_store_int(
+    ctx: &mut CallCtx<'_>,
+    addr: u32,
+    value: i64,
+    short_form: bool,
+    long_long: bool,
+) -> Result<(), KernelError> {
+    if addr == 0 {
+        return Ok(());
+    }
+    if long_long {
+        ctx.cpu.write_mem(addr, &(value as u64).to_le_bytes())?;
+    } else if short_form {
+        ctx.cpu.write_mem(addr, &(value as u16).to_le_bytes())?;
+    } else {
+        ctx.cpu.write_mem(addr, &(value as u32).to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// Parse the body of a `%[...]` scanset, starting just past the `[`.
+/// Returns `(negated, members, index_of_closing_bracket + 1)`.
+///
+/// A `]` immediately after `[` or `[^` is a literal member, not the
+/// terminator — that is what lets `%[^]]` mean "everything but a
+/// bracket".
+fn scanf_scanset(fmt: &[u8], mut fi: usize) -> (bool, Vec<u8>, usize) {
+    let mut negated = false;
+    if fmt.get(fi) == Some(&b'^') {
+        negated = true;
+        fi += 1;
+    }
+    let mut members = Vec::new();
+    if fmt.get(fi) == Some(&b']') {
+        members.push(b']');
+        fi += 1;
+    }
+    while fi < fmt.len() && fmt[fi] != b']' {
+        // `a-z` ranges. A trailing `-` is a literal.
+        if fmt[fi] == b'-' && fi + 1 < fmt.len() && fmt[fi + 1] != b']' && !members.is_empty() {
+            let lo = *members.last().unwrap();
+            let hi = fmt[fi + 1];
+            for c in lo..=hi {
+                members.push(c);
+            }
+            fi += 2;
+            continue;
+        }
+        members.push(fmt[fi]);
+        fi += 1;
+    }
+    // Step past the `]` if it is there; a malformed set runs to the end.
+    (negated, members, (fi + 1).min(fmt.len()))
+}
+
 /// `int vswprintf(wchar_t *dst, const wchar_t *fmt, va_list args)`.
 fn vswprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dst = ctx.arg_u32(0)?;
@@ -4060,6 +4499,13 @@ fn crt_fopen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let name = read_cstr_string(ctx, name_p, 260)?;
     let mode = read_cstr_string(ctx, mode_p, 8)?;
     let h = open_cstr_path(ctx, &name, &mode);
+    // A game that silently gets a NULL `FILE*` usually goes on to spin
+    // or bail somewhere far away from here, so say which path missed.
+    if h == 0 {
+        log::debug!("fopen({name:?}, {mode:?}) -> NULL");
+    } else {
+        log::trace!("fopen({name:?}, {mode:?}) -> 0x{h:08x}");
+    }
     Ok(DispatchOutcome::ReturnedR0(h))
 }
 
@@ -11949,6 +12395,7 @@ mod tests {
             dib_decode_scratch: Vec::new(),
             gx_last_pushed_counter: 0,
             gx_guest_signature: None,
+            gles_strings: std::collections::HashMap::new(),
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,
@@ -12710,5 +13157,201 @@ mod tests {
             call(&mut cpu, &mut kernel, hidden),
             DispatchOutcome::ReturnedR0(1)
         );
+    }
+
+    /// Drive `sscanf` with `input`/`fmt` and up to four out-pointers,
+    /// all pointing into a scratch page. Returns the raw `int` result.
+    fn run_scanf(
+        cpu: &mut StubCpu,
+        kernel: &mut KernelState,
+        input: &str,
+        fmt: &str,
+        outs: &[u32],
+    ) -> i32 {
+        const SRC: u32 = 0x1000;
+        const FMT: u32 = 0x1400;
+        cpu.write_mem(SRC, format!("{input}\0").as_bytes()).unwrap();
+        cpu.write_mem(FMT, format!("{fmt}\0").as_bytes()).unwrap();
+        cpu.write_reg(ArmReg::R0, SRC).unwrap();
+        cpu.write_reg(ArmReg::R1, FMT).unwrap();
+        for (i, o) in outs.iter().enumerate() {
+            match i {
+                0 => cpu.write_reg(ArmReg::R2, *o).unwrap(),
+                1 => cpu.write_reg(ArmReg::R3, *o).unwrap(),
+                n => {
+                    // Args 4+ live on the stack at the ABI offset.
+                    let sp = cpu.read_reg(ArmReg::Sp).unwrap();
+                    let off = sp + cpu.stack_arg_offset() + (n as u32 - 2) * 4;
+                    cpu.write_mem(off, &o.to_le_bytes()).unwrap();
+                }
+            }
+        }
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu,
+            thunk: &t,
+            kernel,
+        };
+        match sscanf(&mut c).unwrap() {
+            DispatchOutcome::ReturnedR0(v) => v as i32,
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    fn scanf_cpu() -> StubCpu {
+        let mut cpu = StubCpu::new();
+        cpu.map_region(0x1000, 0x4000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(0x8000, 0x2000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_reg(ArmReg::Sp, 0x9000).unwrap();
+        cpu
+    }
+
+    #[test]
+    fn sscanf_parses_several_integers_and_counts_them() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let (a, b, c) = (0x2000, 0x2004, 0x2008);
+        let n = run_scanf(&mut cpu, &mut kernel, "12 -34 56", "%d %d %d", &[a, b, c]);
+        assert_eq!(n, 3);
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 12);
+        assert_eq!(cpu.read_u32_le(b).unwrap() as i32, -34);
+        assert_eq!(cpu.read_u32_le(c).unwrap(), 56);
+    }
+
+    #[test]
+    fn sscanf_stops_at_the_first_mismatch_and_reports_the_partial_count() {
+        // The classic caller idiom is `if (sscanf(..) != 3) error;`, so
+        // the count has to reflect only what was really assigned.
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let (a, b) = (0x2000, 0x2004);
+        cpu.write_mem(b, &0xdead_beefu32.to_le_bytes()).unwrap();
+        let n = run_scanf(&mut cpu, &mut kernel, "7 oops", "%d %d", &[a, b]);
+        assert_eq!(n, 1);
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 7);
+        assert_eq!(
+            cpu.read_u32_le(b).unwrap(),
+            0xdead_beef,
+            "second out must be untouched"
+        );
+    }
+
+    #[test]
+    fn sscanf_reads_a_bare_float_as_four_bytes_not_eight() {
+        // `%f` writing 8 bytes would clobber whatever field follows.
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        cpu.write_mem(a + 4, &0xa5a5_a5a5u32.to_le_bytes()).unwrap();
+        let n = run_scanf(&mut cpu, &mut kernel, "1.5", "%f", &[a]);
+        assert_eq!(n, 1);
+        assert_eq!(f32::from_bits(cpu.read_u32_le(a).unwrap()), 1.5);
+        assert_eq!(
+            cpu.read_u32_le(a + 4).unwrap(),
+            0xa5a5_a5a5,
+            "%f must not write 8 bytes"
+        );
+    }
+
+    #[test]
+    fn sscanf_reads_a_long_float_as_a_double() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        let n = run_scanf(&mut cpu, &mut kernel, "-2.25e2", "%lf", &[a]);
+        assert_eq!(n, 1);
+        let lo = cpu.read_u32_le(a).unwrap() as u64;
+        let hi = cpu.read_u32_le(a + 4).unwrap() as u64;
+        assert_eq!(f64::from_bits((hi << 32) | lo), -225.0);
+    }
+
+    #[test]
+    fn sscanf_reads_hex_with_and_without_the_prefix() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let (a, b) = (0x2000, 0x2004);
+        let n = run_scanf(&mut cpu, &mut kernel, "0x1f ff", "%x %x", &[a, b]);
+        assert_eq!(n, 2);
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 0x1f);
+        assert_eq!(cpu.read_u32_le(b).unwrap(), 0xff);
+    }
+
+    #[test]
+    fn sscanf_copies_a_string_with_a_terminator_and_honours_width() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        let n = run_scanf(&mut cpu, &mut kernel, "texture_wall diffuse", "%4s", &[a]);
+        assert_eq!(n, 1);
+        let raw = cpu.read_mem(a, 5).unwrap();
+        assert_eq!(&raw, b"text\0");
+    }
+
+    #[test]
+    fn sscanf_suppressed_fields_consume_input_without_consuming_an_argument() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        // Only one out-pointer is supplied even though there are two
+        // conversions — the `%*d` must not eat it.
+        let n = run_scanf(&mut cpu, &mut kernel, "10 20", "%*d %d", &[a]);
+        assert_eq!(n, 1);
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 20);
+    }
+
+    #[test]
+    fn sscanf_matches_literals_and_a_scanset() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let (a, b) = (0x2000, 0x2100);
+        let n = run_scanf(
+            &mut cpu,
+            &mut kernel,
+            "id=42;name=rifle",
+            "id=%d;name=%[a-z]",
+            &[a, b],
+        );
+        assert_eq!(n, 2);
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 42);
+        let raw = cpu.read_mem(b, 6).unwrap();
+        assert_eq!(&raw, b"rifle\0");
+    }
+
+    #[test]
+    fn sscanf_returns_negative_one_when_the_input_ends_before_any_conversion() {
+        // Callers distinguish this EOF case from "matched nothing".
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        let n = run_scanf(&mut cpu, &mut kernel, "   ", "%d", &[a]);
+        assert_eq!(n, -1);
+    }
+
+    #[test]
+    fn sscanf_percent_n_reports_offset_without_counting_as_a_conversion() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let (a, b) = (0x2000, 0x2004);
+        let n = run_scanf(&mut cpu, &mut kernel, "123abc", "%d%n", &[a, b]);
+        assert_eq!(n, 1, "%n must not be counted");
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 123);
+        assert_eq!(cpu.read_u32_le(b).unwrap(), 3);
+    }
+
+    #[test]
+    fn sscanf_short_modifier_writes_only_two_bytes() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        cpu.write_mem(a, &0u32.to_le_bytes()).unwrap();
+        cpu.write_mem(a + 2, &0xbeefu16.to_le_bytes()).unwrap();
+        let n = run_scanf(&mut cpu, &mut kernel, "300", "%hd", &[a]);
+        assert_eq!(n, 1);
+        let lo = u16::from_le_bytes(cpu.read_mem(a, 2).unwrap().try_into().unwrap());
+        let hi = u16::from_le_bytes(cpu.read_mem(a + 2, 2).unwrap().try_into().unwrap());
+        assert_eq!(lo, 300);
+        assert_eq!(hi, 0xbeef, "%hd must not write past two bytes");
     }
 }
