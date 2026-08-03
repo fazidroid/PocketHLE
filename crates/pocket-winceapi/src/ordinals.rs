@@ -58,6 +58,11 @@ static ORDINAL_TABLES: Lazy<HashMap<String, HashMap<u16, String>>> = Lazy::new(|
 /// if the DLL or ordinal is unknown.
 pub fn lookup(dll: &str, ordinal: u16) -> Option<String> {
     let key = dll.to_ascii_lowercase();
+    // The OpenGL ES client libraries keep their tables in
+    // `pocket-gles`, next to the implementation they describe.
+    if pocket_gles::ordinals::is_gles_dll(&key) {
+        return pocket_gles::ordinals::lookup(&key, ordinal);
+    }
     ORDINAL_TABLES
         .get(&key)
         .and_then(|m| m.get(&ordinal).cloned())
@@ -65,10 +70,11 @@ pub fn lookup(dll: &str, ordinal: u16) -> Option<String> {
 
 /// Number of ordinal entries for `dll` — used by tests.
 pub fn entry_count(dll: &str) -> usize {
-    ORDINAL_TABLES
-        .get(&dll.to_ascii_lowercase())
-        .map(|m| m.len())
-        .unwrap_or(0)
+    let key = dll.to_ascii_lowercase();
+    if pocket_gles::ordinals::is_gles_dll(&key) {
+        return pocket_gles::ordinals::entry_count(&key);
+    }
+    ORDINAL_TABLES.get(&key).map(|m| m.len()).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -86,5 +92,22 @@ mod tests {
         // CRT-style helpers; exact name varies by build, so just
         // verify the lookup returns *something*.
         let _ = lookup("coredll.dll", 33);
+    }
+
+    #[test]
+    fn gles_ordinals_resolve_through_the_shared_resolver() {
+        // Games import libGLES_CL.dll purely by ordinal, so this path
+        // is what turns `#50` into `glDrawElements` for both the
+        // dispatcher and the logs.
+        assert_eq!(
+            lookup("libGLES_CL.dll", 50).as_deref(),
+            Some("glDrawElements")
+        );
+        assert_eq!(
+            lookup("libgles_cm.dll", 133).as_deref(),
+            Some("glTexImage2D")
+        );
+        assert_eq!(entry_count("libgles_cm.dll"), 140);
+        assert_eq!(entry_count("libgles_cl.dll"), 102);
     }
 }

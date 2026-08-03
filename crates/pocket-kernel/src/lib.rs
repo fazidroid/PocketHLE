@@ -697,6 +697,12 @@ pub struct KernelState {
     pub gx_last_pushed_counter: u64,
     /// Signature of sampled guest framebuffer rows from the last sync.
     pub gx_guest_signature: Option<u64>,
+    /// Guest addresses of the strings `glGetString` / `eglQueryString`
+    /// have handed out, keyed by the string itself. GL promises the
+    /// returned pointer stays valid for the life of the context, and
+    /// a renderer that queries `GL_EXTENSIONS` every frame would leak
+    /// the heap dry without this cache.
+    pub gles_strings: std::collections::HashMap<String, u32>,
     /// Number of synthetic `WM_PAINT` / `WM_TIMER` messages already
     /// fed to the guest. Used by `GetMessageW` / `PeekMessageW` to
     /// terminate the message loop after a configurable number of
@@ -1338,6 +1344,11 @@ impl Heap {
     }
 }
 
+/// Fake `HMODULE` for `libGLES_CM.dll`, the Common profile.
+pub const GLES_CM_MODULE_HANDLE: u32 = 0x1000_0004;
+/// Fake `HMODULE` for `libGLES_CL.dll`, the Common-Lite profile.
+pub const GLES_CL_MODULE_HANDLE: u32 = 0x1000_0005;
+
 /// The whole emulated process state owned by the kernel.
 fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>> {
     let mut exports = HashMap::new();
@@ -1345,6 +1356,11 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     let mut ddraw = HashMap::new();
     let mut gx = HashMap::new();
     let mut commctrl = HashMap::new();
+    // The OpenGL ES client libraries are imported purely by ordinal, so
+    // the `friendly_name` the dispatcher attached during load is the
+    // only thing that makes `GetProcAddress("glDrawElements")` work.
+    let mut gles_cm = HashMap::new();
+    let mut gles_cl = HashMap::new();
     for thunk in thunks {
         let name = match (&thunk.binding, &thunk.friendly_name) {
             (_, Some(name)) => name.clone(),
@@ -1370,6 +1386,19 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             } else if let Some(ord) = name.strip_prefix("ord:") {
                 commctrl.insert(format!("#{ord}"), thunk.thunk_va);
             }
+        } else if thunk.dll.eq_ignore_ascii_case("libgles_cm.dll")
+            || thunk.dll.eq_ignore_ascii_case("libgles_cl.dll")
+        {
+            let table = if thunk.dll.eq_ignore_ascii_case("libgles_cm.dll") {
+                &mut gles_cm
+            } else {
+                &mut gles_cl
+            };
+            table.insert(name.clone(), thunk.thunk_va);
+            if let ImportBinding::Ordinal(ord) = &thunk.binding {
+                table.insert(format!("#{ord}"), thunk.thunk_va);
+                table.insert(format!("ord:{ord}"), thunk.thunk_va);
+            }
         }
     }
     if !coredll.is_empty() {
@@ -1383,6 +1412,12 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
     }
     if !gx.is_empty() {
         exports.insert(0x1000_0001, gx);
+    }
+    if !gles_cm.is_empty() {
+        exports.insert(GLES_CM_MODULE_HANDLE, gles_cm);
+    }
+    if !gles_cl.is_empty() {
+        exports.insert(GLES_CL_MODULE_HANDLE, gles_cl);
     }
     exports
 }
@@ -1574,7 +1609,14 @@ impl Process {
         }
 
         let mut dynamic_exports_to_add = Vec::new();
-        for dll in ["coredll.dll", "commctrl.dll", "gx.dll", "ddraw.dll"] {
+        for dll in [
+            "coredll.dll",
+            "commctrl.dll",
+            "gx.dll",
+            "ddraw.dll",
+            "libgles_cm.dll",
+            "libgles_cl.dll",
+        ] {
             dynamic_exports_to_add.extend(
                 dispatcher
                     .dynamic_names(dll)
@@ -1771,6 +1813,7 @@ impl Process {
                 dib_decode_scratch: Vec::new(),
                 gx_last_pushed_counter: 0,
                 gx_guest_signature: None,
+                gles_strings: HashMap::new(),
                 synthetic_message_count: 0,
                 synthetic_message_budget: 240,
                 wnd_proc: 0,

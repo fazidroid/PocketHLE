@@ -20,6 +20,7 @@ pub mod coredll;
 pub mod ddraw;
 pub mod dlgtemplate;
 pub mod game_dlls;
+pub mod gles;
 pub mod gx;
 pub mod hss;
 pub mod ole32;
@@ -118,6 +119,7 @@ impl WinCeDispatcher {
         aygshell::register(&mut d);
         commctrl::register(&mut d);
         game_dlls::register(&mut d);
+        gles::register(&mut d);
         gx::register(&mut d);
         hss::register(&mut d);
         ole32::register(&mut d);
@@ -239,13 +241,21 @@ impl Dispatcher for WinCeDispatcher {
             .filter(|(registered_dll, _)| registered_dll == &dll_key)
             .map(|(_, name)| name.clone())
             .collect();
-        if dll_key == "coredll.dll" {
+        if dll_key == "coredll.dll" || pocket_gles::ordinals::is_gles_dll(&dll_key) {
             for ordinal in 0..=4095u16 {
-                if ordinals::lookup("coredll.dll", ordinal).is_some() {
+                if ordinals::lookup(&dll_key, ordinal).is_some() {
                     names.push(format!("ord:{ordinal}"));
                     names.push(format!("#{ordinal}"));
                 }
             }
+        }
+        // A GLES DLL exports every name in its ordinal table, whether or
+        // not we implement it. `GetProcAddress` returning non-null for
+        // an unimplemented entry point is what we want: the guest gets a
+        // thunk, and the call is logged when it fires instead of the
+        // guest silently taking a "driver too old" fallback path.
+        if pocket_gles::ordinals::is_gles_dll(&dll_key) {
+            names.extend(pocket_gles::ordinals::names_for(&dll_key));
         }
         names.sort();
         names.dedup();

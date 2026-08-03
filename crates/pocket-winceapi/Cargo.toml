@@ -25,6 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 pocket-cpu = { path = "../pocket-cpu" }
+pocket-gles = { path = "../pocket-gles" }
 pocket-kernel = { path = "../pocket-kernel", default-features = false }
 pocket-pe = { path = "../pocket-pe" }
 
