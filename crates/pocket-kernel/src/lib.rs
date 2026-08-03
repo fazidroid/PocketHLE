@@ -56,6 +56,14 @@ pub const THUNK_REGION_BASE: u32 = 0x7000_0000;
 /// instructions, so 32 bytes (8 instructions) is plenty and keeps
 /// every thunk on a 32-byte cache line.
 pub const THUNK_STRIDE: u32 = 32;
+/// Base of the WinCE "slot 0" process view. Images based above this
+/// address are additionally aliased here, because WinCE ARM CRT
+/// startup code addresses itself through slot-relative pointers.
+/// Images already based at [`SLOT_ALIAS_BASE`] need no alias — the
+/// real section mapping *is* the slot view.
+pub const SLOT_ALIAS_BASE: u32 = 0x0001_0000;
+/// Size of the slot-0 alias window (128 KiB).
+pub const SLOT_ALIAS_SIZE: u32 = 0x0002_0000;
 /// Default stack size (256 KiB).
 pub const DEFAULT_STACK_SIZE: u32 = 0x40000;
 /// Default top of stack — chosen so that ARM-style descending stacks
@@ -1444,6 +1452,40 @@ impl Process {
             );
         }
 
+        // WinCE ARM images also address their process-slot view through
+        // low slot-relative pointers during CRT startup.
+        //
+        // Only worth aliasing when the image is based *above* slot 0.
+        // An image based at 0x10000 (the default for Windows Mobile
+        // EXEs) already has its sections mapped exactly where the
+        // slot-relative view would put them, so the alias would be the
+        // identity — and `mem_map` fails outright on the overlap,
+        // which is what used to abort the load for any image whose
+        // sections reach past 0x30000 (COD2's `.data` alone is 3 MiB).
+        let slot_alias_end = SLOT_ALIAS_BASE + SLOT_ALIAS_SIZE;
+        let image_overlaps_slot = image.sections.iter().any(|s| {
+            let start = image.image_base.saturating_add(s.virtual_address);
+            let size = pocket_cpu::round_up_to_page(s.virtual_size.max(s.data.len() as u32));
+            start < slot_alias_end && start.saturating_add(size) > SLOT_ALIAS_BASE
+        });
+        let slot_alias_mapped = !image_overlaps_slot;
+        if slot_alias_mapped {
+            cpu.map_region(
+                SLOT_ALIAS_BASE,
+                SLOT_ALIAS_SIZE,
+                Prot::READ | Prot::WRITE | Prot::EXEC,
+            )?;
+            for section in &image.sections {
+                let alias = SLOT_ALIAS_BASE.saturating_add(section.virtual_address);
+                let size = pocket_cpu::round_up_to_page(
+                    section.virtual_size.max(section.data.len() as u32),
+                );
+                if alias >= SLOT_ALIAS_BASE && alias.saturating_add(size) <= slot_alias_end {
+                    cpu.write_mem(alias, &section.data)?;
+                }
+            }
+        }
+
         // 2. Allocate a thunk pool and patch the IAT to point into it.
         let thunk_count = image.imports.len() as u32;
         let thunk_size = pocket_cpu::round_up_to_page(thunk_count * THUNK_STRIDE).max(0x1000);
@@ -1523,6 +1565,10 @@ impl Process {
             let mut iat_bytes = [0u8; 4];
             LittleEndian::write_u32(&mut iat_bytes, thunk_va);
             cpu.write_mem(imp.iat_va, &iat_bytes)?;
+            let alias_iat = SLOT_ALIAS_BASE.wrapping_add(imp.iat_va.wrapping_sub(image.image_base));
+            if slot_alias_mapped && (SLOT_ALIAS_BASE..slot_alias_end).contains(&alias_iat) {
+                cpu.write_mem(alias_iat, &iat_bytes)?;
+            }
             thunks.push(thunk);
             thunk_by_va.insert(thunk_va, i);
         }
@@ -2290,6 +2336,130 @@ mod tests {
         let _ = h.alloc(60).unwrap();
         // Header overhead leaves only ~52 bytes free; 60 should fail.
         assert!(h.alloc(60).is_none());
+    }
+
+    /// A `StubCpu` that rejects overlapping `map_region` calls, the way
+    /// `unicorn`'s `mem_map` does (`UC_ERR_MAP`). `StubCpu` itself is
+    /// tolerant — it merges overlapping ranges into its page map — so a
+    /// loader bug that double-maps an address range is invisible to it.
+    /// That is exactly how the slot-0 alias collision reached a release
+    /// build: every unit test passed while real ARM images based at
+    /// `0x10000` failed to load at all.
+    struct StrictMapCpu {
+        inner: StubCpu,
+        mapped: Vec<(u32, u32)>,
+    }
+
+    impl StrictMapCpu {
+        fn new() -> Self {
+            Self {
+                inner: StubCpu::new(),
+                mapped: Vec::new(),
+            }
+        }
+    }
+
+    impl Cpu for StrictMapCpu {
+        fn arch(&self) -> Arch {
+            self.inner.arch()
+        }
+
+        fn map_region(&mut self, va: u32, size: u32, prot: Prot) -> Result<(), CpuError> {
+            let end = va.saturating_add(size);
+            for (s, e) in &self.mapped {
+                if va < *e && end > *s {
+                    return Err(CpuError::Backend(format!(
+                        "mem_map: MAP (0x{va:08x}..0x{end:08x} overlaps 0x{s:08x}..0x{e:08x})"
+                    )));
+                }
+            }
+            self.mapped.push((va, end));
+            self.inner.map_region(va, size, prot)
+        }
+
+        fn write_mem(&mut self, va: u32, data: &[u8]) -> Result<(), CpuError> {
+            self.inner.write_mem(va, data)
+        }
+
+        fn read_mem(&mut self, va: u32, len: u32) -> Result<Vec<u8>, CpuError> {
+            self.inner.read_mem(va, len)
+        }
+
+        fn read_reg(&mut self, reg: pocket_cpu::regs::ArmReg) -> Result<u32, CpuError> {
+            self.inner.read_reg(reg)
+        }
+
+        fn write_reg(&mut self, reg: pocket_cpu::regs::ArmReg, value: u32) -> Result<(), CpuError> {
+            self.inner.write_reg(reg, value)
+        }
+
+        fn add_code_hook(&mut self, va: u32) -> Result<(), CpuError> {
+            self.inner.add_code_hook(va)
+        }
+
+        fn run_until_hook(
+            &mut self,
+            start_va: u32,
+            max_instructions: u64,
+        ) -> Result<StopReason, CpuError> {
+            self.inner.run_until_hook(start_va, max_instructions)
+        }
+
+        fn request_stop(&mut self) {
+            self.inner.request_stop()
+        }
+    }
+
+    fn image_based_at(image_base: u32, text_size: u32) -> LoadedImage {
+        LoadedImage {
+            source_path: "test".into(),
+            machine: pocket_pe::machine::ARM,
+            subsystem: pocket_pe::subsystem::WINDOWS_CE_GUI,
+            image_base,
+            size_of_image: text_size + 0x1000,
+            entry_point: 0x1000,
+            sections: vec![LoadedSection {
+                name: ".text".into(),
+                virtual_address: 0x1000,
+                virtual_size: text_size,
+                characteristics: 0x6000_0020,
+                data: vec![0u8; text_size as usize],
+            }],
+            imports: vec![],
+            exports: IndexMap::new(),
+            resources: vec![],
+            managed_runtime: None,
+        }
+    }
+
+    /// Regression test for the slot-0 alias collision. A standard
+    /// Windows Mobile EXE is based at `0x10000` — the same address as
+    /// the slot alias window — and its sections may extend well past
+    /// the 128 KiB window (Call of Duty 2's `.data` alone is 3 MiB).
+    /// Mapping the alias unconditionally made `mem_map` fail and
+    /// aborted the load for every such image.
+    #[test]
+    fn image_based_in_slot_zero_does_not_double_map() {
+        // 3 MiB of .text, comfortably past the 0x30000 alias end.
+        let img = image_based_at(0x10000, 0x30_0000);
+        let mut cpu = StrictMapCpu::new();
+        let p = Process::map_into(img, &mut cpu, &|_, _| None, &NullDispatcher)
+            .expect("an image based at 0x10000 must load without an alias collision");
+        assert_eq!(p.image.entry_va(), 0x11000);
+    }
+
+    /// An image based *above* slot 0 still gets the alias window, since
+    /// its CRT startup addresses itself through slot-relative pointers
+    /// and nothing is mapped at `0x10000` to collide with.
+    #[test]
+    fn image_based_above_slot_zero_still_gets_alias() {
+        let img = image_based_at(0x40_0000, 0x2000);
+        let mut cpu = StrictMapCpu::new();
+        Process::map_into(img, &mut cpu, &|_, _| None, &NullDispatcher)
+            .expect("an image based above slot 0 must still load");
+        // The alias window is present and readable.
+        cpu.read_mem(SLOT_ALIAS_BASE + 0x1000, 4)
+            .expect("slot alias window must be mapped for a high-based image");
     }
 
     #[test]
