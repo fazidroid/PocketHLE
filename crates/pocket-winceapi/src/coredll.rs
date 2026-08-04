@@ -4312,9 +4312,8 @@ fn write_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn flush_file_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let handle = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0(u32::from(
-        ctx.kernel.vfs.is_open(handle),
-    )))
+    let ok = ctx.kernel.vfs.flush(handle).is_ok();
+    Ok(DispatchOutcome::ReturnedR0(u32::from(ok)))
 }
 
 fn close_handle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -4438,7 +4437,9 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
     let create = mode.starts_with('w') || mode.starts_with('a') || mode.contains('+');
     // Pocket PC games sometimes pass `Game/data.bin` without a leading
     // backslash; the VFS expects `\Game\…`. Try both spellings so the
-    // ROM lookup succeeds.
+    // ROM lookup succeeds. Writable paths must try the rooted form
+    // first so the writable save overlay wins over broader read-only
+    // mounts such as `\Application\`.
     let normalized = path.replace('/', "\\").trim_start_matches('\\').to_string();
     let normalized_lower = normalized.to_ascii_lowercase();
     let without_program_files = normalized
@@ -4450,21 +4451,28 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
                 .unwrap_or(0)..,
         )
         .unwrap_or(&normalized);
-    let mut candidates = vec![
-        normalized.clone(),
-        format!("\\{without_program_files}"),
-        if normalized.starts_with('\\') {
-            normalized.clone()
-        } else {
-            format!("\\{normalized}")
-        },
+    let rooted = format!("\\{normalized}");
+    let mut candidates = if create {
+        vec![
+            rooted.clone(),
+            format!("\\{without_program_files}"),
+            normalized.clone(),
+        ]
+    } else {
+        vec![
+            normalized.clone(),
+            format!("\\{without_program_files}"),
+            rooted.clone(),
+        ]
+    };
+    candidates.extend([
         format!("\\Application\\{normalized}"),
         format!("\\Program Files\\{normalized}"),
         format!("\\Program Files\\OmniGSoft\\MiniKayak1.1\\{normalized}"),
         format!("\\Program Files\\OmniGSoft\\MiniKayak1.1\\resources\\{normalized}"),
         format!("\\Program Files\\Game\\{normalized}"),
         format!("\\Program Files\\Atomic Dreams\\{normalized}"),
-    ];
+    ]);
     // Last resort: look for the bare file name in every mount root.
     //
     // A game usually hard-codes the install directory a real setup.exe

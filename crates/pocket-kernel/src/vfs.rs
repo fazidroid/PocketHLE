@@ -283,7 +283,13 @@ impl Vfs {
                 .matching_mounts(&normalised)
                 .into_iter()
                 .find(|mount| !mount.read_only)?;
-            self.host_path_for_mount(mount, &normalised)?
+            let path = self.host_path_for_mount(mount, &normalised)?;
+            if create {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+            }
+            path
         };
         let mut opts = OpenOptions::new();
         match access {
@@ -408,6 +414,28 @@ mod tests {
         v.mount_read_only("\\Rom\\", dir.path());
         assert!(v.open("\\Rom\\data.bin", Access::Read, false).is_some());
         assert!(v.open("\\Rom\\new.bin", Access::Write, true).is_none());
+    }
+
+    #[test]
+    fn writable_open_creates_nested_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\Save\\", dir.path());
+        let h = v
+            .open(
+                "\\Save\\My Documents\\My Saved Games\\settings.pdb",
+                Access::Write,
+                true,
+            )
+            .unwrap();
+        let host_path = v
+            .resolve("\\Save\\My Documents\\My Saved Games\\settings.pdb")
+            .unwrap();
+        assert!(host_path.ends_with("my documents/my saved games/settings.pdb"));
+        assert_eq!(v.write(h, b"settings"), Some(8));
+        v.flush(h).unwrap();
+        v.close(h);
+        assert_eq!(std::fs::read(host_path).unwrap(), b"settings");
     }
 
     #[test]
