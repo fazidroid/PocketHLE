@@ -34,9 +34,9 @@ use pocket_kernel::msgbox::MessageBox;
 use pocket_kernel::{
     module_file_name, CreateStage, DispatchOutcome, GuestCallFrame, GuestThread, InputEvent,
     KernelError, KernelState, LoadedModule, ModalDialog, QsortFrame, VectorIterFrame,
-    WaveCallbackKind, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE, MODULE_REGION_END,
-    MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
-    USER_KDATA_TLS_ARRAY_VA,
+    WaveCallbackKind, DEFAULT_STACK_TOP, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE,
+    MODULE_REGION_END, MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE, SLOT_ALIAS_BASE,
+    THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
 };
 use pocket_pe::{ResourceEntry, ResourceKey};
 
@@ -524,6 +524,11 @@ pub fn register(d: &mut WinCeDispatcher) {
 
     // ---- GDI (real, framebuffer-backed) ----
     d.register_handler(dll, "GetDC", get_dc);
+    // Same DC: this HLE has one screen surface and no non-client area to
+    // distinguish. An EGL/GL renderer asks for the window DC to build
+    // its surface, and a NULL here reads as "no display" and aborts
+    // start-up.
+    d.register_handler(dll, "GetWindowDC", get_dc);
     d.register_constant(dll, "ReleaseDC", 1, one_returning);
     d.register_handler(dll, "BeginPaint", begin_paint);
     d.register_handler(dll, "EndPaint", end_paint);
@@ -4561,6 +4566,13 @@ fn crt_wfopen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let name = String::from_utf16_lossy(&name_w);
     let mode = String::from_utf16_lossy(&mode_w);
     let h = open_cstr_path(ctx, &name, &mode);
+    // Same reasoning as `crt_fopen`: a NULL `FILE*` surfaces as a hang
+    // or a bail-out far from the open, so name the path that missed.
+    if h == 0 {
+        log::debug!("_wfopen({name:?}, {mode:?}) -> NULL");
+    } else {
+        log::trace!("_wfopen({name:?}, {mode:?}) -> 0x{h:08x}");
+    }
     Ok(DispatchOutcome::ReturnedR0(h))
 }
 
@@ -5009,7 +5021,24 @@ fn get_process_heap(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 
 fn virtual_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect)
+    let addr = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
+
+    // The reserve/commit split does not exist here: a reservation is
+    // already backed by real heap memory. So a commit naming an address
+    // inside a live reservation has nothing left to do and must hand
+    // that same address back. Allocating a second block instead would
+    // double the guest's footprint — a game that reserves 29 MB and
+    // then commits it would consume 58 MB and exhaust the heap on its
+    // next request.
+    if addr != 0 {
+        let base = ctx.kernel.heap.base();
+        let end = base.saturating_add(ctx.kernel.heap.size());
+        let fits = addr >= base && addr.checked_add(size).is_some_and(|a| a <= end);
+        if fits {
+            return Ok(DispatchOutcome::ReturnedR0(addr));
+        }
+    }
     do_alloc(ctx, size)
 }
 
@@ -9489,18 +9518,34 @@ fn enum_display_settings(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 /// 240-pixel-wide framebuffer, so a third of every frame was clipped
 /// away.
 ///
-/// We honour two spellings of the request: an explicit
-/// `dmPelsWidth`/`dmPelsHeight` mode, and `DM_DISPLAYORIENTATION`
-/// (`DMDO_90` / `DMDO_270` mean "swap the axes").
+/// Three spellings of the request are honoured: an explicit
+/// `dmPelsWidth`/`dmPelsHeight` mode, Windows CE's
+/// `DM_DISPLAYORIENTATION` (`dmDisplayOrientation` at the *end* of
+/// `DEVMODEW`, not the desktop `dmOrientation` printer field), and the
+/// CE-only `DM_DISPLAYQUERYORIENTATION` probe that asks which
+/// orientations the driver can do before requesting one. Xtrakt sends
+/// the probe first and, when the answer is "none", gives up on rotating
+/// and draws its landscape layout sideways into the portrait panel.
 fn change_display_settings_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     const DM_PELSWIDTH_FLAG: u32 = 0x0008_0000;
     const DM_PELSHEIGHT_FLAG: u32 = 0x0010_0000;
-    const DM_DISPLAYORIENTATION_FLAG: u32 = 0x0000_0080;
+    /// CE-only: "rotate to `dmDisplayOrientation`".
+    const DM_DISPLAYORIENTATION_FLAG: u32 = 0x0080_0000;
+    /// CE-only: "report the rotations you support, do not change mode".
+    const DM_DISPLAYQUERYORIENTATION_FLAG: u32 = 0x0100_0000;
     // Offsets inside `DEVMODEW` (see `enum_display_settings`).
     const OFF_FIELDS: u32 = 72;
-    const OFF_ORIENTATION: u32 = 76;
     const OFF_PELSWIDTH: u32 = 172;
     const OFF_PELSHEIGHT: u32 = 176;
+    /// `dmDisplayOrientation`, the last DWORD of CE's 192-byte DEVMODEW.
+    const OFF_DISPLAYORIENTATION: u32 = 188;
+    /// CE's `DMDO_*` are chosen so a driver can OR them into a
+    /// capability mask: 90=1, 180=2, 270=4, with 0 meaning upright.
+    const DMDO_0: u32 = 0;
+    const DMDO_90: u32 = 1;
+    const DMDO_270: u32 = 4;
+    /// "Report whether this mode is possible, but do not apply it."
+    const CDS_TEST: u32 = 0x0000_0002;
     /// Refuse absurd modes; a bad DEVMODE would otherwise allocate
     /// gigabytes for the panel.
     const MAX_EDGE: u32 = 2048;
@@ -9511,7 +9556,31 @@ fn change_display_settings_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, 
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let fields = read_u32(ctx, dm + OFF_FIELDS)?;
+    let flags = ctx.arg_u32(3)?;
     let (cur_w, cur_h) = screen_dims(ctx);
+
+    if fields & DM_DISPLAYQUERYORIENTATION_FLAG != 0 {
+        // We can present any rotation, because rotating is only a
+        // matter of what shape we hand the guest — it draws in the
+        // rotated coordinate system itself.
+        let caps = (DMDO_90 | 2 | DMDO_270).to_le_bytes();
+        ctx.cpu.write_mem(dm + OFF_DISPLAYORIENTATION, &caps)?;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    // `CDS_TEST` with `DM_DISPLAYORIENTATION` is a read, not a write:
+    // the driver reports the orientation currently in effect and
+    // changes nothing. Xtrakt uses it to decide whether it needs to
+    // un-rotate the panel before drawing, so answering with the
+    // capability mask left over from the probe above would send it
+    // chasing a rotation that never happened.
+    if fields & DM_DISPLAYORIENTATION_FLAG != 0 && flags & CDS_TEST != 0 {
+        // The emulated panel is never rotated out from under the guest.
+        ctx.cpu
+            .write_mem(dm + OFF_DISPLAYORIENTATION, &DMDO_0.to_le_bytes())?;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
     let mut want: Option<(u32, u32)> = None;
 
     if fields & (DM_PELSWIDTH_FLAG | DM_PELSHEIGHT_FLAG) != 0 {
@@ -9522,9 +9591,8 @@ fn change_display_settings_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, 
         }
     }
     if want.is_none() && fields & DM_DISPLAYORIENTATION_FLAG != 0 {
-        // DMDO_DEFAULT=0, DMDO_90=1, DMDO_180=2, DMDO_270=3.
-        let orientation = read_u32(ctx, dm + OFF_ORIENTATION)? & 0xffff;
-        let landscape = matches!(orientation, 1 | 3);
+        let orientation = read_u32(ctx, dm + OFF_DISPLAYORIENTATION)?;
+        let landscape = matches!(orientation, DMDO_90 | DMDO_270);
         let (long_edge, short_edge) = if cur_w >= cur_h {
             (cur_w, cur_h)
         } else {
@@ -9787,17 +9855,36 @@ fn tls_set_value(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `GetSystemInfo(LPSYSTEM_INFO)`.
+///
+/// `SYSTEM_INFO` has no `dwLength` — the first member is the union
+/// `{ DWORD dwOemId; WORD wProcessorArchitecture, wReserved; }`. Laying
+/// it out as if a length came first shifts every later field by four
+/// bytes, which leaves `dwAllocationGranularity` reading as zero.
+/// Allocators size their pools by rounding up to that granularity, so a
+/// zero makes the round-up collapse to nothing and the pool base ends up
+/// a small integer — the guest then writes through it and faults on a
+/// near-null address rather than reporting out of memory.
 fn get_system_info(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let p = ctx.arg_u32(0)?;
     if p != 0 {
         let mut data = [0u8; 36];
-        data[0..4].copy_from_slice(&36u32.to_le_bytes());
-        data[4..8].copy_from_slice(&1u32.to_le_bytes());
-        data[8..12].copy_from_slice(&1u32.to_le_bytes());
-        data[12..16].copy_from_slice(&5u32.to_le_bytes());
-        data[16..20].copy_from_slice(&0u32.to_le_bytes());
-        data[20..24].copy_from_slice(&1u32.to_le_bytes());
-        data[24..28].copy_from_slice(&4096u32.to_le_bytes());
+        // wProcessorArchitecture = PROCESSOR_ARCHITECTURE_ARM (5),
+        // wReserved = 0.
+        data[0..2].copy_from_slice(&5u16.to_le_bytes());
+        data[2..4].copy_from_slice(&0u16.to_le_bytes());
+        data[4..8].copy_from_slice(&4096u32.to_le_bytes()); // dwPageSize
+        data[8..12].copy_from_slice(&SLOT_ALIAS_BASE.to_le_bytes()); // lpMinimumApplicationAddress
+        data[12..16].copy_from_slice(&DEFAULT_STACK_TOP.to_le_bytes()); // lpMaximumApplicationAddress
+        data[16..20].copy_from_slice(&1u32.to_le_bytes()); // dwActiveProcessorMask
+        data[20..24].copy_from_slice(&1u32.to_le_bytes()); // dwNumberOfProcessors
+                                                           // dwProcessorType = PROCESSOR_STRONGARM.
+        data[24..28].copy_from_slice(&2577u32.to_le_bytes());
+        // dwAllocationGranularity: WinCE reserves virtual memory in 64K
+        // blocks, and guests use this to size their own pools.
+        data[28..32].copy_from_slice(&65536u32.to_le_bytes());
+        data[32..34].copy_from_slice(&4u16.to_le_bytes()); // wProcessorLevel
+        data[34..36].copy_from_slice(&0u16.to_le_bytes()); // wProcessorRevision
         ctx.cpu.write_mem(p, &data)?;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
