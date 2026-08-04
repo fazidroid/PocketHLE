@@ -90,6 +90,10 @@ impl Framebuffer {
         self.frame_counter = self.frame_counter.wrapping_add(1);
     }
 
+    pub fn is_all_black(&self) -> bool {
+        self.pixels.iter().all(|&pixel| pixel == 0)
+    }
+
     /// Fill the entire framebuffer with one RGB565 value.
     pub fn fill(&mut self, color: u16) {
         // The framebuffer is canonically two-byte-aligned (we always

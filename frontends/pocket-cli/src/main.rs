@@ -991,6 +991,7 @@ struct DumpFrameHook {
     written: u64,
     max_frames: u64,
     stride: u64,
+    saw_non_black: bool,
 }
 
 impl DumpFrameHook {
@@ -1002,6 +1003,7 @@ impl DumpFrameHook {
             written: 0,
             max_frames,
             stride: stride.max(1),
+            saw_non_black: false,
         }
     }
 }
@@ -1016,6 +1018,10 @@ impl pocket_core::kernel::FrameHook for DumpFrameHook {
             return pocket_core::kernel::FrameAction::Continue;
         }
         self.last_dumped_frame = counter;
+        if state.framebuffer.is_all_black() && self.saw_non_black {
+            return pocket_core::kernel::FrameAction::Continue;
+        }
+        self.saw_non_black = !state.framebuffer.is_all_black();
         let index = self.seen;
         self.seen += 1;
         if !index.is_multiple_of(self.stride) {

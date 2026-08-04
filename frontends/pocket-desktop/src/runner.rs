@@ -164,9 +164,10 @@ impl Runner {
             Err(e) => summary_lines.push(format!("Emulator stopped: {e:#}")),
         }
 
-        let framebuffer = emu
-            .process()
-            .map(|p| FrameSnapshot::from_framebuffer(&p.state.framebuffer));
+        let framebuffer = emu.process().and_then(|p| {
+            (!p.state.framebuffer.is_all_black())
+                .then(|| FrameSnapshot::from_framebuffer(&p.state.framebuffer))
+        });
         RunOutcome {
             summary: summary_lines.join("\n"),
             framebuffer,
@@ -264,6 +265,7 @@ struct RunHook {
     /// outgoing `Vec<u8>` so we keep amortising the same allocation
     /// for the entire run instead of growing one per delivered frame.
     scratch: Vec<u8>,
+    saw_non_black: bool,
 }
 
 impl RunHook {
@@ -279,6 +281,7 @@ impl RunHook {
             input_disconnected: false,
             last_emit_at: None,
             scratch: Vec::new(),
+            saw_non_black: false,
         }
     }
 }
@@ -315,6 +318,15 @@ impl FrameHook for RunHook {
             if let Some(tx) = self.frame_tx.as_ref() {
                 let counter = state.framebuffer.frame_counter;
                 if counter != self.last_frame {
+                    if state.framebuffer.is_all_black() && self.saw_non_black {
+                        return if stop_requested {
+                            state.should_stop = true;
+                            FrameAction::Stop
+                        } else {
+                            FrameAction::Continue
+                        };
+                    }
+                    self.saw_non_black = !state.framebuffer.is_all_black();
                     let now = Instant::now();
                     let due = self
                         .last_emit_at
