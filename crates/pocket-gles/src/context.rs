@@ -717,6 +717,7 @@ impl Context {
     }
 
     pub fn set_fog(&mut self, pname: u32, value: f32) {
+        log::debug!("GLES fog scalar pname=0x{pname:04x} value={value:.6}",);
         match pname {
             GL_FOG_MODE => {
                 // GL_LINEAR and GL_EXP share numeric space with other
@@ -736,6 +737,15 @@ impl Context {
             GL_FOG_END => self.state.fog_end = value,
             _ => self.set_error(GL_INVALID_ENUM),
         }
+        log::debug!(
+            "GLES fog state mode={:?} density={:.6} start={:.6} end={:.6} color={:?} enabled={}",
+            self.state.fog_mode,
+            self.state.fog_density,
+            self.state.fog_start,
+            self.state.fog_end,
+            self.state.fog_color,
+            self.state.fog,
+        );
     }
 
     pub fn set_viewport(&mut self, x: i32, y: i32, w: i32, h: i32) {

@@ -26,7 +26,8 @@ pub struct Vertex {
     pub color: [f32; 4],
     /// Texture coordinates for unit 0.
     pub texcoord: [f32; 2],
-    /// Eye-space distance used for fog, already made positive.
+    /// Eye-space Z used for fog. OpenGL defines fog distance from the
+    /// eye-space depth, not clip-space or NDC Z.
     pub fog_depth: f32,
 }
 
@@ -697,6 +698,8 @@ fn apply_tex_env(state: &PipelineState, frag: [f32; 4], tex: [f32; 4]) -> [f32; 
 
 /// Fog blend factor: 1.0 means fully unfogged.
 fn fog_factor(state: &PipelineState, depth: f32) -> f32 {
+    let depth = depth.max(0.0);
+    let density = state.fog_density.max(0.0);
     let f = match state.fog_mode {
         FogMode::Linear => {
             let span = state.fog_end - state.fog_start;
@@ -706,9 +709,9 @@ fn fog_factor(state: &PipelineState, depth: f32) -> f32 {
                 (state.fog_end - depth) / span
             }
         }
-        FogMode::Exp => (-state.fog_density * depth).exp(),
+        FogMode::Exp => (-density * depth).exp(),
         FogMode::Exp2 => {
-            let d = state.fog_density * depth;
+            let d = density * depth;
             (-(d * d)).exp()
         }
     };
@@ -1061,6 +1064,24 @@ mod tests {
         }
         draw_triangle(&mut t, &s, &no_texture, tri);
         assert_eq!(pixel(&t, 2, 317), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn exponential_fog_is_unfogged_at_zero_depth() {
+        let mut s = PipelineState::default();
+        s.fog_mode = FogMode::Exp;
+        s.fog_density = 0.25;
+        assert_eq!(fog_factor(&s, 0.0), 1.0);
+        assert_eq!(fog_factor(&s, -10.0), 1.0);
+        assert!((fog_factor(&s, 4.0) - (-1.0f32).exp()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn exp2_fog_uses_density_squared_in_the_exponent() {
+        let mut s = PipelineState::default();
+        s.fog_mode = FogMode::Exp2;
+        s.fog_density = 0.5;
+        assert!((fog_factor(&s, 2.0) - (-1.0f32).exp()).abs() < 1e-6);
     }
 
     #[test]

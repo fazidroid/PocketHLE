@@ -230,12 +230,18 @@ fn gl_orthox(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn gl_enable(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let cap = ctx.arg_u32(0)?;
+    if cap == pocket_gles::GL_FOG {
+        log::debug!("GLES enable fog");
+    }
     with_ctx(|c| c.set_capability(cap, true));
     Ok(VOID)
 }
 
 fn gl_disable(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let cap = ctx.arg_u32(0)?;
+    if cap == pocket_gles::GL_FOG {
+        log::debug!("GLES disable fog");
+    }
     with_ctx(|c| c.set_capability(cap, false));
     Ok(VOID)
 }
@@ -377,9 +383,19 @@ fn fog_vector(
     for (i, c) in bytes.chunks_exact(4).enumerate() {
         v[i] = decode(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
     }
+    log::debug!("GLES fog vector pname=0x{pname:04x} ptr=0x{ptr:08x} values={v:?}",);
     with_ctx(|c| {
         if pname == pocket_gles::GL_FOG_COLOR {
             c.state.fog_color = v;
+            log::debug!(
+                "GLES fog state mode={:?} density={:.6} start={:.6} end={:.6} color={:?} enabled={}",
+                c.state.fog_mode,
+                c.state.fog_density,
+                c.state.fog_start,
+                c.state.fog_end,
+                c.state.fog_color,
+                c.state.fog,
+            );
         } else {
             c.set_fog(pname, v[0]);
         }
