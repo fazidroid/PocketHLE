@@ -402,6 +402,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "SetActiveWindow", FAKE_HWND, one_returning);
     d.register_handler(dll, "GetKeyState", get_key_state);
     d.register_handler(dll, "GetAsyncKeyState", get_async_key_state);
+    d.register_handler(dll, "keybd_event", keybd_event);
     d.register_handler(dll, "GetFocus", get_focus);
     d.register_handler(dll, "GetCapture", get_capture);
     d.register_constant(dll, "SetCapture", FAKE_HWND, one_returning);
@@ -6172,6 +6173,22 @@ fn get_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 fn get_async_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let vk = ctx.arg_u32(0)?;
     Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk)))
+}
+
+fn keybd_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    let vk = ctx.arg_u32(0)? as u16;
+    let flags = ctx.arg_u32(2)?;
+    let event = if flags & KEYEVENTF_KEYUP != 0 {
+        InputEvent::KeyUp { vk }
+    } else {
+        InputEvent::KeyDown { vk }
+    };
+    if ctx.kernel.pending_input.len() < 256 {
+        ctx.kernel.pending_input.push_back(event);
+    }
+    log::debug!("keybd_event(vk=0x{vk:02x}, flags=0x{flags:08x}) -> {event:?}");
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 /// `HWND GetFocus()` — the focused control if the user has tapped one,
