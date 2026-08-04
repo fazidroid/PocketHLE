@@ -26,6 +26,14 @@ use crate::{CallCtx, WinCeDispatcher};
 
 static CTX: Lazy<Mutex<Context>> = Lazy::new(|| Mutex::new(Context::new(240, 320)));
 
+/// Compressed formats we decode, reported through
+/// `GL_COMPRESSED_TEXTURE_FORMATS` and the extension string.
+const COMPRESSED_FORMATS: [u32; 3] = [
+    pocket_gles::GL_ATC_RGB_AMD,
+    pocket_gles::GL_ATC_RGBA_EXPLICIT_ALPHA_AMD,
+    pocket_gles::GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD,
+];
+
 /// Thin wrapper so `pocket_cpu::Cpu` satisfies `GuestMemory`.
 struct CpuMem<'a>(&'a mut dyn pocket_cpu::Cpu);
 
@@ -351,24 +359,39 @@ fn gl_scissor(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(VOID)
 }
 
+/// Decode one `glFog*` value word.
+///
+/// `GL_FOG_MODE` names an enum, and enums are never fixed-point. Running
+/// `GL_LINEAR` (9729) through the 16.16 decode yields 0.148453, which
+/// `set_fog` rightly rejects as an invalid enum — and because `glGetError`
+/// reports the *first* error since the last check, that stray code then
+/// fails whatever the guest was actually probing. The `f` entry points
+/// need no exception: they already carry the enum as a float.
+fn fog_value(pname: u32, word: u32, fixed: bool) -> f32 {
+    match (fixed, pname) {
+        (true, pocket_gles::GL_FOG_MODE) => word as f32,
+        (true, _) => word_to_f32(word),
+        (false, _) => word_to_f32_bits(word),
+    }
+}
+
 fn gl_fogf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let (p, v) = (ctx.arg_u32(0)?, argf(ctx, 1)?);
+    let (p, w) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
+    let v = fog_value(p, w, false);
     with_ctx(|c| c.set_fog(p, v));
     Ok(VOID)
 }
 
 fn gl_fogx(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let (p, v) = (ctx.arg_u32(0)?, argx(ctx, 1)?);
+    let (p, w) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
+    let v = fog_value(p, w, true);
     with_ctx(|c| c.set_fog(p, v));
     Ok(VOID)
 }
 
 /// `glFogfv` / `glFogxv`. Only `GL_FOG_COLOR` needs the vector form;
 /// the scalar parameters are forwarded to `set_fog` from element 0.
-fn fog_vector(
-    ctx: &mut CallCtx<'_>,
-    decode: fn(u32) -> f32,
-) -> Result<DispatchOutcome, KernelError> {
+fn fog_vector(ctx: &mut CallCtx<'_>, fixed: bool) -> Result<DispatchOutcome, KernelError> {
     let pname = ctx.arg_u32(0)?;
     let ptr = ctx.arg_u32(1)?;
     let count = if pname == pocket_gles::GL_FOG_COLOR {
@@ -381,7 +404,7 @@ fn fog_vector(
     };
     let mut v = [0f32; 4];
     for (i, c) in bytes.chunks_exact(4).enumerate() {
-        v[i] = decode(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        v[i] = fog_value(pname, u32::from_le_bytes([c[0], c[1], c[2], c[3]]), fixed);
     }
     log::debug!("GLES fog vector pname=0x{pname:04x} ptr=0x{ptr:08x} values={v:?}",);
     with_ctx(|c| {
@@ -404,11 +427,11 @@ fn fog_vector(
 }
 
 fn gl_fogfv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    fog_vector(ctx, f32::from_bits)
+    fog_vector(ctx, false)
 }
 
 fn gl_fogxv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    fog_vector(ctx, word_to_f32)
+    fog_vector(ctx, true)
 }
 
 // ---- clear and current values ----------------------------------------------
@@ -503,12 +526,9 @@ fn gl_vertex_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
         ctx.arg_u32(2)?,
         ctx.arg_u32(3)?,
     );
-    with_ctx(|c| {
-        c.vertex_array.size = size;
-        c.vertex_array.ty = ty;
-        c.vertex_array.stride = stride;
-        c.vertex_array.pointer = ptr;
-    });
+    // GL ES 1.1 captures the ARRAY_BUFFER binding here, not at draw
+    // time, so each array remembers the VBO it was set against.
+    with_ctx(|c| c.set_vertex_pointer(size, ty, stride, ptr));
     Ok(VOID)
 }
 
@@ -519,12 +539,7 @@ fn gl_color_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
         ctx.arg_u32(2)?,
         ctx.arg_u32(3)?,
     );
-    with_ctx(|c| {
-        c.color_array.size = size;
-        c.color_array.ty = ty;
-        c.color_array.stride = stride;
-        c.color_array.pointer = ptr;
-    });
+    with_ctx(|c| c.set_color_pointer(size, ty, stride, ptr));
     Ok(VOID)
 }
 
@@ -549,10 +564,7 @@ fn gl_tex_coord_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
 fn gl_normal_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let (ty, stride, ptr) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?, ctx.arg_u32(2)?);
     with_ctx(|c| {
-        c.normal_array.size = 3;
-        c.normal_array.ty = ty;
-        c.normal_array.stride = stride;
-        c.normal_array.pointer = ptr;
+        c.set_normal_pointer(ty, stride, ptr);
     });
     Ok(VOID)
 }
@@ -589,6 +601,75 @@ fn gl_delete_textures(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
 fn gl_bind_texture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let (target, name) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
     with_ctx(|c| c.bind_texture(target, name));
+    Ok(VOID)
+}
+
+// ---- buffer objects --------------------------------------------------------
+
+fn gl_gen_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let n = ctx.arg_u32(0)? as i32;
+    let out = ctx.arg_u32(1)?;
+    if n <= 0 || out == 0 {
+        return Ok(VOID);
+    }
+    let names = with_ctx(|c| c.gen_buffers(n as usize));
+    let bytes: Vec<u8> = names.iter().flat_map(|n| n.to_le_bytes()).collect();
+    ctx.cpu.write_mem(out, &bytes)?;
+    Ok(VOID)
+}
+
+fn gl_delete_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let n = ctx.arg_u32(0)? as i32;
+    let ptr = ctx.arg_u32(1)?;
+    if n <= 0 || ptr == 0 {
+        return Ok(VOID);
+    }
+    let bytes = ctx.cpu.read_mem(ptr, n as u32 * 4)?;
+    let names: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    with_ctx(|c| c.delete_buffers(&names));
+    Ok(VOID)
+}
+
+fn gl_bind_buffer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let (target, name) = (ctx.arg_u32(0)?, ctx.arg_u32(1)?);
+    with_ctx(|c| c.bind_buffer(target, name));
+    Ok(VOID)
+}
+
+/// `glBufferData(target, size, data, usage)`. A null `data` allocates
+/// the store without initialising it, which is legal and common — the
+/// guest fills it with `glBufferSubData` afterwards.
+fn gl_buffer_data(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let target = ctx.arg_u32(0)?;
+    let size = ctx.arg_u32(1)? as i32;
+    let data = ctx.arg_u32(2)?;
+    let usage = ctx.arg_u32(3)?;
+    if size < 0 {
+        with_ctx(|c| c.set_error(pocket_gles::GL_INVALID_VALUE));
+        return Ok(VOID);
+    }
+    let bytes = if data != 0 {
+        Some(ctx.cpu.read_mem(data, size as u32)?)
+    } else {
+        None
+    };
+    with_ctx(|c| c.buffer_data(target, size as usize, bytes.as_deref(), usage));
+    Ok(VOID)
+}
+
+fn gl_buffer_sub_data(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let target = ctx.arg_u32(0)?;
+    let offset = ctx.arg_u32(1)?;
+    let size = ctx.arg_u32(2)? as i32;
+    let data = ctx.arg_u32(3)?;
+    if size <= 0 || data == 0 {
+        return Ok(VOID);
+    }
+    let bytes = ctx.cpu.read_mem(data, size as u32)?;
+    with_ctx(|c| c.buffer_sub_data(target, offset, &bytes));
     Ok(VOID)
 }
 
@@ -786,13 +867,58 @@ fn gl_get_integerv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
         pocket_gles::GL_GREEN_BITS => vec![6],
         pocket_gles::GL_BLUE_BITS => vec![5],
         pocket_gles::GL_ALPHA_BITS => vec![0],
-        pocket_gles::GL_NUM_COMPRESSED_TEXTURE_FORMATS => vec![0],
-        pocket_gles::GL_COMPRESSED_TEXTURE_FORMATS => vec![],
+        pocket_gles::GL_NUM_COMPRESSED_TEXTURE_FORMATS => vec![COMPRESSED_FORMATS.len() as i32],
+        pocket_gles::GL_COMPRESSED_TEXTURE_FORMATS => {
+            COMPRESSED_FORMATS.iter().map(|&f| f as i32).collect()
+        }
         pocket_gles::GL_VIEWPORT => {
             let vp = with_ctx(|c| c.state.viewport);
             vec![vp.0, vp.1, vp.2, vp.3]
         }
+        pocket_gles::GL_ARRAY_BUFFER_BINDING => {
+            vec![with_ctx(|c| c.array_buffer) as i32]
+        }
+        pocket_gles::GL_ELEMENT_ARRAY_BUFFER_BINDING => {
+            vec![with_ctx(|c| c.element_array_buffer) as i32]
+        }
         _ => vec![0],
+    };
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    if !bytes.is_empty() {
+        ctx.cpu.write_mem(out, &bytes)?;
+    }
+    Ok(VOID)
+}
+
+/// `glGetFloatv`. Games read the matrices back far more often than
+/// anything else here — a renderer that keeps its own copy of the
+/// modelview still asks GL for the projection to build a culling
+/// frustum, and gets a degenerate one if we answer with zeroes.
+fn gl_get_floatv(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let pname = ctx.arg_u32(0)?;
+    let out = ctx.arg_u32(1)?;
+    if out == 0 {
+        return Ok(VOID);
+    }
+    let values: Vec<f32> = match pname {
+        pocket_gles::GL_MODELVIEW_MATRIX => with_ctx(|c| c.modelview.current().to_vec()),
+        pocket_gles::GL_PROJECTION_MATRIX => with_ctx(|c| c.projection.current().to_vec()),
+        pocket_gles::GL_TEXTURE_MATRIX => with_ctx(|c| c.texture_matrix.current().to_vec()),
+        pocket_gles::GL_CURRENT_COLOR => with_ctx(|c| c.current_color.to_vec()),
+        pocket_gles::GL_DEPTH_RANGE => {
+            let (n, f) = with_ctx(|c| c.state.depth_range);
+            vec![n, f]
+        }
+        // Integer-valued queries are legal through glGetFloatv as well;
+        // GL converts. Only the few games actually ask for are listed.
+        pocket_gles::GL_MAX_TEXTURE_SIZE => vec![1024.0],
+        pocket_gles::GL_MAX_LIGHTS => vec![8.0],
+        pocket_gles::GL_MAX_TEXTURE_UNITS => vec![1.0],
+        pocket_gles::GL_VIEWPORT => {
+            let vp = with_ctx(|c| c.state.viewport);
+            vec![vp.0 as f32, vp.1 as f32, vp.2 as f32, vp.3 as f32]
+        }
+        _ => vec![0.0],
     };
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     if !bytes.is_empty() {
@@ -810,7 +936,9 @@ fn gl_get_string(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         pocket_gles::GL_VENDOR => "PocketHLE",
         pocket_gles::GL_RENDERER => "PocketHLE Software Rasterizer",
         pocket_gles::GL_VERSION => "OpenGL ES-CL 1.1",
-        pocket_gles::GL_EXTENSIONS => "",
+        pocket_gles::GL_EXTENSIONS => {
+            "GL_AMD_compressed_ATC_texture GL_ATI_texture_compression_atitc"
+        }
         _ => {
             with_ctx(|c| c.set_error(pocket_gles::GL_INVALID_ENUM));
             return Ok(DispatchOutcome::ReturnedR0(0));
@@ -886,9 +1014,30 @@ fn gl_ignored(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(VOID)
 }
 
-/// `glCompressedTexImage2D` and friends. We advertise zero compressed
-/// formats via `GL_NUM_COMPRESSED_TEXTURE_FORMATS`, so a guest reaching
-/// these has ignored that; report the error GL specifies.
+/// `glCompressedTexImage2D(target, level, internalformat, width,
+/// height, border, imageSize, data)` — eight arguments, four on the
+/// stack. Only the ATC formats are decodable; anything else gets the
+/// `GL_INVALID_ENUM` GL specifies for an unsupported format.
+fn gl_compressed_tex_image_2d(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let target = ctx.arg_u32(0)?;
+    let level = ctx.arg_u32(1)? as i32;
+    let format = ctx.arg_u32(2)?;
+    let width = ctx.arg_u32(3)?;
+    let height = ctx.arg_u32(4)?;
+    let size = ctx.arg_u32(6)?;
+    let data = ctx.arg_u32(7)?;
+    let bytes = if data == 0 || size == 0 {
+        Vec::new()
+    } else {
+        ctx.cpu.read_mem(data, size).unwrap_or_default()
+    };
+    with_ctx(|c| c.compressed_tex_image_2d(target, level, width, height, format, &bytes));
+    Ok(VOID)
+}
+
+/// `glCompressedTexSubImage2D` and the two `glCopyTex*Image2D` entry
+/// points. We advertise no framebuffer-to-texture path and no partial
+/// compressed update; report the error GL specifies.
 fn gl_unsupported_format(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     with_ctx(|c| c.set_error(pocket_gles::GL_INVALID_ENUM));
     Ok(VOID)
@@ -1280,8 +1429,25 @@ fn handler_for(name: &str) -> Option<crate::Handler> {
         // queries
         "glGetError" => gl_get_error,
         "glGetIntegerv" => gl_get_integerv,
+        "glGetFloatv" => gl_get_floatv,
         "glGetString" => gl_get_string,
         "glReadPixels" => gl_read_pixels,
+
+        // buffer objects
+        "glGenBuffers" => gl_gen_buffers,
+        "glDeleteBuffers" => gl_delete_buffers,
+        "glBindBuffer" => gl_bind_buffer,
+        "glBufferData" => gl_buffer_data,
+        "glBufferSubData" => gl_buffer_sub_data,
+
+        // Matrix-palette skinning (OES_matrix_palette). The rasterizer
+        // transforms by the modelview alone, so a skinned mesh renders
+        // in its bind pose rather than not at all.
+        "glMatrixIndexPointerOES"
+        | "glWeightPointerOES"
+        | "glCurrentPaletteMatrixOES"
+        | "glLoadPaletteFromModelViewMatrixOES"
+        | "glPointSizePointerOES" => gl_ignored,
 
         // Lighting is not evaluated: the rasterizer shades from the
         // vertex colour alone. Games that light their geometry get flat
@@ -1298,10 +1464,10 @@ fn handler_for(name: &str) -> Option<crate::Handler> {
         | "glPixelStorei" | "glFinish" | "glFlush" => gl_ignored,
 
         // Compressed and copy-from-framebuffer texture paths.
-        "glCompressedTexImage2D"
-        | "glCompressedTexSubImage2D"
-        | "glCopyTexImage2D"
-        | "glCopyTexSubImage2D" => gl_unsupported_format,
+        "glCompressedTexImage2D" => gl_compressed_tex_image_2d,
+        "glCompressedTexSubImage2D" | "glCopyTexImage2D" | "glCopyTexSubImage2D" => {
+            gl_unsupported_format
+        }
 
         // EGL
         "eglGetDisplay" => egl_get_display,
@@ -1346,6 +1512,31 @@ fn reset_for_test(width: u32, height: u32) {
     *guard = EGL_SUCCESS;
 }
 
+/// Entry points that are not in the ordinal tables but that games
+/// import *by name*.
+///
+/// The tables in `pocket-gles/data` are generated by alphabetising the
+/// Khronos entry-point lists, so the ordinal of every function depends
+/// on every other function in the list. Adding names there would shift
+/// the ordinals COD2 is verified against and break it. Vendor DLLs
+/// export these anyway — the GL ES 1.1 buffer-object calls are core,
+/// not extensions — and a game that imports by name (Xtrakt does, with
+/// 73 named symbols) resolves them through the name path regardless of
+/// what the ordinal table says.
+const EXTRA_NAMED_EXPORTS: [&str; 11] = [
+    "glGenBuffers",
+    "glDeleteBuffers",
+    "glBindBuffer",
+    "glBufferData",
+    "glBufferSubData",
+    "glGetFloatv",
+    "glMatrixIndexPointerOES",
+    "glWeightPointerOES",
+    "glCurrentPaletteMatrixOES",
+    "glLoadPaletteFromModelViewMatrixOES",
+    "glPointSizePointerOES",
+];
+
 pub fn register(d: &mut WinCeDispatcher) {
     for dll in GLES_DLLS {
         for name in gles_ord::names_for(dll) {
@@ -1353,6 +1544,12 @@ pub fn register(d: &mut WinCeDispatcher) {
                 continue;
             };
             d.register_handler(dll, &name, handler);
+        }
+        for name in EXTRA_NAMED_EXPORTS {
+            let Some(handler) = handler_for(name) else {
+                continue;
+            };
+            d.register_handler(dll, name, handler);
         }
         // Games import these libraries purely by ordinal, so the
         // ordinal spellings the loader produces need to reach the same
@@ -1834,7 +2031,10 @@ mod tests {
             (pocket_gles::GL_MAX_TEXTURE_SIZE, 1024u32),
             (pocket_gles::GL_MAX_TEXTURE_UNITS, 1),
             (pocket_gles::GL_DEPTH_BITS, 16),
-            (pocket_gles::GL_NUM_COMPRESSED_TEXTURE_FORMATS, 0),
+            (
+                pocket_gles::GL_NUM_COMPRESSED_TEXTURE_FORMATS,
+                COMPRESSED_FORMATS.len() as u32,
+            ),
         ] {
             call(&mut cpu, &mut kernel, gl_get_integerv, &[pname, SCRATCH]);
             assert_eq!(
@@ -1853,6 +2053,98 @@ mod tests {
         );
         assert_eq!(cpu.read_u32_le(SCRATCH + 8).unwrap(), 240);
         assert_eq!(cpu.read_u32_le(SCRATCH + 12).unwrap(), 320);
+    }
+
+    #[test]
+    fn fogx_takes_the_mode_as_an_enum_not_as_fixed_point() {
+        let _g = guard();
+        reset_for_test(320, 240);
+        let (mut cpu, mut kernel) = (fresh_cpu(), fresh_kernel());
+
+        // Xtrakt calls glFogx(GL_FOG_MODE, GL_LINEAR) during start-up.
+        // 16.16-decoding the enum gives 9729/65536 = 0.148453, which
+        // `set_fog` rejects — and the stray GL_INVALID_ENUM then fails
+        // the game's next `glGetError`, its VBO capability probe.
+        call(
+            &mut cpu,
+            &mut kernel,
+            gl_fogx,
+            &[pocket_gles::GL_FOG_MODE, pocket_gles::GL_LINEAR],
+        );
+        with_ctx(|c| {
+            assert_eq!(c.take_error(), pocket_gles::GL_NO_ERROR);
+            assert_eq!(c.state.fog_mode, pocket_gles::raster::FogMode::Linear);
+        });
+
+        // The scalar parameters really are fixed-point.
+        call(
+            &mut cpu,
+            &mut kernel,
+            gl_fogx,
+            &[pocket_gles::GL_FOG_END, 0x0002_0000],
+        );
+        with_ctx(|c| {
+            assert_eq!(c.take_error(), pocket_gles::GL_NO_ERROR);
+            assert_eq!(c.state.fog_end, 2.0);
+        });
+    }
+
+    #[test]
+    fn fogf_takes_the_mode_as_a_float_encoded_enum() {
+        let _g = guard();
+        reset_for_test(320, 240);
+        let (mut cpu, mut kernel) = (fresh_cpu(), fresh_kernel());
+
+        // The Common profile spells the same enum as a float, so the
+        // fixed-point exception must not leak into `glFogf`.
+        call(
+            &mut cpu,
+            &mut kernel,
+            gl_fogf,
+            &[
+                pocket_gles::GL_FOG_MODE,
+                (pocket_gles::GL_EXP2 as f32).to_bits(),
+            ],
+        );
+        with_ctx(|c| {
+            assert_eq!(c.take_error(), pocket_gles::GL_NO_ERROR);
+            assert_eq!(c.state.fog_mode, pocket_gles::raster::FogMode::Exp2);
+        });
+    }
+
+    #[test]
+    fn fogxv_reads_the_mode_as_an_enum_and_the_colour_as_fixed_point() {
+        let _g = guard();
+        reset_for_test(320, 240);
+        let (mut cpu, mut kernel) = (fresh_cpu(), fresh_kernel());
+
+        cpu.write_mem(SCRATCH, &pocket_gles::GL_EXP.to_le_bytes())
+            .unwrap();
+        call(
+            &mut cpu,
+            &mut kernel,
+            gl_fogxv,
+            &[pocket_gles::GL_FOG_MODE, SCRATCH],
+        );
+        with_ctx(|c| {
+            assert_eq!(c.take_error(), pocket_gles::GL_NO_ERROR);
+            assert_eq!(c.state.fog_mode, pocket_gles::raster::FogMode::Exp);
+        });
+
+        for (i, v) in [0x0001_0000u32, 0, 0x0000_8000, 0x0001_0000]
+            .iter()
+            .enumerate()
+        {
+            cpu.write_mem(SCRATCH + i as u32 * 4, &v.to_le_bytes())
+                .unwrap();
+        }
+        call(
+            &mut cpu,
+            &mut kernel,
+            gl_fogxv,
+            &[pocket_gles::GL_FOG_COLOR, SCRATCH],
+        );
+        with_ctx(|c| assert_eq!(c.state.fog_color, [1.0, 0.0, 0.5, 1.0]));
     }
 
     #[test]

@@ -39,8 +39,14 @@ pub struct ArrayPointer {
     pub ty: u32,
     /// Byte stride between elements. Zero means tightly packed.
     pub stride: u32,
-    /// Guest virtual address of the first element.
+    /// Guest virtual address of the first element — or, when `buffer`
+    /// is non-zero, a byte offset into that buffer object.
     pub pointer: u32,
+    /// The `GL_ARRAY_BUFFER` bound when this pointer was set. GL ES 1.1
+    /// captures the binding at `gl*Pointer` time, not at draw time, so
+    /// it has to be remembered per array: a game may bind a VBO, set
+    /// the vertex pointer, then bind a different VBO for texcoords.
+    pub buffer: u32,
 }
 
 impl Default for ArrayPointer {
@@ -51,6 +57,7 @@ impl Default for ArrayPointer {
             ty: GL_FLOAT,
             stride: 0,
             pointer: 0,
+            buffer: 0,
         }
     }
 }
@@ -123,6 +130,32 @@ fn decode_component(bytes: &[u8], ty: u32, normalize: bool) -> f32 {
 
 const MAX_TEXTURE_UNITS: usize = 2;
 
+/// A buffer object: the host-side copy of what `glBufferData` uploaded.
+///
+/// GL ES 1.1 buffer objects hold vertex attributes (`GL_ARRAY_BUFFER`)
+/// or indices (`GL_ELEMENT_ARRAY_BUFFER`). The guest uploads once and
+/// then draws from the buffer many times, so keeping the bytes on the
+/// host side means a draw does not re-read guest memory at all.
+#[derive(Debug, Default, Clone)]
+pub struct Buffer {
+    pub data: Vec<u8>,
+    /// The `GL_STATIC_DRAW` / `GL_DYNAMIC_DRAW` hint. Recorded for
+    /// debugging; a software rasterizer has no use for it.
+    pub usage: u32,
+}
+
+impl Buffer {
+    /// Borrow `len` bytes at `offset`, or `None` if that range runs off
+    /// the end. A short read must not be padded with zeroes — that
+    /// silently renders degenerate geometry instead of surfacing the
+    /// out-of-range access.
+    pub fn slice(&self, offset: u32, len: usize) -> Option<&[u8]> {
+        let start = offset as usize;
+        let end = start.checked_add(len)?;
+        self.data.get(start..end)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TextureUnitState {
     pub bound_texture: u32,
@@ -170,6 +203,15 @@ pub struct Context {
     pub texture_units: [TextureUnitState; MAX_TEXTURE_UNITS],
     pub bound_texture: u32,
     next_texture_name: u32,
+
+    // ---- buffer objects ----
+    pub buffers: HashMap<u32, Buffer>,
+    /// Currently bound `GL_ARRAY_BUFFER`; captured by `gl*Pointer`.
+    pub array_buffer: u32,
+    /// Currently bound `GL_ELEMENT_ARRAY_BUFFER`; consulted by
+    /// `glDrawElements` at draw time, unlike the array binding.
+    pub element_array_buffer: u32,
+    next_buffer_name: u32,
 
     // ---- fragment pipeline ----
     pub state: PipelineState,
@@ -221,6 +263,10 @@ impl Context {
             texture_units: [TextureUnitState::default(); MAX_TEXTURE_UNITS],
             bound_texture: 0,
             next_texture_name: 1,
+            buffers: HashMap::new(),
+            array_buffer: 0,
+            element_array_buffer: 0,
+            next_buffer_name: 1,
             state,
             clear_color: [0.0, 0.0, 0.0, 1.0],
             clear_depth: 1.0,
@@ -239,6 +285,10 @@ impl Context {
     /// a later failure does not mask an earlier one.
     pub fn set_error(&mut self, code: u32) {
         if self.error == GL_NO_ERROR {
+            // `glGetError` reports the *first* error since the last
+            // check, so by the time a guest sees a code the offending
+            // call is long gone. Log at the point of blame instead.
+            log::debug!("GLES set error 0x{code:04x}");
             self.error = code;
         }
     }
@@ -434,6 +484,122 @@ impl Context {
         );
     }
 
+    /// `glGenBuffers`. Names are handed out densely from 1; GL only
+    /// requires that they be unused, not that they be contiguous.
+    pub fn gen_buffers(&mut self, n: usize) -> Vec<u32> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let name = self.next_buffer_name;
+            self.next_buffer_name += 1;
+            self.buffers.insert(name, Buffer::default());
+            out.push(name);
+        }
+        out
+    }
+
+    /// `glBindBuffer`. Binding an unseen name creates the object, and
+    /// binding 0 means "no buffer" — client arrays go back to reading
+    /// guest memory directly.
+    pub fn bind_buffer(&mut self, target: u32, name: u32) {
+        if name != 0 {
+            self.buffers.entry(name).or_default();
+            self.next_buffer_name = self.next_buffer_name.max(name + 1);
+        }
+        match target {
+            GL_ARRAY_BUFFER => self.array_buffer = name,
+            GL_ELEMENT_ARRAY_BUFFER => self.element_array_buffer = name,
+            _ => {
+                self.set_error(GL_INVALID_ENUM);
+                return;
+            }
+        }
+        log::debug!(
+            "GLES bind buffer target=0x{target:04x} name={name} objects={}",
+            self.buffers.len()
+        );
+    }
+
+    /// `glDeleteBuffers`. Deleting the bound buffer reverts the binding
+    /// to 0, as GL requires.
+    pub fn delete_buffers(&mut self, names: &[u32]) {
+        for &name in names {
+            if name == 0 {
+                continue;
+            }
+            self.buffers.remove(&name);
+            if self.array_buffer == name {
+                self.array_buffer = 0;
+            }
+            if self.element_array_buffer == name {
+                self.element_array_buffer = 0;
+            }
+        }
+    }
+
+    /// The buffer currently bound to `target`, or `None` for 0.
+    fn bound_buffer_name(&self, target: u32) -> Option<u32> {
+        let name = match target {
+            GL_ARRAY_BUFFER => self.array_buffer,
+            GL_ELEMENT_ARRAY_BUFFER => self.element_array_buffer,
+            _ => return None,
+        };
+        (name != 0).then_some(name)
+    }
+
+    /// `glBufferData`: (re)allocate the store and fill it with `data`.
+    /// A null `data` pointer allocates without initialising, which is
+    /// legal and common — the guest follows up with `glBufferSubData`.
+    pub fn buffer_data(&mut self, target: u32, size: usize, data: Option<&[u8]>, usage: u32) {
+        let Some(name) = self.bound_buffer_name(target) else {
+            // Uploading with no buffer bound is an error, not a no-op:
+            // GL has nowhere to put the data.
+            self.set_error(
+                if target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER {
+                    GL_INVALID_OPERATION
+                } else {
+                    GL_INVALID_ENUM
+                },
+            );
+            return;
+        };
+        let Some(buf) = self.buffers.get_mut(&name) else {
+            return;
+        };
+        buf.usage = usage;
+        buf.data.clear();
+        buf.data.resize(size, 0);
+        if let Some(src) = data {
+            let n = src.len().min(size);
+            buf.data[..n].copy_from_slice(&src[..n]);
+        }
+        log::debug!(
+            "GLES buffer data target=0x{target:04x} name={name} size={size} usage=0x{usage:04x} initialised={}",
+            data.is_some()
+        );
+    }
+
+    /// `glBufferSubData`: overwrite part of an existing store. A range
+    /// that runs past the end is an error and writes nothing.
+    pub fn buffer_sub_data(&mut self, target: u32, offset: u32, data: &[u8]) {
+        let Some(name) = self.bound_buffer_name(target) else {
+            self.set_error(GL_INVALID_OPERATION);
+            return;
+        };
+        let Some(buf) = self.buffers.get_mut(&name) else {
+            return;
+        };
+        let start = offset as usize;
+        let Some(end) = start.checked_add(data.len()) else {
+            self.set_error(GL_INVALID_VALUE);
+            return;
+        };
+        if end > buf.data.len() {
+            self.set_error(GL_INVALID_VALUE);
+            return;
+        }
+        buf.data[start..end].copy_from_slice(data);
+    }
+
     pub fn set_active_texture(&mut self, unit: u32) {
         if unit as usize >= MAX_TEXTURE_UNITS {
             self.set_error(GL_INVALID_ENUM);
@@ -450,6 +616,43 @@ impl Context {
         self.client_active_texture = unit;
     }
 
+    /// `glVertexPointer`. The enable flag is owned by
+    /// `glEnableClientState` and must survive a pointer change.
+    pub fn set_vertex_pointer(&mut self, size: u32, ty: u32, stride: u32, pointer: u32) {
+        self.vertex_array = ArrayPointer {
+            enabled: self.vertex_array.enabled,
+            size,
+            ty,
+            stride,
+            pointer,
+            buffer: self.array_buffer,
+        };
+    }
+
+    /// `glColorPointer`.
+    pub fn set_color_pointer(&mut self, size: u32, ty: u32, stride: u32, pointer: u32) {
+        self.color_array = ArrayPointer {
+            enabled: self.color_array.enabled,
+            size,
+            ty,
+            stride,
+            pointer,
+            buffer: self.array_buffer,
+        };
+    }
+
+    /// `glNormalPointer`. Normals are always three components.
+    pub fn set_normal_pointer(&mut self, ty: u32, stride: u32, pointer: u32) {
+        self.normal_array = ArrayPointer {
+            enabled: self.normal_array.enabled,
+            size: 3,
+            ty,
+            stride,
+            pointer,
+            buffer: self.array_buffer,
+        };
+    }
+
     pub fn set_texcoord_pointer(&mut self, size: u32, ty: u32, stride: u32, pointer: u32) {
         let unit = self.client_active_texture as usize;
         if unit >= MAX_TEXTURE_UNITS {
@@ -463,6 +666,7 @@ impl Context {
             ty,
             stride,
             pointer,
+            buffer: self.array_buffer,
         };
         if unit == 0 {
             self.texcoord_array = self.texture_units[unit].texcoord_array;
@@ -556,6 +760,65 @@ impl Context {
             tex.is_complete(),
             &tex.rgba[..tex.rgba.len().min(4)],
         );
+        dump_texture(name, tex);
+    }
+
+    /// `glCompressedTexImage2D` for the ATC formats.
+    ///
+    /// Decoded to RGBA at upload time like every other format, so the
+    /// rasterizer never learns that compression exists.
+    pub fn compressed_tex_image_2d(
+        &mut self,
+        target: u32,
+        level: i32,
+        width: u32,
+        height: u32,
+        format: u32,
+        data: &[u8],
+    ) {
+        if target != GL_TEXTURE_2D {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        if texture::compressed_image_size(format, width, height).is_none() {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        if level != 0 {
+            return;
+        }
+        let unit = self.active_texture as usize;
+        if unit >= MAX_TEXTURE_UNITS || self.texture_units[unit].bound_texture == 0 {
+            self.set_error(GL_INVALID_OPERATION);
+            return;
+        }
+        let rgba = if data.is_empty() {
+            vec![0u8; (width as usize) * (height as usize) * 4]
+        } else {
+            match texture::decode_compressed_to_rgba(data, width, height, format) {
+                Some(v) => v,
+                None => {
+                    // Right size for the format but the guest gave us
+                    // short data — `GL_INVALID_VALUE` is what GL
+                    // specifies for a mismatched `imageSize`.
+                    self.set_error(GL_INVALID_VALUE);
+                    return;
+                }
+            }
+        };
+        let name = self.texture_units[self.active_texture as usize].bound_texture;
+        let tex = self.textures.entry(name).or_default();
+        tex.width = width;
+        tex.height = height;
+        tex.rgba = rgba;
+        log::debug!(
+            "GLES compressed tex image texture={name} {width}x{height} \
+             format=0x{format:04x} bytes={} complete={}",
+            data.len(),
+            tex.is_complete(),
+        );
+        dump_texture(name, tex);
+        dump_compressed(name, width, height, format, data);
     }
 
     /// `glTexSubImage2D`: patch a rectangle of the bound texture.
@@ -771,6 +1034,14 @@ impl Context {
     // ---- clearing -------------------------------------------------------
 
     pub fn clear(&mut self, mask: u32) {
+        // Ordering against the draws is the whole point: a frame that
+        // clears *after* drawing looks exactly like a frame that never
+        // drew, and only an interleaved log tells the two apart.
+        log::trace!(
+            "GLES clear mask=0x{mask:04x} color={:?} depth={}",
+            self.clear_color,
+            self.clear_depth
+        );
         if mask & GL_COLOR_BUFFER_BIT != 0 {
             let c = [
                 (self.clear_color[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
@@ -807,6 +1078,22 @@ impl Context {
         let stride = array.element_stride()?;
         let addr = array.pointer.checked_add(stride.checked_mul(index)?)?;
         let len = (comp * array.size) as usize;
+
+        // A pointer captured while a VBO was bound is an offset into
+        // that buffer's host-side copy, not a guest address. Reading it
+        // as a guest address would dereference a small integer and, on
+        // an unlucky mapping, silently render garbage.
+        if array.buffer != 0 {
+            let buf = self.buffers.get(&array.buffer)?;
+            let bytes = buf.slice(addr, len)?;
+            let mut out = [0.0, 0.0, 0.0, 1.0];
+            for (c, slot) in out.iter_mut().enumerate().take(array.size as usize) {
+                let off = c * comp as usize;
+                *slot = decode_component(&bytes[off..], array.ty, normalize);
+            }
+            return Some(out);
+        }
+
         let mut buf = std::mem::take(&mut self.scratch);
         let ok = mem.read(addr, len, &mut buf);
         let mut out = [0.0, 0.0, 0.0, 1.0];
@@ -862,9 +1149,17 @@ impl Context {
         })
     }
 
+    /// Is there vertex data to draw from? A pointer of 0 is legitimate
+    /// when it is an offset into a bound VBO, so the null check only
+    /// applies to client-side arrays.
+    fn vertex_source_ready(&self) -> bool {
+        self.vertex_array.enabled
+            && (self.vertex_array.buffer != 0 || self.vertex_array.pointer != 0)
+    }
+
     /// `glDrawArrays`.
     pub fn draw_arrays(&mut self, mem: &mut dyn GuestMemory, mode: u32, first: u32, count: u32) {
-        if !self.vertex_array.enabled || self.vertex_array.pointer == 0 {
+        if !self.vertex_source_ready() {
             return;
         }
         let indices: Vec<u32> = (first..first.saturating_add(count)).collect();
@@ -874,7 +1169,7 @@ impl Context {
     /// `glDrawElements`. `indices` has already been read out of guest
     /// memory and widened to `u32`.
     pub fn draw_elements(&mut self, mem: &mut dyn GuestMemory, mode: u32, indices: &[u32]) {
-        if !self.vertex_array.enabled || self.vertex_array.pointer == 0 {
+        if !self.vertex_source_ready() {
             return;
         }
         self.draw_indexed(mem, mode, indices);
@@ -901,6 +1196,34 @@ impl Context {
             self.set_error(GL_INVALID_VALUE);
             return;
         };
+
+        // With an element-array VBO bound, `pointer` is an offset into
+        // it. Unlike the vertex arrays, this binding is read at draw
+        // time rather than captured when the pointer was set.
+        if self.element_array_buffer != 0 {
+            let indices: Vec<u32> = {
+                let Some(buf) = self.buffers.get(&self.element_array_buffer) else {
+                    return;
+                };
+                let Some(bytes) = buf.slice(pointer, len) else {
+                    self.set_error(GL_INVALID_VALUE);
+                    return;
+                };
+                if width == 1 {
+                    bytes.iter().map(|&b| b as u32).collect()
+                } else {
+                    bytes
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]) as u32)
+                        .collect()
+                }
+            };
+            if !indices.is_empty() {
+                self.draw_elements(mem, mode, &indices);
+            }
+            return;
+        }
+
         let mut buf = std::mem::take(&mut self.index_scratch);
         let ok = mem.read(pointer, len, &mut buf);
         let indices: Vec<u32> = if !ok {
@@ -976,7 +1299,7 @@ impl Context {
             None
         };
         log::debug!(
-            "GLES draw mode=0x{mode:04x} indices={} texture_enabled={} active_unit={} bound_texture={} texture_present={} texture_complete={} vertex_array={} texcoord_array={} texcoord_ptr=0x{:08x} stride={} type=0x{:04x}",
+            "GLES draw mode=0x{mode:04x} indices={} texture_enabled={} active_unit={} bound_texture={} texture_present={} texture_complete={} vertex_array={} texcoord_array={} texcoord_ptr=0x{:08x} stride={} type=0x{:04x} blend={} src={:?} dst={:?} alpha_test={} func={:?} ref={} tex_env={:?} mag={:?}",
             indices.len(),
             self.texture_units[0].texture_enabled,
             self.active_texture,
@@ -988,12 +1311,93 @@ impl Context {
             self.texcoord_array.pointer,
             self.texcoord_array.stride,
             self.texcoord_array.ty,
+            self.state.blend,
+            self.state.blend_src,
+            self.state.blend_dst,
+            self.state.alpha_test,
+            self.state.alpha_func,
+            self.state.alpha_ref,
+            self.state.tex_env,
+            tex.map(|t| t.mag_filter),
         );
-        let sample = |s: f32, t: f32| tex.map(|tx| tx.sample_nearest(s, t));
+        // A draw that emits nothing looks identical to a draw that was
+        // never issued, so when the screen is blank the only way to tell
+        // "wrong transform" from "wrong colour" is to see the vertices.
+        // Trace level, not debug: one line per vertex would otherwise
+        // multiply an already-chatty `-vv` by the batch size.
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!(
+                "GLES draw state viewport={:?} depth_test={} func={:?} range={:?} write={} cull={:?} front={:?} color_mask={:?} scissor={:?} clear_depth={}",
+                self.state.viewport,
+                self.state.depth_test,
+                self.state.depth_func,
+                self.state.depth_range,
+                self.state.depth_write,
+                self.state.cull,
+                self.state.front_face,
+                self.state.color_mask,
+                self.state.scissor,
+                self.clear_depth,
+            );
+            for v in &verts {
+                log::trace!(
+                    "GLES vertex clip=[{:.3} {:.3} {:.3} {:.3}] color=[{:.3} {:.3} {:.3} {:.3}] uv=[{:.3} {:.3}]",
+                    v.pos[0], v.pos[1], v.pos[2], v.pos[3],
+                    v.color[0], v.color[1], v.color[2], v.color[3],
+                    v.texcoord[0], v.texcoord[1],
+                );
+            }
+        }
+        let sample = |s: f32, t: f32| tex.map(|tx| tx.sample(s, t));
         for tri in tris {
             raster::draw_triangle(&mut self.target, &self.state, &sample, tri);
         }
     }
+}
+
+/// Write a freshly uploaded texture out as a PPM plus a companion
+/// greyscale PPM of its alpha, when `POCKETHLE_DUMP_TEXTURES` names a
+/// directory.
+///
+/// Decoding a compressed format wrong shows up on screen as art that is
+/// merely *slightly* off — a fat glyph, a wrong-hued gradient — which is
+/// almost impossible to judge from a composited frame. Looking at the
+/// atlas on its own is the only reliable way to tell a bad decoder from
+/// bad texture coordinates.
+fn dump_texture(name: u32, tex: &Texture) {
+    let Ok(dir) = std::env::var("POCKETHLE_DUMP_TEXTURES") else {
+        return;
+    };
+    if !tex.is_complete() {
+        return;
+    }
+    let (w, h) = (tex.width as usize, tex.height as usize);
+    let header = format!("P6\n{w} {h}\n255\n");
+    let mut rgb = Vec::with_capacity(header.len() + w * h * 3);
+    let mut alpha = Vec::with_capacity(header.len() + w * h * 3);
+    rgb.extend_from_slice(header.as_bytes());
+    alpha.extend_from_slice(header.as_bytes());
+    for px in tex.rgba.chunks_exact(4).take(w * h) {
+        rgb.extend_from_slice(&px[..3]);
+        alpha.extend_from_slice(&[px[3]; 3]);
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(format!("{dir}/tex{name:04}-{w}x{h}.ppm"), &rgb);
+    let _ = std::fs::write(format!("{dir}/tex{name:04}-{w}x{h}-alpha.ppm"), &alpha);
+}
+
+/// Write the guest's undecoded compressed blocks alongside the decoded
+/// texture, so a suspect decode can be re-derived offline from the exact
+/// bytes the game supplied.
+fn dump_compressed(name: u32, width: u32, height: u32, format: u32, data: &[u8]) {
+    let Ok(dir) = std::env::var("POCKETHLE_DUMP_TEXTURES") else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(
+        format!("{dir}/tex{name:04}-{width}x{height}-fmt{format:04x}.raw"),
+        data,
+    );
 }
 
 #[cfg(test)]
@@ -1080,6 +1484,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         c.current_color = [1.0, 0.0, 0.0, 1.0];
         c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
@@ -1103,6 +1508,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         a.draw_arrays(&mut ma, GL_TRIANGLE_FAN, 0, 4);
 
@@ -1122,6 +1528,7 @@ mod tests {
             ty: GL_FIXED,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         b.draw_arrays(&mut mb, GL_TRIANGLE_FAN, 0, 4);
 
@@ -1151,6 +1558,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 20,
             pointer: BASE,
+            buffer: 0,
         };
         c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
         assert!(covered(&c) > 3000, "stride handling dropped geometry");
@@ -1170,6 +1578,7 @@ mod tests {
             stride: 0,
             // Far outside the fake mapping.
             pointer: 0xDEAD_0000,
+            buffer: 0,
         };
         c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
         assert_eq!(covered(&c), 0);
@@ -1188,6 +1597,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
         assert_eq!(covered(&c), 0);
@@ -1208,6 +1618,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         c.draw_elements_from_guest(&mut m, GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, BASE + index_off);
         assert!(covered(&c) > 3000, "indexed quad covered {}", covered(&c));
@@ -1226,6 +1637,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         c.draw_elements_from_guest(&mut m, GL_TRIANGLES, 6, GL_UNSIGNED_BYTE, BASE + index_off);
         assert!(covered(&c) > 3000);
@@ -1248,6 +1660,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         c.color_array = ArrayPointer {
             enabled: true,
@@ -1255,6 +1668,7 @@ mod tests {
             ty: GL_UNSIGNED_BYTE,
             stride: 0,
             pointer: BASE + color_off,
+            buffer: 0,
         };
         c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
         assert_eq!(pixel(&c, 32, 32), [0, 0, 255, 255]);
@@ -1288,6 +1702,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         c.texcoord_array = ArrayPointer {
             enabled: true,
@@ -1295,6 +1710,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE + uv_off,
+            buffer: 0,
         };
         c.draw_arrays(&mut m, GL_TRIANGLE_FAN, 0, 4);
         assert_eq!(pixel(&c, 32, 32), [0, 255, 0, 255]);
@@ -1315,6 +1731,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         full.vertex_array = ptr;
         full.draw_arrays(&mut m1, GL_TRIANGLE_FAN, 0, 4);
@@ -1501,6 +1918,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
 
         let mut plain = ctx();
@@ -1558,6 +1976,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         c.draw_arrays(&mut m, GL_LINES, 0, 4);
         c.draw_arrays(&mut m, GL_POINTS, 0, 4);
@@ -1577,6 +1996,7 @@ mod tests {
             ty: GL_FLOAT,
             stride: 0,
             pointer: BASE,
+            buffer: 0,
         };
         c.draw_arrays(&mut m, 0x99, 0, 4);
         assert_eq!(c.take_error(), GL_INVALID_ENUM);
@@ -1616,5 +2036,154 @@ mod tests {
         c.frustum(-1.0, 1.0, -1.0, 1.0, 0.0, 100.0);
         assert_eq!(c.take_error(), GL_INVALID_VALUE);
         assert!(c.projection.current().iter().all(|v| v.is_finite()));
+    }
+
+    // ---- buffer objects -------------------------------------------------
+
+    /// Guest memory that refuses every read.
+    ///
+    /// A VBO-backed draw must not touch guest memory at all, so any
+    /// read is a bug the test should fail on rather than tolerate.
+    struct NoMem;
+
+    impl GuestMemory for NoMem {
+        fn read(&mut self, _addr: u32, _len: usize, _out: &mut Vec<u8>) -> bool {
+            panic!("VBO draw read guest memory");
+        }
+    }
+
+    #[test]
+    fn draw_arrays_reads_from_array_buffer() {
+        let mut c = ctx();
+        let names = c.gen_buffers(1);
+        c.bind_buffer(GL_ARRAY_BUFFER, names[0]);
+        let quad = quad_floats();
+        c.buffer_data(GL_ARRAY_BUFFER, quad.len(), Some(&quad), GL_STATIC_DRAW);
+        // Offset 0 into the buffer, which is also the null guest pointer:
+        // the draw must still happen.
+        c.vertex_array = ArrayPointer {
+            enabled: true,
+            size: 3,
+            ty: GL_FLOAT,
+            stride: 0,
+            pointer: 0,
+            buffer: names[0],
+        };
+        c.draw_arrays(&mut NoMem, GL_TRIANGLE_FAN, 0, 4);
+        assert_eq!(c.take_error(), GL_NO_ERROR);
+        assert!(covered(&c) > 3000, "VBO quad covered {}", covered(&c));
+    }
+
+    #[test]
+    fn draw_elements_reads_indices_from_element_buffer() {
+        let mut c = ctx();
+        let names = c.gen_buffers(2);
+        c.bind_buffer(GL_ARRAY_BUFFER, names[0]);
+        let quad = quad_floats();
+        c.buffer_data(GL_ARRAY_BUFFER, quad.len(), Some(&quad), GL_STATIC_DRAW);
+        c.vertex_array = ArrayPointer {
+            enabled: true,
+            size: 3,
+            ty: GL_FLOAT,
+            stride: 0,
+            pointer: 0,
+            buffer: names[0],
+        };
+        c.bind_buffer(GL_ELEMENT_ARRAY_BUFFER, names[1]);
+        let indices: Vec<u8> = [0u16, 1, 2, 0, 2, 3]
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        c.buffer_data(
+            GL_ELEMENT_ARRAY_BUFFER,
+            indices.len(),
+            Some(&indices),
+            GL_STATIC_DRAW,
+        );
+        c.draw_elements_from_guest(&mut NoMem, GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+        assert_eq!(c.take_error(), GL_NO_ERROR);
+        assert!(
+            covered(&c) > 3000,
+            "indexed VBO quad covered {}",
+            covered(&c)
+        );
+    }
+
+    #[test]
+    fn pointer_captures_binding_at_call_time_not_draw_time() {
+        // GL ES 1.1 latches GL_ARRAY_BUFFER when gl*Pointer runs. A game
+        // that binds a VBO, sets the vertex pointer, then binds a
+        // different VBO for another array must still draw from the first.
+        let mut c = ctx();
+        let names = c.gen_buffers(2);
+        c.bind_buffer(GL_ARRAY_BUFFER, names[0]);
+        let quad = quad_floats();
+        c.buffer_data(GL_ARRAY_BUFFER, quad.len(), Some(&quad), GL_STATIC_DRAW);
+        c.set_vertex_pointer(3, GL_FLOAT, 0, 0);
+        assert_eq!(c.vertex_array.buffer, names[0]);
+
+        c.bind_buffer(GL_ARRAY_BUFFER, names[1]);
+        c.buffer_data(GL_ARRAY_BUFFER, 16, None, GL_DYNAMIC_DRAW);
+        assert_eq!(
+            c.vertex_array.buffer, names[0],
+            "rebinding clobbered an already-set pointer"
+        );
+
+        c.vertex_array.enabled = true;
+        c.draw_arrays(&mut NoMem, GL_TRIANGLE_FAN, 0, 4);
+        assert!(covered(&c) > 3000, "covered {}", covered(&c));
+    }
+
+    #[test]
+    fn buffer_sub_data_rejects_out_of_range_writes() {
+        let mut c = ctx();
+        let names = c.gen_buffers(1);
+        c.bind_buffer(GL_ARRAY_BUFFER, names[0]);
+        c.buffer_data(GL_ARRAY_BUFFER, 8, None, GL_STATIC_DRAW);
+        c.buffer_sub_data(GL_ARRAY_BUFFER, 4, &[1, 2, 3, 4]);
+        assert_eq!(c.take_error(), GL_NO_ERROR);
+        assert_eq!(c.buffers[&names[0]].data, [0, 0, 0, 0, 1, 2, 3, 4]);
+
+        // One byte past the end must write nothing at all, not clip.
+        c.buffer_sub_data(GL_ARRAY_BUFFER, 5, &[9, 9, 9, 9]);
+        assert_eq!(c.take_error(), GL_INVALID_VALUE);
+        assert_eq!(c.buffers[&names[0]].data, [0, 0, 0, 0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn upload_without_a_bound_buffer_is_an_error() {
+        let mut c = ctx();
+        c.buffer_data(GL_ARRAY_BUFFER, 16, None, GL_STATIC_DRAW);
+        assert_eq!(c.take_error(), GL_INVALID_OPERATION);
+        c.buffer_sub_data(GL_ELEMENT_ARRAY_BUFFER, 0, &[1, 2]);
+        assert_eq!(c.take_error(), GL_INVALID_OPERATION);
+    }
+
+    #[test]
+    fn deleting_a_bound_buffer_clears_the_binding() {
+        let mut c = ctx();
+        let names = c.gen_buffers(2);
+        c.bind_buffer(GL_ARRAY_BUFFER, names[0]);
+        c.bind_buffer(GL_ELEMENT_ARRAY_BUFFER, names[1]);
+        c.delete_buffers(&names);
+        assert_eq!(c.array_buffer, 0);
+        assert_eq!(c.element_array_buffer, 0);
+        assert!(c.buffers.is_empty());
+    }
+
+    #[test]
+    fn draw_from_a_short_buffer_renders_nothing() {
+        // An out-of-range VBO read must drop the draw. Padding it with
+        // zeroes would render a degenerate triangle at the origin and
+        // hide the guest's mistake.
+        let mut c = ctx();
+        let names = c.gen_buffers(1);
+        c.bind_buffer(GL_ARRAY_BUFFER, names[0]);
+        let quad = quad_floats();
+        c.buffer_data(GL_ARRAY_BUFFER, quad.len() - 4, Some(&quad), GL_STATIC_DRAW);
+        c.set_vertex_pointer(3, GL_FLOAT, 0, 0);
+        c.vertex_array.enabled = true;
+        c.draw_arrays(&mut NoMem, GL_TRIANGLE_FAN, 0, 4);
+        assert_eq!(covered(&c), 0, "short buffer still rendered");
     }
 }
