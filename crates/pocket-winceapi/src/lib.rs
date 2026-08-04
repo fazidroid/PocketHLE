@@ -13,6 +13,11 @@
 //!
 //! All four are dispatched through a single [`WinCeDispatcher`] that
 //! implements [`pocket_kernel::Dispatcher`].
+//!
+//! Bundled third-party libraries we have no intention of emulating are
+//! not given a submodule at all — they get one entry in [`IGNORED_DLLS`]
+//! naming the start of the file name, and every call into them is
+//! answered generically.
 
 pub mod aygshell;
 pub mod commctrl;
@@ -36,6 +41,88 @@ use pocket_pe::ImportBinding;
 /// Convert an ordinal-only import to a friendly name where possible.
 pub fn resolve_ordinal(dll: &str, ordinal: u16) -> Option<String> {
     ordinals::lookup(dll, ordinal)
+}
+
+/// A third-party library we deliberately do not emulate.
+///
+/// Games bundle their own middleware — audio mixers, movie players,
+/// copy-protection shims — and a game that links one usually refuses to
+/// start when its calls come back as unimplemented (which returns 0, and
+/// 0 reads as failure to most of them). Writing a module full of
+/// hand-rolled no-ops per library is a lot of dead code for something we
+/// have no intention of implementing, so instead the library gets one
+/// line here: match its name by prefix, answer every entry point with
+/// "fine", and let the game get on with rendering.
+///
+/// Matching is by prefix on the lower-cased DLL name so that the version
+/// suffixes these libraries ship with (`fmodce.dll`, `fmodce370.dll`, …)
+/// are all covered by one entry.
+struct IgnoredDll {
+    /// Lower-case prefix matched against the import's DLL name.
+    prefix: &'static str,
+    /// What every entry point returns. `1` is the useful default: it
+    /// reads as `TRUE` to a status check and as a non-NULL handle to
+    /// code that stores the result and hands it back to us later.
+    returns: u32,
+    /// Entry points that have to answer something else. Keep this to
+    /// the values a game actually gates its start-up on — if a call is
+    /// worth more than a constant, the library wants real emulation
+    /// rather than an entry here.
+    overrides: &'static [(&'static str, u32)],
+}
+
+impl IgnoredDll {
+    fn value_for(&self, name: &str) -> u32 {
+        self.overrides
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or(self.returns, |(_, v)| *v)
+    }
+}
+
+const IGNORED_DLLS: &[IgnoredDll] = &[IgnoredDll {
+    // FMOD CE, the audio middleware Xtrakt links against.
+    prefix: "fmodce",
+    returns: 1,
+    overrides: &[
+        // Xtrakt opens `Create_FmodSoundDevice` with
+        //
+        //     if (FSOUND_GetVersion() < 3.75f) -> "incompatible version"
+        //
+        // and a failure there fails the whole start-up ("Failed to
+        // initialize game."). FMOD returns the version as a `float`, and
+        // WinCE ARM is soft-float, so the bit pattern travels back in r0
+        // and the guest feeds it straight into coredll's `__lts` against
+        // the literal — hence the float encoding of 3.75 rather than the
+        // integer.
+        ("FSOUND_GetVersion", 0x4070_0000),
+    ],
+}];
+
+fn ignored_dll(dll: &str) -> Option<&'static IgnoredDll> {
+    let dll = dll.to_ascii_lowercase();
+    IGNORED_DLLS.iter().find(|i| dll.starts_with(i.prefix))
+}
+
+/// Handler installed for every import from an [`IgnoredDll`]. It
+/// re-derives the answer from the thunk rather than capturing it,
+/// because a [`Handler`] is a plain `fn` pointer with nothing to
+/// capture into; the table is three entries long, so the scan costs
+/// nothing next to the dispatch itself.
+fn ignored_dll_stub(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let value =
+        ignored_dll(&ctx.thunk.dll).map_or(0, |i| i.value_for(import_name(ctx.thunk).as_ref()));
+    Ok(DispatchOutcome::ReturnedR0(value))
+}
+
+/// The name an import is dispatched under: the friendly name if the
+/// loader resolved one, else the imported name, else `ord:N`.
+fn import_name(thunk: &Thunk) -> std::borrow::Cow<'_, str> {
+    match (&thunk.binding, &thunk.friendly_name) {
+        (_, Some(n)) => n.as_str().into(),
+        (ImportBinding::Name(n), _) => n.as_str().into(),
+        (ImportBinding::Ordinal(o), _) => format!("ord:{o}").into(),
+    }
 }
 
 /// Per-call context passed to handler functions.
@@ -178,7 +265,11 @@ impl WinCeDispatcher {
 
     /// Enable JSON-lines tracing. Each dispatched call writes one
     /// record with the form
-    /// `{"dll": "...", "name": "...", "args": [r0, r1, r2, r3], "ret": <u32>, "status": "ok"|"unimplemented"|"halt"}`.
+    /// `{"dll": "...", "name": "...", "args": [r0, r1, r2, r3], "ret": <u32>, "status": "ok"|"unimplemented"|"halt", "caller": <u32>}`.
+    ///
+    /// `caller` is the guest return address with the Thumb bit
+    /// cleared, which is what makes a trace answer "which of the
+    /// game's functions is this?" rather than just "what did it call?".
     pub fn set_trace_sink(&mut self, sink: Box<dyn Write + Send>) {
         self.trace_sink = Some(sink);
     }
@@ -191,20 +282,18 @@ impl WinCeDispatcher {
             return *cached;
         }
         let dll_key = thunk.dll.to_ascii_lowercase();
-        let name_owned;
-        let name: &str = match (&thunk.binding, &thunk.friendly_name) {
-            (_, Some(n)) => n.as_str(),
-            (ImportBinding::Name(n), _) => n.as_str(),
-            (ImportBinding::Ordinal(o), _) => {
-                name_owned = format!("ord:{o}");
-                &name_owned
-            }
-        };
         // The HashMap key is `(String, String)`, so we still have to
         // build owned strings for the lookup itself — but we only do
         // it once per unique thunk_va, not once per call.
-        let key = (dll_key, name.to_string());
-        let resolved = self.by_name.get(&key).copied();
+        let key = (dll_key, import_name(thunk).into_owned());
+        let resolved = self
+            .by_name
+            .get(&key)
+            .copied()
+            // An explicit handler wins: a library can be ignored
+            // wholesale and still have one or two entry points we
+            // decided to emulate properly.
+            .or_else(|| ignored_dll(&thunk.dll).map(|_| ignored_dll_stub as Handler));
         self.by_thunk_va.insert(thunk.thunk_va, resolved);
         resolved
     }
@@ -219,18 +308,15 @@ impl Dispatcher for WinCeDispatcher {
         // `zero_returning` and `null_returning` could appear equal
         // in release builds. An explicit table sidesteps that.
         let dll_key = thunk.dll.to_ascii_lowercase();
-        let name_owned;
-        let name: &str = match (&thunk.binding, &thunk.friendly_name) {
-            (_, Some(n)) => n.as_str(),
-            (ImportBinding::Name(n), _) => n.as_str(),
-            (ImportBinding::Ordinal(o), _) => {
-                name_owned = format!("ord:{o}");
-                &name_owned
-            }
-        };
         self.by_name_constant
-            .get(&(dll_key, name.to_string()))
+            .get(&(dll_key, import_name(thunk).into_owned()))
             .copied()
+        // Ignored libraries deliberately stay out of this. Answering
+        // here would let the loader patch the IAT with a native
+        // `mov r0, #imm; bx lr` and the calls would never reach the
+        // dispatcher — but a library we have not implemented is exactly
+        // the one whose calls we want to see in `--trace` when the game
+        // stops at the next thing.
     }
 
     fn dynamic_names(&self, dll: &str) -> Vec<String> {
@@ -284,6 +370,18 @@ impl Dispatcher for WinCeDispatcher {
             [0; 4]
         };
 
+        // Where in the guest this call came from. Two identical calls
+        // are indistinguishable in a trace without it, which makes a
+        // 250k-line log almost useless for the question that matters
+        // most — *which* of the game's own functions is running. The
+        // low bit is the Thumb flag rather than part of the address,
+        // so clear it to get something that lines up with a disassembly.
+        let caller = if self.trace_sink.is_some() {
+            cpu.read_reg(ArmReg::Lr).unwrap_or(0) & !1
+        } else {
+            0
+        };
+
         let outcome = if let Some(handler) = handler_opt {
             if log::log_enabled!(log::Level::Trace) {
                 log::trace!("call {}", thunk.label());
@@ -314,21 +412,23 @@ impl Dispatcher for WinCeDispatcher {
             // Trace path is cold-ish (only on `--trace`), so it's
             // fine to pay the formatting cost here.
             let dll_key = thunk.dll.to_ascii_lowercase();
-            let name = match (&thunk.binding, &thunk.friendly_name) {
-                (_, Some(n)) => n.clone(),
-                (ImportBinding::Name(n), _) => n.clone(),
-                (ImportBinding::Ordinal(o), _) => format!("ord:{o}"),
-            };
+            let name = import_name(thunk).into_owned();
             let (ret, status) = match &outcome {
-                Ok(DispatchOutcome::ReturnedR0(v)) => (*v, "ok"),
-                Ok(DispatchOutcome::ReturnedR0R1(v, _)) => (*v, "ok"),
+                Ok(DispatchOutcome::ReturnedR0(v)) | Ok(DispatchOutcome::ReturnedR0R1(v, _)) => (
+                    *v,
+                    if ignored_dll(&thunk.dll).is_some() {
+                        "ignored"
+                    } else {
+                        "ok"
+                    },
+                ),
                 Ok(DispatchOutcome::Halt) => (0, "halt"),
                 Ok(DispatchOutcome::Unimplemented) => (0, "unimplemented"),
                 Ok(DispatchOutcome::JumpTo(pc)) => (*pc, "trampoline"),
                 Err(_) => (0, "error"),
             };
             let line = format!(
-                "{{\"dll\":\"{dll}\",\"name\":\"{n}\",\"args\":[{a0},{a1},{a2},{a3}],\"ret\":{ret},\"status\":\"{st}\"}}\n",
+                "{{\"dll\":\"{dll}\",\"name\":\"{n}\",\"args\":[{a0},{a1},{a2},{a3}],\"ret\":{ret},\"status\":\"{st}\",\"caller\":{caller}}}\n",
                 dll = dll_key,
                 n = name,
                 a0 = args[0],
@@ -337,6 +437,7 @@ impl Dispatcher for WinCeDispatcher {
                 a3 = args[3],
                 ret = ret,
                 st = status,
+                caller = caller,
             );
             let _ = sink.write_all(line.as_bytes());
         }
@@ -394,5 +495,54 @@ mod tests {
         let d = WinCeDispatcher::new();
         let t = fake_thunk("coredll.dll", "ThisDoesNotExist");
         assert_eq!(d.constant_for(&t), None);
+    }
+
+    #[test]
+    fn an_ignored_library_answers_every_name_it_exports() {
+        // The point of the ignore list is that we never enumerate the
+        // library's exports, so a name nobody has ever heard of has to
+        // resolve just like a real one.
+        let mut d = WinCeDispatcher::new();
+        for name in ["FSOUND_Init", "FMUSIC_LoadSongEx", "FSOUND_NeverHeardOfIt"] {
+            let t = fake_thunk("fmodce.dll", name);
+            assert!(
+                d.resolve_handler(&t).is_some(),
+                "{name} fell through to the unimplemented path"
+            );
+        }
+    }
+
+    #[test]
+    fn the_prefix_covers_the_version_suffixed_spellings() {
+        assert!(ignored_dll("FMODCE.DLL").is_some(), "match is case-blind");
+        assert!(ignored_dll("fmodce370.dll").is_some());
+        assert!(ignored_dll("coredll.dll").is_none());
+    }
+
+    #[test]
+    fn fmod_reports_the_version_xtrakt_gates_its_start_up_on() {
+        // Xtrakt does `if (FSOUND_GetVersion() < 3.75f) -> bail`, with
+        // the float arriving in r0 under the soft-float ABI. Anything
+        // that is not a valid encoding of >= 3.75 fails start-up.
+        let fmod = ignored_dll("fmodce.dll").expect("fmodce is on the ignore list");
+        let bits = fmod.value_for("FSOUND_GetVersion");
+        assert!(
+            f32::from_bits(bits) >= 3.75,
+            "reported {} (bits {bits:#010x})",
+            f32::from_bits(bits)
+        );
+        // Everything else just has to look like success.
+        assert_eq!(fmod.value_for("FSOUND_Init"), 1);
+    }
+
+    #[test]
+    fn an_explicit_handler_still_beats_the_ignore_list() {
+        let mut d = WinCeDispatcher::new();
+        d.register_constant("fmodce.dll", "FSOUND_Init", 7, |_| {
+            Ok(DispatchOutcome::ReturnedR0(7))
+        });
+        let t = fake_thunk("fmodce.dll", "FSOUND_Init");
+        assert_eq!(d.constant_for(&t), Some(7));
+        assert!(d.resolve_handler(&t).is_some());
     }
 }
