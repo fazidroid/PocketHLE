@@ -456,25 +456,25 @@ fn gl_normal3x(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 /// because we have no 3D or projective texturing.
 fn gl_multi_tex_coord4f(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let (s, t) = (argf(ctx, 1)?, argf(ctx, 2)?);
-    with_ctx(|c| c.current_texcoord = [s, t]);
+    with_ctx(|c| c.set_multi_texcoord(ctx.arg_u32(0).unwrap_or(pocket_gles::GL_TEXTURE0), s, t));
     Ok(VOID)
 }
 
 fn gl_multi_tex_coord4x(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let (s, t) = (argx(ctx, 1)?, argx(ctx, 2)?);
-    with_ctx(|c| c.current_texcoord = [s, t]);
+    with_ctx(|c| c.set_multi_texcoord(ctx.arg_u32(0).unwrap_or(pocket_gles::GL_TEXTURE0), s, t));
     Ok(VOID)
 }
 
 fn gl_active_texture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let unit = ctx.arg_u32(0)?.saturating_sub(pocket_gles::GL_TEXTURE0);
-    with_ctx(|c| c.active_texture = unit);
+    with_ctx(|c| c.set_active_texture(unit));
     Ok(VOID)
 }
 
 fn gl_client_active_texture(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let unit = ctx.arg_u32(0)?.saturating_sub(pocket_gles::GL_TEXTURE0);
-    with_ctx(|c| c.client_active_texture = unit);
+    with_ctx(|c| c.set_client_active_texture(unit));
     Ok(VOID)
 }
 
@@ -519,12 +519,12 @@ fn gl_tex_coord_pointer(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kernel
         ctx.arg_u32(2)?,
         ctx.arg_u32(3)?,
     );
-    with_ctx(|c| {
-        c.texcoord_array.size = size;
-        c.texcoord_array.ty = ty;
-        c.texcoord_array.stride = stride;
-        c.texcoord_array.pointer = ptr;
-    });
+    log::debug!(
+        "GLES glTexCoordPointer size={} type=0x{ty:04x} stride={} pointer=0x{ptr:08x}",
+        size,
+        stride,
+    );
+    with_ctx(|c| c.set_texcoord_pointer(size, ty, stride, ptr));
     Ok(VOID)
 }
 
@@ -730,6 +730,10 @@ fn gl_draw_elements(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
         ctx.arg_u32(1)?,
         ctx.arg_u32(2)?,
         ctx.arg_u32(3)?,
+    );
+    log::debug!(
+        "GLES glDrawElements mode=0x{mode:04x} count={} type=0x{ty:04x} indices=0x{ptr:08x}",
+        count,
     );
     let mut mem = CpuMem(ctx.cpu);
     with_ctx(|c| c.draw_elements_from_guest(&mut mem, mode, count, ty, ptr));

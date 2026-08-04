@@ -121,6 +121,27 @@ fn decode_component(bytes: &[u8], ty: u32, normalize: bool) -> f32 {
     }
 }
 
+const MAX_TEXTURE_UNITS: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
+pub struct TextureUnitState {
+    pub bound_texture: u32,
+    pub texture_enabled: bool,
+    pub texcoord_array: ArrayPointer,
+    pub current_texcoord: [f32; 2],
+}
+
+impl Default for TextureUnitState {
+    fn default() -> Self {
+        Self {
+            bound_texture: 0,
+            texture_enabled: false,
+            texcoord_array: ArrayPointer::default(),
+            current_texcoord: [0.0, 0.0],
+        }
+    }
+}
+
 /// The full GL ES 1.1 context.
 pub struct Context {
     // ---- transform state ----
@@ -146,6 +167,7 @@ pub struct Context {
 
     // ---- textures ----
     pub textures: HashMap<u32, Texture>,
+    pub texture_units: [TextureUnitState; MAX_TEXTURE_UNITS],
     pub bound_texture: u32,
     next_texture_name: u32,
 
@@ -196,6 +218,7 @@ impl Context {
             client_active_texture: 0,
             active_texture: 0,
             textures: HashMap::new(),
+            texture_units: [TextureUnitState::default(); MAX_TEXTURE_UNITS],
             bound_texture: 0,
             next_texture_name: 1,
             state,
@@ -318,7 +341,17 @@ impl Context {
                 // Enabling without a box set leaves the full-window
                 // default, which matches GL's initial scissor state.
             }
-            GL_TEXTURE_2D => self.state.texture_enabled = on,
+            GL_TEXTURE_2D => {
+                let unit = self.active_texture as usize;
+                if unit >= MAX_TEXTURE_UNITS {
+                    self.set_error(GL_INVALID_ENUM);
+                    return;
+                }
+                self.texture_units[unit].texture_enabled = on;
+                if unit == 0 {
+                    self.state.texture_enabled = on;
+                }
+            }
             GL_FOG => self.state.fog = on,
             // Lighting, dither, normalize, stencil and the rest are
             // accepted and ignored: the fixed-function lighting model
@@ -345,7 +378,17 @@ impl Context {
         match array {
             GL_VERTEX_ARRAY => self.vertex_array.enabled = on,
             GL_COLOR_ARRAY => self.color_array.enabled = on,
-            GL_TEXTURE_COORD_ARRAY => self.texcoord_array.enabled = on,
+            GL_TEXTURE_COORD_ARRAY => {
+                let unit = self.client_active_texture as usize;
+                if unit >= MAX_TEXTURE_UNITS {
+                    self.set_error(GL_INVALID_ENUM);
+                    return;
+                }
+                self.texture_units[unit].texcoord_array.enabled = on;
+                if unit == 0 {
+                    self.texcoord_array.enabled = on;
+                }
+            }
             GL_NORMAL_ARRAY => self.normal_array.enabled = on,
             _ => self.set_error(GL_INVALID_ENUM),
         }
@@ -370,12 +413,72 @@ impl Context {
             self.set_error(GL_INVALID_ENUM);
             return;
         }
+        let unit = self.active_texture as usize;
+        if unit >= MAX_TEXTURE_UNITS {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
         // Binding an unseen name creates the object, as GL requires.
         if name != 0 {
             self.textures.entry(name).or_default();
             self.next_texture_name = self.next_texture_name.max(name + 1);
         }
-        self.bound_texture = name;
+        self.texture_units[unit].bound_texture = name;
+        if unit == 0 {
+            self.bound_texture = name;
+        }
+        log::debug!(
+            "GLES bind texture target=0x{target:04x} name={name} active_unit={} objects={}",
+            self.active_texture,
+            self.textures.len()
+        );
+    }
+
+    pub fn set_active_texture(&mut self, unit: u32) {
+        if unit as usize >= MAX_TEXTURE_UNITS {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        self.active_texture = unit;
+    }
+
+    pub fn set_client_active_texture(&mut self, unit: u32) {
+        if unit as usize >= MAX_TEXTURE_UNITS {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        self.client_active_texture = unit;
+    }
+
+    pub fn set_texcoord_pointer(&mut self, size: u32, ty: u32, stride: u32, pointer: u32) {
+        let unit = self.client_active_texture as usize;
+        if unit >= MAX_TEXTURE_UNITS {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        let enabled = self.texture_units[unit].texcoord_array.enabled;
+        self.texture_units[unit].texcoord_array = ArrayPointer {
+            enabled,
+            size,
+            ty,
+            stride,
+            pointer,
+        };
+        if unit == 0 {
+            self.texcoord_array = self.texture_units[unit].texcoord_array;
+        }
+    }
+
+    pub fn set_multi_texcoord(&mut self, unit: u32, s: f32, t: f32) {
+        let unit = unit.saturating_sub(GL_TEXTURE0) as usize;
+        if unit >= MAX_TEXTURE_UNITS {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        self.texture_units[unit].current_texcoord = [s, t];
+        if unit == 0 {
+            self.current_texcoord = [s, t];
+        }
     }
 
     pub fn delete_textures(&mut self, names: &[u32]) {
@@ -384,8 +487,13 @@ impl Context {
                 continue;
             }
             self.textures.remove(&name);
-            if self.bound_texture == name {
-                self.bound_texture = 0;
+            for (unit, state) in self.texture_units.iter_mut().enumerate() {
+                if state.bound_texture == name {
+                    state.bound_texture = 0;
+                    if unit == 0 {
+                        self.bound_texture = 0;
+                    }
+                }
             }
         }
     }
@@ -417,7 +525,8 @@ impl Context {
         if level != 0 {
             return;
         }
-        if self.bound_texture == 0 {
+        let unit = self.active_texture as usize;
+        if unit >= MAX_TEXTURE_UNITS || self.texture_units[unit].bound_texture == 0 {
             self.set_error(GL_INVALID_OPERATION);
             return;
         }
@@ -432,11 +541,21 @@ impl Context {
                 }
             }
         };
-        let name = self.bound_texture;
+        let name = self.texture_units[self.active_texture as usize].bound_texture;
         let tex = self.textures.entry(name).or_default();
         tex.width = width;
         tex.height = height;
         tex.rgba = rgba;
+        log::debug!(
+            "GLES tex image texture={} level={} {}x{} format=0x{format:04x} type=0x{ty:04x} bytes={} complete={} first={:02x?}",
+            name,
+            level,
+            width,
+            height,
+            data.len(),
+            tex.is_complete(),
+            &tex.rgba[..tex.rgba.len().min(4)],
+        );
     }
 
     /// `glTexSubImage2D`: patch a rectangle of the bound texture.
@@ -465,7 +584,12 @@ impl Context {
             self.set_error(GL_INVALID_ENUM);
             return;
         };
-        let name = self.bound_texture;
+        let unit = self.active_texture as usize;
+        if unit >= MAX_TEXTURE_UNITS {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        let name = self.texture_units[unit].bound_texture;
         let Some(tex) = self.textures.get_mut(&name) else {
             self.set_error(GL_INVALID_OPERATION);
             return;
@@ -487,7 +611,12 @@ impl Context {
             self.set_error(GL_INVALID_ENUM);
             return;
         }
-        let name = self.bound_texture;
+        let unit = self.active_texture as usize;
+        if unit >= MAX_TEXTURE_UNITS {
+            self.set_error(GL_INVALID_ENUM);
+            return;
+        }
+        let name = self.texture_units[unit].bound_texture;
         let Some(tex) = self.textures.get_mut(&name) else {
             return;
         };
@@ -700,15 +829,16 @@ impl Context {
             self.current_color
         };
 
-        let texcoord = if self.texcoord_array.enabled {
+        let unit0 = self.texture_units[0];
+        let texcoord = if unit0.texcoord_array.enabled {
             let t = self
-                .fetch(mem, self.texcoord_array, index, false)
+                .fetch(mem, unit0.texcoord_array, index, false)
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]);
             // The texture matrix applies to incoming coordinates.
             let m = matrix::transform(self.texture_matrix.current(), [t[0], t[1], 0.0, 1.0]);
             [m[0], m[1]]
         } else {
-            self.current_texcoord
+            unit0.current_texcoord
         };
 
         // Eye-space Z drives fog. The modelview alone takes us to eye
@@ -830,11 +960,25 @@ impl Context {
         };
 
         // Resolve the bound texture once per draw, not per fragment.
-        let tex = if self.state.texture_enabled {
-            self.textures.get(&self.bound_texture)
+        let tex = if self.texture_units[0].texture_enabled {
+            self.textures.get(&self.texture_units[0].bound_texture)
         } else {
             None
         };
+        log::debug!(
+            "GLES draw mode=0x{mode:04x} indices={} texture_enabled={} active_unit={} bound_texture={} texture_present={} texture_complete={} vertex_array={} texcoord_array={} texcoord_ptr=0x{:08x} stride={} type=0x{:04x}",
+            indices.len(),
+            self.texture_units[0].texture_enabled,
+            self.active_texture,
+            self.texture_units[0].bound_texture,
+            tex.is_some(),
+            tex.is_some_and(Texture::is_complete),
+            self.vertex_array.enabled,
+            self.texcoord_array.enabled,
+            self.texcoord_array.pointer,
+            self.texcoord_array.stride,
+            self.texcoord_array.ty,
+        );
         let sample = |s: f32, t: f32| tex.map(|tx| tx.sample_nearest(s, t));
         for tri in tris {
             raster::draw_triangle(&mut self.target, &self.state, &sample, tri);

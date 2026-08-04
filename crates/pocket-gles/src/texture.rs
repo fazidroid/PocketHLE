@@ -309,6 +309,7 @@ mod tests {
     fn rgba5551_alpha_is_one_bit() {
         let opaque = 0x0001u16.to_le_bytes();
         let out = decode_to_rgba(&opaque, 1, 1, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1).unwrap();
+        assert_eq!(out.len(), 4);
         assert_eq!(out[3], 255);
         let transparent = 0x0000u16.to_le_bytes();
         let out = decode_to_rgba(&transparent, 1, 1, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1).unwrap();
