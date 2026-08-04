@@ -1068,9 +1068,11 @@ mod tests {
 
     #[test]
     fn exponential_fog_is_unfogged_at_zero_depth() {
-        let mut s = PipelineState::default();
-        s.fog_mode = FogMode::Exp;
-        s.fog_density = 0.25;
+        let s = PipelineState {
+            fog_mode: FogMode::Exp,
+            fog_density: 0.25,
+            ..PipelineState::default()
+        };
         assert_eq!(fog_factor(&s, 0.0), 1.0);
         assert_eq!(fog_factor(&s, -10.0), 1.0);
         assert!((fog_factor(&s, 4.0) - (-1.0f32).exp()).abs() < 1e-6);
@@ -1078,9 +1080,11 @@ mod tests {
 
     #[test]
     fn exp2_fog_uses_density_squared_in_the_exponent() {
-        let mut s = PipelineState::default();
-        s.fog_mode = FogMode::Exp2;
-        s.fog_density = 0.5;
+        let s = PipelineState {
+            fog_mode: FogMode::Exp2,
+            fog_density: 0.5,
+            ..PipelineState::default()
+        };
         assert!((fog_factor(&s, 2.0) - (-1.0f32).exp()).abs() < 1e-6);
     }
 
