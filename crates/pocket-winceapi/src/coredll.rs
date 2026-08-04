@@ -6864,11 +6864,14 @@ fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn end_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // The guest has finished filling its client area; the child controls
-    // paint on top, as sibling windows would on a device.
-    repaint_controls(ctx);
-    repaint_status_bar(ctx);
-    ctx.kernel.framebuffer.mark_dirty();
+    // The game has already presented its completed surface when it calls
+    // EndPaint. Repainting the shell here can expose an all-white DIB
+    // frame before the next game frame is ready. Controls are composited
+    // by the frame hook at the presentation boundary instead.
+    if !ctx.kernel.fb_mapped {
+        repaint_controls(ctx);
+        repaint_status_bar(ctx);
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
