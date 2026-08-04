@@ -113,6 +113,32 @@ pub const GL_VIEWPORT: u32 = 0x0BA2;
 pub const GL_COMPRESSED_TEXTURE_FORMATS: u32 = 0x86A3;
 pub const GL_NUM_COMPRESSED_TEXTURE_FORMATS: u32 = 0x86A2;
 
+// ---- ATITC (AMD ATC) compressed texture formats ------------------------
+//
+// `GL_AMD_compressed_ATC_texture`. Qualcomm's Adreno was the dominant
+// GPU in Windows Mobile handsets, so titles that ship compressed art
+// ship it as ATC: Xtrakt uploads its entire atlas set this way and
+// checks `glGetError` afterwards, so a driver that rejects the format
+// stops the game rather than merely losing the texture.
+pub const GL_ATC_RGB_AMD: u32 = 0x8C92;
+pub const GL_ATC_RGBA_EXPLICIT_ALPHA_AMD: u32 = 0x8C93;
+pub const GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD: u32 = 0x87EE;
+pub const GL_MODELVIEW_MATRIX: u32 = 0x0BA6;
+pub const GL_PROJECTION_MATRIX: u32 = 0x0BA7;
+pub const GL_TEXTURE_MATRIX: u32 = 0x0BA8;
+pub const GL_CURRENT_COLOR: u32 = 0x0B00;
+pub const GL_DEPTH_RANGE: u32 = 0x0B70;
+
+// ---- buffer objects ----------------------------------------------------
+pub const GL_ARRAY_BUFFER: u32 = 0x8892;
+pub const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
+pub const GL_ARRAY_BUFFER_BINDING: u32 = 0x8894;
+pub const GL_ELEMENT_ARRAY_BUFFER_BINDING: u32 = 0x8895;
+pub const GL_STATIC_DRAW: u32 = 0x88E4;
+pub const GL_DYNAMIC_DRAW: u32 = 0x88E8;
+pub const GL_BUFFER_SIZE: u32 = 0x8764;
+pub const GL_BUFFER_USAGE: u32 = 0x8765;
+
 // ---- depth / alpha comparison functions --------------------------------
 pub const GL_NEVER: u32 = 0x0200;
 pub const GL_LESS: u32 = 0x0201;

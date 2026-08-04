@@ -87,6 +87,66 @@ impl Texture {
         ]
     }
 
+    /// Sample a texel with bilinear filtering.
+    ///
+    /// GL places texel centres at half-integer coordinates, so the
+    /// weights come from `s * width - 0.5`. Filtering runs on straight
+    /// alpha, which lets the RGB of fully transparent texels bleed into
+    /// a glyph's edge — that is what real GL does too, and font atlases
+    /// are authored knowing it.
+    pub fn sample_linear(&self, s: f32, t: f32) -> [u8; 4] {
+        if !self.is_complete() {
+            return [255, 255, 255, 255];
+        }
+        let fx = s * self.width as f32 - 0.5;
+        let fy = t * self.height as f32 - 0.5;
+        let (x0, y0) = (fx.floor(), fy.floor());
+        let (wx, wy) = (fx - x0, fy - y0);
+        let (x0, y0) = (x0 as i64, y0 as i64);
+
+        let texel = |x: i64, y: i64| {
+            let x = Self::wrap_texel(x, self.width, self.wrap_s);
+            let y = Self::wrap_texel(y, self.height, self.wrap_t);
+            let i = ((y * self.width + x) * 4) as usize;
+            &self.rgba[i..i + 4]
+        };
+        let (c00, c10) = (texel(x0, y0), texel(x0 + 1, y0));
+        let (c01, c11) = (texel(x0, y0 + 1), texel(x0 + 1, y0 + 1));
+
+        let mut out = [0u8; 4];
+        for (ch, o) in out.iter_mut().enumerate() {
+            let top = c00[ch] as f32 + (c10[ch] as f32 - c00[ch] as f32) * wx;
+            let bot = c01[ch] as f32 + (c11[ch] as f32 - c01[ch] as f32) * wx;
+            *o = (top + (bot - top) * wy).round().clamp(0.0, 255.0) as u8;
+        }
+        out
+    }
+
+    /// Sample with whichever filter the guest asked for.
+    ///
+    /// The rasterizer has no derivatives, so it cannot tell
+    /// magnification from minification; we always honour `mag_filter`.
+    /// Games set both to the same value in practice, and the case that
+    /// matters visually — a HUD or font quad drawn at roughly 1:1 — is
+    /// magnification anyway.
+    pub fn sample(&self, s: f32, t: f32) -> [u8; 4] {
+        match self.mag_filter {
+            Filter::Nearest => self.sample_nearest(s, t),
+            Filter::Linear => self.sample_linear(s, t),
+        }
+    }
+
+    /// Resolve an integer texel coordinate through a wrap mode.
+    fn wrap_texel(v: i64, size: u32, wrap: Wrap) -> u32 {
+        if size == 0 {
+            return 0;
+        }
+        match wrap {
+            Wrap::Repeat => v.rem_euclid(size as i64) as u32,
+            Wrap::ClampToEdge => v.clamp(0, size as i64 - 1) as u32,
+        }
+    }
+
     fn wrap_coord(v: f32, size: u32, wrap: Wrap) -> u32 {
         if size == 0 {
             return 0;
@@ -271,6 +331,169 @@ pub fn decode_to_rgba(
     Some(out)
 }
 
+// ---- ATITC (AMD ATC) ------------------------------------------------------
+//
+// ATC stores 4x4 blocks. The RGB block is eight bytes laid out like
+// DXT1 — two endpoint colours then sixteen two-bit selectors — but the
+// endpoints are derived differently, and the top bit of the first
+// endpoint picks between two interpolation modes rather than signalling
+// punch-through alpha. `EXPLICIT_ALPHA` prefixes each block with eight
+// bytes of DXT3-style 4-bit alpha; `INTERPOLATED_ALPHA` prefixes it
+// with a DXT5-style alpha block.
+
+/// Blocks needed to cover `width` x `height`, rounding up on both axes.
+#[inline]
+fn block_counts(width: u32, height: u32) -> (usize, usize) {
+    (width.div_ceil(4) as usize, height.div_ceil(4) as usize)
+}
+
+/// Bytes `glCompressedTexImage2D` needs for an image in `format`, or
+/// `None` if the format is not one we decode.
+pub fn compressed_image_size(format: u32, width: u32, height: u32) -> Option<usize> {
+    let per_block = match format {
+        GL_ATC_RGB_AMD => 8,
+        GL_ATC_RGBA_EXPLICIT_ALPHA_AMD | GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD => 16,
+        _ => return None,
+    };
+    let (bw, bh) = block_counts(width, height);
+    bw.checked_mul(bh)?.checked_mul(per_block)
+}
+
+/// Decode one eight-byte ATC RGB block into sixteen RGB triples in
+/// raster order within the block.
+fn atc_rgb_block(src: &[u8]) -> [[u8; 3]; 16] {
+    let c0 = u16::from_le_bytes([src[0], src[1]]);
+    let c1 = u16::from_le_bytes([src[2], src[3]]);
+    let bits = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+
+    // The first endpoint is RGB555 with the mode in bit 15; the second
+    // is always RGB565.
+    let e0 = [expand5(c0 >> 10), expand5(c0 >> 5), expand5(c0)];
+    let e1 = [expand5(c1 >> 11), expand6(c1 >> 5), expand5(c1)];
+
+    let mut pal = [[0u8; 3]; 4];
+    if c0 & 0x8000 == 0 {
+        // Mode 0: both endpoints are used, with the two interior
+        // colours at 3/8 and 5/8 — the same split DXT1 uses at 1/3.
+        pal[0] = e0;
+        pal[3] = e1;
+        for ch in 0..3 {
+            let (a, b) = (e0[ch] as u32, e1[ch] as u32);
+            pal[1][ch] = ((a * 5 + b * 3) / 8) as u8;
+            pal[2][ch] = ((a * 3 + b * 5) / 8) as u8;
+        }
+    } else {
+        // Mode 1: selector 0 is forced to black, which is how ATC
+        // encodes blocks that need a hard dark edge without spending an
+        // endpoint on it.
+        pal[0] = [0, 0, 0];
+        pal[2] = e0;
+        pal[3] = e1;
+        for ch in 0..3 {
+            pal[1][ch] = (e0[ch] as u32).saturating_sub(e1[ch] as u32 / 4) as u8;
+        }
+    }
+
+    let mut out = [[0u8; 3]; 16];
+    for (i, texel) in out.iter_mut().enumerate() {
+        *texel = pal[((bits >> (i * 2)) & 3) as usize];
+    }
+    out
+}
+
+/// Decode one eight-byte DXT5-style interpolated alpha block into
+/// sixteen alpha values.
+fn interpolated_alpha_block(src: &[u8]) -> [u8; 16] {
+    let (a0, a1) = (src[0], src[1]);
+    let mut pal = [0u8; 8];
+    pal[0] = a0;
+    pal[1] = a1;
+    if a0 > a1 {
+        for (i, slot) in pal.iter_mut().enumerate().take(8).skip(2) {
+            let (w0, w1) = ((8 - i) as u32, (i - 1) as u32);
+            *slot = ((a0 as u32 * w0 + a1 as u32 * w1) / 7) as u8;
+        }
+    } else {
+        for (i, slot) in pal.iter_mut().enumerate().take(6).skip(2) {
+            let (w0, w1) = ((6 - i) as u32, (i - 1) as u32);
+            *slot = ((a0 as u32 * w0 + a1 as u32 * w1) / 5) as u8;
+        }
+        pal[6] = 0;
+        pal[7] = 255;
+    }
+    // Sixteen three-bit selectors packed into the remaining six bytes.
+    let bits = src[2..8]
+        .iter()
+        .enumerate()
+        .fold(0u64, |acc, (i, &b)| acc | ((b as u64) << (i * 8)));
+    let mut out = [0u8; 16];
+    for (i, a) in out.iter_mut().enumerate() {
+        *a = pal[((bits >> (i * 3)) & 7) as usize];
+    }
+    out
+}
+
+/// Decode an ATC image into RGBA8888.
+///
+/// Returns `None` if the format is not ATC or the guest handed us fewer
+/// bytes than the block layout needs.
+pub fn decode_compressed_to_rgba(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    format: u32,
+) -> Option<Vec<u8>> {
+    let needed = compressed_image_size(format, width, height)?;
+    if data.len() < needed {
+        return None;
+    }
+    let stride = match format {
+        GL_ATC_RGB_AMD => 8,
+        _ => 16,
+    };
+    let (bw, bh) = block_counts(width, height);
+    let (w, h) = (width as usize, height as usize);
+    let mut out = vec![0u8; w.checked_mul(h)?.checked_mul(4)?];
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let block = &data[(by * bw + bx) * stride..];
+            let (rgb, alpha) = match format {
+                GL_ATC_RGB_AMD => (atc_rgb_block(block), [255u8; 16]),
+                GL_ATC_RGBA_EXPLICIT_ALPHA_AMD => {
+                    let mut a = [0u8; 16];
+                    for (i, slot) in a.iter_mut().enumerate() {
+                        let nibble = block[i / 2] >> (4 * (i % 2));
+                        *slot = expand4(nibble as u16);
+                    }
+                    (atc_rgb_block(&block[8..]), a)
+                }
+                _ => (atc_rgb_block(&block[8..]), interpolated_alpha_block(block)),
+            };
+            // Blocks at the right and bottom edges hang over the image
+            // when the dimensions are not multiples of four; the
+            // overhanging texels are simply dropped.
+            for ty in 0..4 {
+                let y = by * 4 + ty;
+                if y >= h {
+                    break;
+                }
+                for tx in 0..4 {
+                    let x = bx * 4 + tx;
+                    if x >= w {
+                        break;
+                    }
+                    let i = ty * 4 + tx;
+                    let o = (y * w + x) * 4;
+                    out[o..o + 3].copy_from_slice(&rgb[i]);
+                    out[o + 3] = alpha[i];
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +580,64 @@ mod tests {
     fn incomplete_texture_samples_white() {
         let t = Texture::default();
         assert_eq!(t.sample_nearest(0.5, 0.5), [255, 255, 255, 255]);
+        assert_eq!(t.sample_linear(0.5, 0.5), [255, 255, 255, 255]);
+    }
+
+    /// A 2x1 texture, black then white, clamped so the edges do not
+    /// wrap around into each other.
+    fn ramp_2x1() -> Texture {
+        Texture {
+            width: 2,
+            height: 1,
+            rgba: vec![0, 0, 0, 0, 255, 255, 255, 255],
+            wrap_s: Wrap::ClampToEdge,
+            wrap_t: Wrap::ClampToEdge,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn linear_blends_halfway_between_texel_centres() {
+        let t = ramp_2x1();
+        // Texel centres sit at s = 0.25 and 0.75; sampling exactly
+        // between them must return the midpoint of the two colours.
+        assert_eq!(t.sample_linear(0.5, 0.5), [128, 128, 128, 128]);
+        // And a quarter of the way across is a quarter of the blend.
+        assert_eq!(t.sample_linear(0.375, 0.5), [64, 64, 64, 64]);
+    }
+
+    #[test]
+    fn linear_reproduces_texel_colours_at_their_centres() {
+        let t = ramp_2x1();
+        assert_eq!(t.sample_linear(0.25, 0.5), [0, 0, 0, 0]);
+        assert_eq!(t.sample_linear(0.75, 0.5), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn linear_clamps_rather_than_reading_out_of_bounds() {
+        let t = ramp_2x1();
+        // Left of the first texel centre there is nothing to blend
+        // with, so ClampToEdge repeats the edge texel.
+        assert_eq!(t.sample_linear(0.0, 0.5), [0, 0, 0, 0]);
+        assert_eq!(t.sample_linear(1.0, 0.5), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn linear_wraps_across_the_seam_when_repeating() {
+        let mut t = ramp_2x1();
+        t.wrap_s = Wrap::Repeat;
+        // At s = 0 the sample straddles the seam, blending texel 1
+        // (white, wrapped from the right edge) with texel 0 (black).
+        assert_eq!(t.sample_linear(0.0, 0.5), [128, 128, 128, 128]);
+    }
+
+    #[test]
+    fn sample_dispatches_on_the_requested_filter() {
+        let mut t = ramp_2x1();
+        t.mag_filter = Filter::Nearest;
+        assert_eq!(t.sample(0.5, 0.5), [255, 255, 255, 255]);
+        t.mag_filter = Filter::Linear;
+        assert_eq!(t.sample(0.5, 0.5), [128, 128, 128, 128]);
     }
 
     #[test]
@@ -373,5 +654,84 @@ mod tests {
         let mut t = Texture::default();
         assert!(!t.set_parameter(0x9999, GL_LINEAR));
         assert!(!t.set_parameter(GL_TEXTURE_MAG_FILTER, 0x9999));
+    }
+
+    /// Build one ATC RGB block: two endpoints and sixteen selectors.
+    fn atc_block(c0: u16, c1: u16, sel: u32) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        b[0..2].copy_from_slice(&c0.to_le_bytes());
+        b[2..4].copy_from_slice(&c1.to_le_bytes());
+        b[4..8].copy_from_slice(&sel.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn atc_image_size_follows_the_block_layout() {
+        // 8 bytes per 4x4 block for RGB, 16 with an alpha block.
+        assert_eq!(compressed_image_size(GL_ATC_RGB_AMD, 8, 8), Some(4 * 8));
+        assert_eq!(
+            compressed_image_size(GL_ATC_RGBA_EXPLICIT_ALPHA_AMD, 8, 8),
+            Some(4 * 16)
+        );
+        // Non-multiples of four round up to whole blocks.
+        assert_eq!(compressed_image_size(GL_ATC_RGB_AMD, 5, 1), Some(2 * 8));
+        // Anything else is not ours to decode.
+        assert_eq!(compressed_image_size(GL_RGBA, 8, 8), None);
+    }
+
+    #[test]
+    fn atc_mode0_interpolates_between_both_endpoints() {
+        // Mode 0 (top bit of c0 clear): white RGB555 endpoint and black
+        // RGB565 endpoint, with the four selectors 0..3 in texels 0..3.
+        let block = atc_block(0x7FFF, 0x0000, 0b11_10_01_00);
+        let out = decode_compressed_to_rgba(&block, 4, 1, GL_ATC_RGB_AMD).unwrap();
+        // Selector 0 is endpoint 0, selector 3 is endpoint 1, and the
+        // interior colours sit at 5/8 and 3/8 rather than DXT1's 2/3.
+        assert_eq!(&out[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&out[4..8], &[159, 159, 159, 255]);
+        assert_eq!(&out[8..12], &[95, 95, 95, 255]);
+        assert_eq!(&out[12..16], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn atc_mode1_forces_selector_zero_to_black() {
+        // Mode 1 (top bit of c0 set) spends no endpoint on black, so
+        // selector 0 is black regardless of what the endpoints hold.
+        let block = atc_block(0x8000 | 0x7FFF, 0xFFFF, 0b00_00_00_00);
+        let out = decode_compressed_to_rgba(&block, 4, 1, GL_ATC_RGB_AMD).unwrap();
+        assert_eq!(&out[0..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn atc_explicit_alpha_reads_one_nibble_per_texel() {
+        let mut block = [0u8; 16];
+        // Texel 0 alpha = 0x0, texel 1 = 0xF, texel 2 = 0x8.
+        block[0] = 0xF0;
+        block[1] = 0x08;
+        block[8..16].copy_from_slice(&atc_block(0x7FFF, 0x7FFF, 0));
+        let out = decode_compressed_to_rgba(&block, 4, 1, GL_ATC_RGBA_EXPLICIT_ALPHA_AMD).unwrap();
+        assert_eq!(out[3], 0x00);
+        assert_eq!(out[7], 0xFF);
+        // 0x8 replicated to eight bits is 0x88, not 0x80 — the same
+        // reasoning as `expand5`.
+        assert_eq!(out[11], 0x88);
+    }
+
+    #[test]
+    fn atc_rejects_short_data_rather_than_panicking() {
+        // A guest that passes a wrong `imageSize` must get None, not an
+        // out-of-bounds slice.
+        let short = [0u8; 4];
+        assert!(decode_compressed_to_rgba(&short, 4, 4, GL_ATC_RGB_AMD).is_none());
+    }
+
+    #[test]
+    fn atc_drops_texels_that_hang_past_the_edge() {
+        // A 2x2 image still costs one whole block; the twelve
+        // overhanging texels must not be written anywhere.
+        let block = atc_block(0x7FFF, 0x7FFF, 0);
+        let out = decode_compressed_to_rgba(&block, 2, 2, GL_ATC_RGB_AMD).unwrap();
+        assert_eq!(out.len(), 2 * 2 * 4);
+        assert!(out.chunks(4).all(|p| p == [255, 255, 255, 255]));
     }
 }
