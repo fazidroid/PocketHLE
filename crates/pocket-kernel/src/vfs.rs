@@ -183,13 +183,20 @@ impl Vfs {
         let mut mounts: Vec<_> = self
             .mounts
             .iter()
-            .filter(|mount| normalised.starts_with(&mount.prefix))
+            .filter(|mount| {
+                let root = mount.prefix.trim_end_matches('/');
+                normalised == root || normalised.starts_with(&mount.prefix)
+            })
             .collect();
         mounts.sort_by_key(|mount| std::cmp::Reverse(mount.prefix.len()));
         mounts
     }
 
     fn host_path_for_mount(&self, mount: &Mount, normalised: &str) -> Option<PathBuf> {
+        let root = mount.prefix.trim_end_matches('/');
+        if normalised == root {
+            return Some(mount.host_dir.clone());
+        }
         let rel = &normalised[mount.prefix.len()..];
         let mut p = mount.host_dir.clone();
         for comp in Path::new(rel).components() {
@@ -271,6 +278,65 @@ impl Vfs {
             }
         }
         (!merged.is_empty()).then(|| merged.into_values().collect())
+    }
+
+    /// Create a guest directory through the writable mount that owns it.
+    pub fn create_dir(&self, guest_path: &str) -> bool {
+        let normalised = self.normalise_guest_path(guest_path);
+        let Some(mount) = self
+            .matching_mounts(&normalised)
+            .into_iter()
+            .find(|mount| !mount.read_only)
+        else {
+            return false;
+        };
+        let Some(path) = self.host_path_for_mount(mount, &normalised) else {
+            return false;
+        };
+        std::fs::create_dir_all(path).is_ok()
+    }
+
+    /// Remove a guest file from the writable mount that owns it.
+    pub fn delete_file(&self, guest_path: &str) -> bool {
+        let normalised = self.normalise_guest_path(guest_path);
+        let Some(mount) = self
+            .matching_mounts(&normalised)
+            .into_iter()
+            .find(|mount| !mount.read_only)
+        else {
+            return false;
+        };
+        let Some(path) = self.host_path_for_mount(mount, &normalised) else {
+            return false;
+        };
+        std::fs::remove_file(path).is_ok()
+    }
+
+    /// Rename a guest file within the writable mount that owns it.
+    pub fn move_file(&self, from: &str, to: &str) -> bool {
+        let from_normalised = self.normalise_guest_path(from);
+        let to_normalised = self.normalise_guest_path(to);
+        let Some(mount) = self
+            .matching_mounts(&from_normalised)
+            .into_iter()
+            .find(|mount| !mount.read_only)
+        else {
+            return false;
+        };
+        let Some(source) = self.host_path_for_mount(mount, &from_normalised) else {
+            return false;
+        };
+        let root = mount.prefix.trim_end_matches('/');
+        if to_normalised != root && !to_normalised.starts_with(&mount.prefix) {
+            return false;
+        }
+        let Some(destination) = self.host_path_for_mount(mount, &to_normalised) else {
+            return false;
+        };
+        if let Some(parent) = destination.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::rename(source, destination).is_ok()
     }
 
     /// Open a host file behind a guest path. Returns the handle id.
@@ -436,6 +502,23 @@ mod tests {
         v.flush(h).unwrap();
         v.close(h);
         assert_eq!(std::fs::read(host_path).unwrap(), b"settings");
+    }
+
+    #[test]
+    fn writable_mount_supports_atomic_save_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vfs::new();
+        v.mount("\\Save\\", dir.path());
+        assert!(v.create_dir("\\Save\\nested"));
+        let h = v
+            .open("\\Save\\nested\\old.dat", Access::Write, true)
+            .unwrap();
+        assert_eq!(v.write(h, b"save"), Some(4));
+        v.flush(h).unwrap();
+        v.close(h);
+        assert!(v.move_file("\\Save\\nested\\old.dat", "\\Save\\nested\\new.dat"));
+        assert!(v.delete_file("\\Save\\nested\\new.dat"));
+        assert!(!v.move_file("\\Save\\nested\\missing.dat", "\\Other\\escape.dat"));
     }
 
     #[test]

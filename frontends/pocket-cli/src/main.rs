@@ -566,7 +566,7 @@ fn cmd_run(
             &pocket_library::default_library_root(),
             &archive::save_id(path),
         );
-        emu.mount_dir(save_prefix, &save_dir);
+        emu.mount_save_dir(save_prefix, &save_dir);
         println!(
             "Persistent save data: {} -> {save_prefix:?}",
             save_dir.display()

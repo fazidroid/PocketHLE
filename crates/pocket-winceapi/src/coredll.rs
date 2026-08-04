@@ -260,13 +260,13 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "FindFirstFileW", find_first_file_w);
     d.register_handler(dll, "FindNextFileW", find_next_file_w);
     d.register_handler(dll, "FindClose", find_close);
-    d.register_constant(dll, "DeleteFileW", 1, one_returning);
+    d.register_handler(dll, "DeleteFileW", delete_file_w);
     d.register_constant(dll, "SetFileAttributesW", 1, one_returning);
     d.register_handler(dll, "GetFileAttributesW", get_file_attributes_w);
-    d.register_constant(dll, "CreateDirectoryW", 1, one_returning);
+    d.register_handler(dll, "CreateDirectoryW", create_directory_w);
     d.register_handler(dll, "RemoveDirectoryW", remove_directory_w);
     d.register_constant(dll, "CopyFileW", 1, one_returning);
-    d.register_constant(dll, "MoveFileW", 1, one_returning);
+    d.register_handler(dll, "MoveFileW", move_file_w);
     d.register_constant(dll, "SetEndOfFile", 1, one_returning);
     d.register_constant(dll, "GetFileInformationByHandle", 0, zero_returning);
     d.register_constant(dll, "OpenProcess", 0, zero_returning);
@@ -283,7 +283,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "fgetpos", crt_fgetpos);
     d.register_handler(dll, "fsetpos", crt_fsetpos);
     d.register_handler(dll, "feof", crt_feof);
-    d.register_constant(dll, "fflush", 1, one_returning);
+    d.register_handler(dll, "fflush", crt_fflush);
     d.register_handler(dll, "fgetc", crt_fgetc);
     d.register_handler(dll, "fputc", crt_fputc);
     d.register_handler(dll, "fgets", crt_fgets);
@@ -4349,6 +4349,41 @@ fn get_file_size(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 /// it must succeed. Refusing to delete through a mount is deliberate:
 /// mounts point at the extracted CAB (or whatever `--rom-dir` names),
 /// and a guest should not be able to erase host content.
+fn create_directory_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let name = String::from_utf16_lossy(&read_wstr(ctx, name_p, 260)?);
+    let ok = ctx.kernel.vfs.create_dir(&name);
+    log::debug!("CreateDirectoryW({name:?}) -> {ok}");
+    Ok(DispatchOutcome::ReturnedR0(u32::from(ok)))
+}
+
+fn delete_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let name = String::from_utf16_lossy(&read_wstr(ctx, name_p, 260)?);
+    let ok = ctx.kernel.vfs.delete_file(&name);
+    log::debug!("DeleteFileW({name:?}) -> {ok}");
+    Ok(DispatchOutcome::ReturnedR0(u32::from(ok)))
+}
+
+fn move_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let from_p = ctx.arg_u32(0)?;
+    let to_p = ctx.arg_u32(1)?;
+    if from_p == 0 || to_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let from = String::from_utf16_lossy(&read_wstr(ctx, from_p, 260)?);
+    let to = String::from_utf16_lossy(&read_wstr(ctx, to_p, 260)?);
+    let ok = ctx.kernel.vfs.move_file(&from, &to);
+    log::debug!("MoveFileW({from:?}, {to:?}) -> {ok}");
+    Ok(DispatchOutcome::ReturnedR0(u32::from(ok)))
+}
+
 fn remove_directory_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let name_p = ctx.arg_u32(0)?;
     if name_p == 0 {
@@ -4530,8 +4565,23 @@ fn crt_wfopen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn crt_fclose(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let h = ctx.arg_u32(0)?;
-    ctx.kernel.vfs.close(h);
-    Ok(DispatchOutcome::ReturnedR0(0))
+    let result = if ctx.kernel.vfs.flush(h).is_ok() && ctx.kernel.vfs.close(h) {
+        0
+    } else {
+        u32::MAX
+    };
+    Ok(DispatchOutcome::ReturnedR0(result))
+}
+
+fn crt_fflush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(
+        if ctx.kernel.vfs.flush(h).is_ok() {
+            0
+        } else {
+            u32::MAX
+        },
+    ))
 }
 
 fn crt_fread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -12317,6 +12367,26 @@ fn find_first_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let pattern_p = ctx.arg_u32(0)?;
     let out = ctx.arg_u32(1)?;
     let pattern = String::from_utf16_lossy(&read_wstr(ctx, pattern_p, 520)?);
+    if !pattern.contains('*') && !pattern.contains('?') {
+        if let Some(host) = ctx.kernel.vfs.resolve(&pattern) {
+            if let Ok(meta) = std::fs::metadata(&host) {
+                let name = pattern
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(".")
+                    .to_string();
+                let entry = (name, meta.len(), meta.is_dir());
+                write_find_data(ctx, out, &entry)?;
+                let handle = FIND_HANDLE_BASE.saturating_add(ctx.kernel.next_find_handle);
+                ctx.kernel.next_find_handle = ctx.kernel.next_find_handle.wrapping_add(1);
+                ctx.kernel
+                    .find_handles
+                    .insert(handle, std::collections::VecDeque::new());
+                return Ok(DispatchOutcome::ReturnedR0(handle));
+            }
+        }
+    }
     let (dir, mask) = split_search_pattern(&pattern);
     let entries = ctx.kernel.vfs.list_dir(&dir).unwrap_or_default();
     let mut matches: std::collections::VecDeque<(String, u64, bool)> = entries
@@ -12368,7 +12438,10 @@ fn find_close(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 mod tests {
     use super::*;
     use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu, Prot};
-    use pocket_kernel::{vfs::Vfs, Heap, KernelState, Thunk};
+    use pocket_kernel::{
+        vfs::{Access, Vfs},
+        Heap, KernelState, Thunk,
+    };
     use pocket_pe::ImportBinding;
 
     fn fresh_kernel() -> KernelState {
@@ -12852,6 +12925,60 @@ mod tests {
             remove_directory_w(&mut c).unwrap(),
             DispatchOutcome::ReturnedR0(0)
         );
+    }
+
+    #[test]
+    fn file_mutation_handlers_write_through_vfs() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        kernel.vfs.mount("\\Save\\", dir.path());
+        cpu.map_region(0x1000, 0x2000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let wide = |text: &str| -> Vec<u8> {
+            text.encode_utf16()
+                .chain(std::iter::once(0))
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        };
+        cpu.write_mem(0x1000, &wide("\\Save\\old.dat")).unwrap();
+        cpu.write_mem(0x1400, &wide("\\Save\\new.dat")).unwrap();
+        cpu.write_mem(0x1800, b"data").unwrap();
+        cpu.write_mem(0x1c00, &wide("\\Save\\nested")).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1c00).unwrap();
+        cpu.write_mem(0x1e00, &wide("\\Save\\nested\\old.dat"))
+            .unwrap();
+        cpu.write_mem(0x2200, &wide("\\Save\\nested\\new.dat"))
+            .unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(
+            create_directory_w(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        let handle = c
+            .kernel
+            .vfs
+            .open("\\Save\\nested\\old.dat", Access::Write, true)
+            .unwrap();
+        c.cpu.write_reg(ArmReg::R0, handle).unwrap();
+        c.cpu.write_reg(ArmReg::R1, 0x1800).unwrap();
+        c.cpu.write_reg(ArmReg::R2, 4).unwrap();
+        c.cpu.write_reg(ArmReg::R3, 0).unwrap();
+        assert_eq!(write_file(&mut c).unwrap(), DispatchOutcome::ReturnedR0(1));
+        c.cpu.write_reg(ArmReg::R0, 0x1e00).unwrap();
+        c.cpu.write_reg(ArmReg::R1, 0x2200).unwrap();
+        assert_eq!(move_file_w(&mut c).unwrap(), DispatchOutcome::ReturnedR0(1));
+        c.cpu.write_reg(ArmReg::R0, 0x2200).unwrap();
+        assert_eq!(
+            delete_file_w(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert!(!dir.path().join("nested").join("new.dat").exists());
     }
 
     #[test]
