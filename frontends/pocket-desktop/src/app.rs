@@ -341,100 +341,96 @@ impl PocketLauncher {
     }
 
     fn ui_game_card(&mut self, ui: &mut egui::Ui, game: &GameEntry, width: f32) {
-        let card_size = Vec2::new(width, 224.0);
-        let (card_rect, card_response) = ui.allocate_exact_size(card_size, Sense::click());
         let frame = egui::Frame::none()
             .fill(Color32::from_rgb(35, 38, 46))
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(82, 86, 96)))
             .rounding(16.0)
             .inner_margin(0.0);
-        ui.painter().add(frame.paint(card_rect));
-
-        let menu_rect = Rect::from_min_size(
-            Pos2::new(card_rect.right() - 36.0, card_rect.top() + 4.0),
-            Vec2::new(32.0, 32.0),
-        );
-        let mut menu_ui = ui.child_ui(menu_rect, egui::Layout::right_to_left(egui::Align::Center));
-        menu_ui.menu_button(RichText::new("⋮").size(24.0), |ui| {
-            if ui.button("Settings").clicked() {
-                self.selected_game = Some(game.id.clone());
-                self.game_settings_draft = Some((game.id.clone(), game.settings.clone()));
-                self.screen = Screen::GameSettings;
-                ui.close_menu();
-            }
-            if ui.button("Remove").clicked() {
-                if let Err(e) = self.library.remove(&game.id) {
-                    self.status = format!("Remove failed: {e}");
-                } else {
-                    self.status = format!("Removed {}", game.display_name);
-                }
-                ui.close_menu();
-            }
-        });
-
-        let icon_rect = Rect::from_min_size(
-            Pos2::new(card_rect.left(), card_rect.top() + 4.0),
-            Vec2::new(width, 152.0),
-        );
-        let icon_size = (width - 24.0).clamp(56.0, 112.0);
-        let mut icon_ui = ui.child_ui(
-            icon_rect,
-            egui::Layout::centered_and_justified(egui::Direction::TopDown),
-        );
-        if let Some(path) = game.icon_path(self.library.root()) {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(image) = load_image_bytes(&bytes) {
-                    let texture = self.icon_cache.entry(game.id.clone()).or_insert_with(|| {
-                        icon_ui.ctx().load_texture(
-                            format!("icon-{}", game.id),
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        )
+        let card = frame.show(ui, |ui| {
+            ui.set_min_width(width);
+            ui.set_max_width(width);
+            ui.vertical(|ui| {
+                ui.set_width(width);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button(RichText::new("⋮").size(24.0), |ui| {
+                        if ui.button("Settings").clicked() {
+                            self.selected_game = Some(game.id.clone());
+                            self.game_settings_draft =
+                                Some((game.id.clone(), game.settings.clone()));
+                            self.screen = Screen::GameSettings;
+                            ui.close_menu();
+                        }
+                        if ui.button("Remove").clicked() {
+                            if let Err(e) = self.library.remove(&game.id) {
+                                self.status = format!("Remove failed: {e}");
+                            } else {
+                                self.status = format!("Removed {}", game.display_name);
+                            }
+                            ui.close_menu();
+                        }
                     });
-                    icon_ui.add(
-                        egui::Image::from_texture(&*texture)
-                            .fit_to_exact_size(Vec2::splat(icon_size)),
-                    );
-                } else {
-                    icon_ui.label(RichText::new("📱").size(64.0));
-                }
-            } else {
-                icon_ui.label(RichText::new("📱").size(64.0));
-            }
-        } else {
-            icon_ui.label(RichText::new("📱").size(64.0));
-        }
+                });
 
-        let label_rect = Rect::from_min_size(
-            Pos2::new(card_rect.left(), card_rect.top() + 156.0),
-            Vec2::new(width, 68.0),
-        );
-        ui.painter()
-            .rect_filled(label_rect, 0.0, Color32::from_rgb(28, 29, 32));
-        let text_rect = Rect::from_min_size(
-            Pos2::new(label_rect.left() + 12.0, label_rect.top() + 9.0),
-            Vec2::new(width - 24.0, 50.0),
-        );
-        let mut text_ui = ui.child_ui(text_rect, egui::Layout::top_down(egui::Align::Min));
-        text_ui.set_width(width - 24.0);
-        text_ui.set_height(50.0);
-        let publisher = game
-            .provider
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("Unknown");
-        text_ui.add(
-            egui::Label::new(RichText::new(&game.display_name).strong().size(18.0)).truncate(true),
-        );
-        text_ui.add(
-            egui::Label::new(
-                RichText::new(format!("Backend: {publisher}"))
-                    .size(14.0)
-                    .color(Color32::from_gray(180)),
-            )
-            .truncate(true),
-        );
+                let icon_size = (width - 24.0).clamp(56.0, 112.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(width, 128.0),
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        if let Some(path) = game.icon_path(self.library.root()) {
+                            if let Ok(bytes) = std::fs::read(path) {
+                                if let Ok(image) = load_image_bytes(&bytes) {
+                                    let texture = self
+                                        .icon_cache
+                                        .entry(game.id.clone())
+                                        .or_insert_with(|| {
+                                            ui.ctx().load_texture(
+                                                format!("icon-{}", game.id),
+                                                image,
+                                                egui::TextureOptions::LINEAR,
+                                            )
+                                        });
+                                    ui.add(
+                                        egui::Image::from_texture(&*texture)
+                                            .fit_to_exact_size(Vec2::splat(icon_size)),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        ui.label(RichText::new("📱").size(64.0));
+                    },
+                );
 
+                let publisher = game
+                    .provider
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("Unknown");
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(28, 29, 32))
+                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 24.0);
+                        ui.add(
+                            egui::Label::new(RichText::new(&game.display_name).strong().size(18.0))
+                                .truncate(true),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Backend: {publisher}"))
+                                    .size(14.0)
+                                    .color(Color32::from_gray(180)),
+                            )
+                            .truncate(true),
+                        );
+                    });
+            });
+        });
+        let card_response = ui.interact(
+            card.response.rect,
+            ui.id().with(("game", &game.id)),
+            Sense::click(),
+        );
         if card_response.clicked() {
             self.spawn_run(game);
         }
