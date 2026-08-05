@@ -635,9 +635,9 @@ impl Library {
             .map(|p| p.to_path_buf())
             .unwrap_or(exe_abs.clone());
 
-        let display_name = header
-            .as_ref()
-            .and_then(|h| h.app_name.clone())
+        let setup_app_name = setup.as_ref().and_then(|script| script.app_name.clone());
+        let display_name = setup_app_name
+            .or_else(|| header.as_ref().and_then(|h| h.app_name.clone()))
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| pretty_id(&id));
         let provider = header.as_ref().and_then(|h| h.provider.clone());

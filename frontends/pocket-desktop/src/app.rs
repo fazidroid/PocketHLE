@@ -331,11 +331,9 @@ impl PocketLauncher {
         ScrollArea::vertical().show(ui, |ui| {
             let avail = ui.available_width().max(1.0);
             let gap = 16.0;
-            let min_card_width = 224.0;
-            let columns = ((avail + gap) / (min_card_width + gap)).floor() as usize;
+            let card_width = 260.0;
+            let columns = ((avail + gap) / (card_width + gap)).floor() as usize;
             let columns = columns.clamp(1, games.len().max(1));
-            let card_width = ((avail - gap * (columns.saturating_sub(1) as f32)) / columns as f32)
-                .max(min_card_width);
             egui::Grid::new("library_grid")
                 .num_columns(columns)
                 .spacing(Vec2::splat(gap))
@@ -430,7 +428,7 @@ impl PocketLauncher {
                         );
                         ui.add(
                             egui::Label::new(
-                                RichText::new(format!("Publisher: {publisher}"))
+                                RichText::new(format!("Backend: {publisher}"))
                                     .size(14.0)
                                     .color(Color32::from_gray(180)),
                             )
