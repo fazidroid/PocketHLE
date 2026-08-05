@@ -93,4 +93,5 @@
         <item>portrait</item>
         <item>landscape</item>
     </string-array>
+    <string name="toggle_fullscreen">Toggle controls and fullscreen</string>
 </resources>
