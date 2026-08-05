@@ -63,7 +63,6 @@ pub struct PocketLauncher {
     last_frame_status: Option<String>,
     frame_stats: FrameStats,
     game_rotation: GameRotation,
-    open_menu_game: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +219,6 @@ impl PocketLauncher {
             last_frame_status: None,
             frame_stats: FrameStats::default(),
             game_rotation: GameRotation::Normal,
-            open_menu_game: None,
         }
     }
 
@@ -351,33 +349,14 @@ impl PocketLauncher {
     }
 
     fn ui_game_card(&mut self, ui: &mut egui::Ui, game: &GameEntry, width: f32) {
-        let card_id = game.id.clone();
-        let menu_open = self.open_menu_game.as_deref() == Some(card_id.as_str());
         let frame = egui::Frame::none()
             .fill(Color32::from_rgb(35, 38, 46))
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(82, 86, 96)))
             .rounding(16.0)
-            .inner_margin(0.0);
+            .inner_margin(12.0);
         frame.show(ui, |ui| {
             ui.set_width(width);
             ui.set_min_height(330.0);
-            ui.allocate_ui_with_layout(
-                Vec2::new(width, 38.0),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    if ui
-                        .add(egui::Button::new(RichText::new("⋮").size(24.0)).frame(false))
-                        .clicked()
-                    {
-                        self.open_menu_game = if menu_open {
-                            None
-                        } else {
-                            Some(card_id.clone())
-                        };
-                    }
-                },
-            );
-
             let icon_size = (width - 24.0).min(196.0);
             ui.allocate_ui_with_layout(
                 Vec2::new(width, icon_size + 8.0),
@@ -408,13 +387,7 @@ impl PocketLauncher {
             );
 
             ui.add_space(8.0);
-            let title = ui.add(
-                egui::Label::new(RichText::new(&game.display_name).strong().size(18.0))
-                    .sense(Sense::click()),
-            );
-            if title.clicked() {
-                self.spawn_run(game);
-            }
+            ui.label(RichText::new(&game.display_name).strong().size(18.0));
             let publisher = game
                 .provider
                 .as_deref()
@@ -426,29 +399,23 @@ impl PocketLauncher {
                     .color(Color32::from_gray(180)),
             );
             ui.add_space(10.0);
-
-            if menu_open {
-                ui.horizontal(|ui| {
-                    if ui.button("Run").clicked() {
-                        self.open_menu_game = None;
-                        self.spawn_run(game);
+            ui.horizontal(|ui| {
+                if ui.button("Run").clicked() {
+                    self.spawn_run(game);
+                }
+                if ui.button("Settings").clicked() {
+                    self.selected_game = Some(game.id.clone());
+                    self.game_settings_draft = Some((game.id.clone(), game.settings.clone()));
+                    self.screen = Screen::GameSettings;
+                }
+                if ui.button("Remove").clicked() {
+                    if let Err(e) = self.library.remove(&game.id) {
+                        self.status = format!("Remove failed: {e}");
+                    } else {
+                        self.status = format!("Removed {}", game.display_name);
                     }
-                    if ui.button("Settings").clicked() {
-                        self.open_menu_game = None;
-                        self.selected_game = Some(game.id.clone());
-                        self.game_settings_draft = Some((game.id.clone(), game.settings.clone()));
-                        self.screen = Screen::GameSettings;
-                    }
-                    if ui.button("Remove").clicked() {
-                        self.open_menu_game = None;
-                        if let Err(e) = self.library.remove(&game.id) {
-                            self.status = format!("Remove failed: {e}");
-                        } else {
-                            self.status = format!("Removed {}", game.display_name);
-                        }
-                    }
-                });
-            }
+                }
+            });
         });
     }
 
@@ -639,12 +606,14 @@ impl PocketLauncher {
     }
 
     fn ui_run(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Run output");
+        ui.add_space(8.0);
+        if let Some(name) = self.running_game.as_ref() {
+            ui.label(format!("Running {name}…"));
+        }
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.heading("Run");
-            if let Some(name) = self.running_game.as_ref() {
-                ui.label(format!("— {name}"));
-            }
-            ui.separator();
+            ui.label("Rotation");
             ui.label("Rotation");
             egui::ComboBox::from_id_source("game_rotation")
                 .selected_text(self.game_rotation.label())
