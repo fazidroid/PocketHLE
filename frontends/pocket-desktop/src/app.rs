@@ -331,7 +331,7 @@ impl PocketLauncher {
         ScrollArea::vertical().show(ui, |ui| {
             let avail = ui.available_width().max(1.0);
             let gap = 16.0;
-            let min_card_width = 248.0;
+            let min_card_width = 224.0;
             let columns = ((avail + gap) / (min_card_width + gap)).floor() as usize;
             let columns = columns.clamp(1, games.len().max(1));
             let card_width = ((avail - gap * (columns.saturating_sub(1) as f32)) / columns as f32)
@@ -358,20 +358,39 @@ impl PocketLauncher {
             .fill(Color32::from_rgb(35, 38, 46))
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(82, 86, 96)))
             .rounding(16.0)
-            .inner_margin(12.0);
-        frame.show(ui, |ui| {
-            ui.set_width(width);
+            .inner_margin(0.0);
+        let card = frame.show(ui, |ui| {
+            ui.set_min_width(width);
             ui.set_max_width(width);
-            ui.set_min_height(230.0);
-            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                let content_width = (width - 24.0).max(1.0);
-                let icon_size = content_width.min(112.0);
+            ui.vertical(|ui| {
+                ui.set_width(width);
+                ui.horizontal(|ui| {
+                    ui.add_space((width - 48.0).max(0.0));
+                    ui.menu_button(RichText::new("⋮").size(24.0), |ui| {
+                        if ui.button("Settings").clicked() {
+                            self.selected_game = Some(game.id.clone());
+                            self.game_settings_draft =
+                                Some((game.id.clone(), game.settings.clone()));
+                            self.screen = Screen::GameSettings;
+                            ui.close_menu();
+                        }
+                        if ui.button("Remove").clicked() {
+                            if let Err(e) = self.library.remove(&game.id) {
+                                self.status = format!("Remove failed: {e}");
+                            } else {
+                                self.status = format!("Removed {}", game.display_name);
+                            }
+                            ui.close_menu();
+                        }
+                    });
+                });
+
+                let icon_size = (width - 24.0).clamp(56.0, 112.0);
                 ui.allocate_ui_with_layout(
-                    Vec2::new(content_width, icon_size + 8.0),
+                    Vec2::new(width, 128.0),
                     egui::Layout::centered_and_justified(egui::Direction::TopDown),
                     |ui| {
-                        let icon_path = game.icon_path(self.library.root());
-                        if let Some(path) = icon_path {
+                        if let Some(path) = game.icon_path(self.library.root()) {
                             if let Ok(bytes) = std::fs::read(path) {
                                 if let Ok(image) = load_image_bytes(&bytes) {
                                     let texture = self
@@ -396,44 +415,39 @@ impl PocketLauncher {
                     },
                 );
 
-                ui.add_space(8.0);
-                ui.add(
-                    egui::Label::new(RichText::new(&game.display_name).strong().size(18.0))
-                        .truncate(true),
-                );
                 let publisher = game
                     .provider
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or("Unknown");
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("Publisher: {publisher}"))
-                            .size(14.0)
-                            .color(Color32::from_gray(180)),
-                    )
-                    .truncate(true),
-                );
-                ui.add_space(10.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Run").clicked() {
-                        self.spawn_run(game);
-                    }
-                    if ui.button("Settings").clicked() {
-                        self.selected_game = Some(game.id.clone());
-                        self.game_settings_draft = Some((game.id.clone(), game.settings.clone()));
-                        self.screen = Screen::GameSettings;
-                    }
-                    if ui.button("Remove").clicked() {
-                        if let Err(e) = self.library.remove(&game.id) {
-                            self.status = format!("Remove failed: {e}");
-                        } else {
-                            self.status = format!("Removed {}", game.display_name);
-                        }
-                    }
-                });
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(28, 29, 32))
+                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 24.0);
+                        ui.add(
+                            egui::Label::new(RichText::new(&game.display_name).strong().size(18.0))
+                                .truncate(true),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Publisher: {publisher}"))
+                                    .size(14.0)
+                                    .color(Color32::from_gray(180)),
+                            )
+                            .truncate(true),
+                        );
+                    });
             });
         });
+        let card_response = ui.interact(
+            card.response.rect,
+            ui.id().with(("game", &game.id)),
+            Sense::click(),
+        );
+        if card_response.clicked() {
+            self.spawn_run(game);
+        }
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
