@@ -329,25 +329,14 @@ impl PocketLauncher {
             return;
         }
         ScrollArea::vertical().show(ui, |ui| {
-            let avail = ui.available_width().max(1.0);
             let gap = 16.0;
-            let card_width = 260.0;
-            let columns = ((avail + gap) / (card_width + gap)).floor() as usize;
-            let columns = columns.clamp(1, games.len().max(1));
-            egui::Grid::new("library_grid")
-                .num_columns(columns)
-                .spacing(Vec2::splat(gap))
-                .show(ui, |ui| {
-                    for (i, game) in games.iter().enumerate() {
-                        self.ui_game_card(ui, game, card_width);
-                        if (i + 1) % columns == 0 {
-                            ui.end_row();
-                        }
-                    }
-                    if !games.len().is_multiple_of(columns) {
-                        ui.end_row();
-                    }
-                });
+            let card_width = 224.0;
+            ui.spacing_mut().item_spacing = Vec2::splat(gap);
+            ui.horizontal_wrapped(|ui| {
+                for game in &games {
+                    self.ui_game_card(ui, game, card_width);
+                }
+            });
         });
     }
 
