@@ -364,8 +364,7 @@ impl PocketLauncher {
             ui.set_max_width(width);
             ui.vertical(|ui| {
                 ui.set_width(width);
-                ui.horizontal(|ui| {
-                    ui.add_space((width - 48.0).max(0.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.menu_button(RichText::new("⋮").size(24.0), |ui| {
                         if ui.button("Settings").clicked() {
                             self.selected_game = Some(game.id.clone());
