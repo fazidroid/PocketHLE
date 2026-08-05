@@ -63,6 +63,7 @@ pub struct PocketLauncher {
     last_frame_status: Option<String>,
     frame_stats: FrameStats,
     game_rotation: GameRotation,
+    open_menu_game: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +220,7 @@ impl PocketLauncher {
             last_frame_status: None,
             frame_stats: FrameStats::default(),
             game_rotation: GameRotation::Normal,
+            open_menu_game: None,
         }
     }
 
@@ -330,11 +332,13 @@ impl PocketLauncher {
         }
         ScrollArea::vertical().show(ui, |ui| {
             let avail = ui.available_width();
-            let card_width = 280.0_f32.min(avail);
-            let columns = ((avail / (card_width + 12.0)).floor() as usize).max(1);
+            let card_width = 248.0_f32.min(avail);
+            let gap = 16.0;
+            let columns = ((avail + gap) / (card_width + gap)).floor() as usize;
+            let columns = columns.max(1);
             egui::Grid::new("library_grid")
                 .num_columns(columns)
-                .spacing(Vec2::new(12.0, 12.0))
+                .spacing(Vec2::splat(gap))
                 .show(ui, |ui| {
                     for (i, game) in games.iter().enumerate() {
                         self.ui_game_card(ui, game, card_width);
@@ -347,73 +351,104 @@ impl PocketLauncher {
     }
 
     fn ui_game_card(&mut self, ui: &mut egui::Ui, game: &GameEntry, width: f32) {
-        let frame = egui::Frame::group(ui.style())
-            .rounding(8.0)
-            .inner_margin(12.0);
+        let card_id = game.id.clone();
+        let menu_open = self.open_menu_game.as_deref() == Some(card_id.as_str());
+        let frame = egui::Frame::none()
+            .fill(Color32::from_rgb(35, 38, 46))
+            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(82, 86, 96)))
+            .rounding(16.0)
+            .inner_margin(0.0);
         frame.show(ui, |ui| {
             ui.set_width(width);
-            ui.set_min_height(120.0);
-            ui.horizontal(|ui| {
-                let icon_path = game.icon_path(self.library.root());
-                if let Some(path) = icon_path {
-                    if let Ok(bytes) = std::fs::read(path) {
-                        if let Ok(image) = load_image_bytes(&bytes) {
-                            let texture =
-                                self.icon_cache.entry(game.id.clone()).or_insert_with(|| {
-                                    ui.ctx().load_texture(
-                                        format!("icon-{}", game.id),
-                                        image,
-                                        egui::TextureOptions::LINEAR,
-                                    )
-                                });
-                            ui.add(
-                                egui::Image::from_texture(&*texture)
-                                    .fit_to_exact_size(Vec2::splat(48.0)),
-                            );
+            ui.set_min_height(330.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(width, 38.0),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("⋮").size(24.0)).frame(false))
+                        .clicked()
+                    {
+                        self.open_menu_game = if menu_open {
+                            None
                         } else {
-                            ui.label(RichText::new("📱").size(32.0));
+                            Some(card_id.clone())
+                        };
+                    }
+                },
+            );
+
+            let icon_size = (width - 24.0).min(196.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(width, icon_size + 8.0),
+                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    let icon_path = game.icon_path(self.library.root());
+                    if let Some(path) = icon_path {
+                        if let Ok(bytes) = std::fs::read(path) {
+                            if let Ok(image) = load_image_bytes(&bytes) {
+                                let texture =
+                                    self.icon_cache.entry(game.id.clone()).or_insert_with(|| {
+                                        ui.ctx().load_texture(
+                                            format!("icon-{}", game.id),
+                                            image,
+                                            egui::TextureOptions::LINEAR,
+                                        )
+                                    });
+                                ui.add(
+                                    egui::Image::from_texture(&*texture)
+                                        .fit_to_exact_size(Vec2::splat(icon_size)),
+                                );
+                                return;
+                            }
                         }
-                    } else {
-                        ui.label(RichText::new("📱").size(32.0));
                     }
-                } else {
-                    ui.label(RichText::new("📱").size(32.0));
-                }
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(&game.display_name).strong().size(16.0));
-                    if let Some(p) = &game.provider {
-                        ui.label(RichText::new(p).small().color(Color32::from_gray(170)));
+                    ui.label(RichText::new("📱").size(64.0));
+                },
+            );
+
+            ui.add_space(8.0);
+            let title = ui.add(
+                egui::Label::new(RichText::new(&game.display_name).strong().size(18.0))
+                    .sense(Sense::click()),
+            );
+            if title.clicked() {
+                self.spawn_run(game);
+            }
+            let publisher = game
+                .provider
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("Unknown");
+            ui.label(
+                RichText::new(format!("Publisher: {publisher}"))
+                    .size(14.0)
+                    .color(Color32::from_gray(180)),
+            );
+            ui.add_space(10.0);
+
+            if menu_open {
+                ui.horizontal(|ui| {
+                    if ui.button("Run").clicked() {
+                        self.open_menu_game = None;
+                        self.spawn_run(game);
                     }
-                    ui.label(
-                        RichText::new(format!("CAB: {}", game.source_cab))
-                            .small()
-                            .color(Color32::from_gray(140)),
-                    );
-                    ui.label(
-                        RichText::new(format!("Backend: {}", game.settings.cpu_backend.label()))
-                            .small()
-                            .color(Color32::from_gray(140)),
-                    );
+                    if ui.button("Settings").clicked() {
+                        self.open_menu_game = None;
+                        self.selected_game = Some(game.id.clone());
+                        self.game_settings_draft = Some((game.id.clone(), game.settings.clone()));
+                        self.screen = Screen::GameSettings;
+                    }
+                    if ui.button("Remove").clicked() {
+                        self.open_menu_game = None;
+                        if let Err(e) = self.library.remove(&game.id) {
+                            self.status = format!("Remove failed: {e}");
+                        } else {
+                            self.status = format!("Removed {}", game.display_name);
+                        }
+                    }
                 });
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Run").clicked() {
-                    self.spawn_run(game);
-                }
-                if ui.button("Settings").clicked() {
-                    self.selected_game = Some(game.id.clone());
-                    self.game_settings_draft = Some((game.id.clone(), game.settings.clone()));
-                    self.screen = Screen::GameSettings;
-                }
-                if ui.button("Remove").clicked() {
-                    if let Err(e) = self.library.remove(&game.id) {
-                        self.status = format!("Remove failed: {e}");
-                    } else {
-                        self.status = format!("Removed {}", game.display_name);
-                    }
-                }
-            });
+            }
         });
     }
 
