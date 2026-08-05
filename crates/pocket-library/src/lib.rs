@@ -332,6 +332,8 @@ pub struct LauncherConfig {
     pub show_fps: bool,
     #[serde(default)]
     pub fullscreen: bool,
+    #[serde(default = "default_fullscreen_mode")]
+    pub fullscreen_mode: String,
     #[serde(default = "default_orientation")]
     pub orientation: String,
 }
@@ -344,6 +346,10 @@ fn default_orientation() -> String {
     "auto".to_string()
 }
 
+fn default_fullscreen_mode() -> String {
+    "with_controls".to_string()
+}
+
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
@@ -353,6 +359,7 @@ impl Default for LauncherConfig {
             last_import_dir: None,
             show_fps: default_show_fps(),
             fullscreen: false,
+            fullscreen_mode: default_fullscreen_mode(),
             orientation: default_orientation(),
         }
     }
