@@ -41,6 +41,7 @@ class GameActivity : AppCompatActivity() {
     private lateinit var progress: ProgressBar
     private lateinit var status: TextView
     private lateinit var fpsOverlay: TextView
+    private lateinit var toolbar: Toolbar
     private lateinit var glRenderer: FrameRenderer
     private lateinit var controls: View
     private lateinit var fullscreenButton: ImageButton

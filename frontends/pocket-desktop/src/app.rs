@@ -3,7 +3,7 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, Rect, RichText, ScrollArea, Sense, Vec2};
+use eframe::egui::{self, Color32, Mesh, Pos2, Rect, RichText, ScrollArea, Sense, Vec2};
 use egui_extras::image::load_image_bytes;
 
 use pocket_core::kernel::{InputEvent, FB_HEIGHT, FB_WIDTH};
@@ -62,6 +62,59 @@ pub struct PocketLauncher {
     last_frame_texture: Option<egui::TextureHandle>,
     last_frame_status: Option<String>,
     frame_stats: FrameStats,
+    game_rotation: GameRotation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GameRotation {
+    Normal,
+    Clockwise90,
+    HalfTurn,
+    CounterClockwise90,
+}
+
+impl GameRotation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "0°",
+            Self::Clockwise90 => "90° clockwise",
+            Self::HalfTurn => "180°",
+            Self::CounterClockwise90 => "90° counter-clockwise",
+        }
+    }
+
+    fn is_quarter_turn(self) -> bool {
+        matches!(self, Self::Clockwise90 | Self::CounterClockwise90)
+    }
+
+    fn uv(self) -> [Pos2; 4] {
+        match self {
+            Self::Normal => [
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1.0, 0.0),
+                egui::pos2(0.0, 1.0),
+                egui::pos2(1.0, 1.0),
+            ],
+            Self::Clockwise90 => [
+                egui::pos2(0.0, 1.0),
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1.0, 1.0),
+                egui::pos2(1.0, 0.0),
+            ],
+            Self::HalfTurn => [
+                egui::pos2(1.0, 1.0),
+                egui::pos2(0.0, 1.0),
+                egui::pos2(1.0, 0.0),
+                egui::pos2(0.0, 0.0),
+            ],
+            Self::CounterClockwise90 => [
+                egui::pos2(1.0, 0.0),
+                egui::pos2(1.0, 1.0),
+                egui::pos2(0.0, 0.0),
+                egui::pos2(0.0, 1.0),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +218,7 @@ impl PocketLauncher {
             last_frame_texture: None,
             last_frame_status: None,
             frame_stats: FrameStats::default(),
+            game_rotation: GameRotation::Normal,
         }
     }
 
@@ -555,6 +609,27 @@ impl PocketLauncher {
             if let Some(name) = self.running_game.as_ref() {
                 ui.label(format!("— {name}"));
             }
+            ui.separator();
+            ui.label("Rotation");
+            egui::ComboBox::from_id_source("game_rotation")
+                .selected_text(self.game_rotation.label())
+                .show_ui(ui, |ui| {
+                    for rotation in [
+                        GameRotation::Normal,
+                        GameRotation::Clockwise90,
+                        GameRotation::HalfTurn,
+                        GameRotation::CounterClockwise90,
+                    ] {
+                        ui.selectable_value(&mut self.game_rotation, rotation, rotation.label());
+                    }
+                });
+            if ui.button("Fullscreen (F11)").clicked() {
+                let fullscreen = ui
+                    .ctx()
+                    .input(|input| input.viewport().fullscreen.unwrap_or(false));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Back to library").clicked() {
                     // Best-effort — if the runner thread already
@@ -599,16 +674,35 @@ impl PocketLauncher {
         // egui actually gave us. A 480x800 WVGA game at a fixed 2x is
         // 960x1600 and would run off the bottom of a 1080p window.
         let available = ui.available_size();
+        let rotated_size = if self.game_rotation.is_quarter_turn() {
+            Vec2::new(size.y, size.x)
+        } else {
+            size
+        };
         let scale = 2.0_f32
-            .min(available.x / size.x)
-            .min(available.y / size.y)
-            .max(1.0);
-        let display_size = size * scale;
+            .min(available.x / rotated_size.x)
+            .min(available.y / rotated_size.y)
+            .max(0.1);
+        let display_size = rotated_size * scale;
         let (rect, response) = ui.allocate_exact_size(display_size, Sense::click_and_drag());
-        let image = egui::Image::from_texture(&tex)
-            .fit_to_exact_size(display_size)
-            .texture_options(egui::TextureOptions::NEAREST);
-        image.paint_at(ui, rect);
+        let uv = self.game_rotation.uv();
+        let mut mesh = Mesh::with_texture(tex.id());
+        let idx = mesh.vertices.len() as u32;
+        for (pos, uv) in [
+            (rect.left_top(), uv[0]),
+            (rect.right_top(), uv[1]),
+            (rect.left_bottom(), uv[2]),
+            (rect.right_bottom(), uv[3]),
+        ] {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos,
+                uv,
+                color: Color32::WHITE,
+            });
+        }
+        mesh.indices
+            .extend_from_slice(&[idx, idx + 1, idx + 2, idx + 2, idx + 1, idx + 3]);
+        ui.painter().add(egui::Shape::mesh(mesh));
         // The j2me-loader-style FPS overlay is opt-in: gated on the
         // launcher's `show_fps` config flag so users who find a
         // permanent debug HUD distracting can switch it off in
@@ -649,10 +743,8 @@ impl PocketLauncher {
         // factors have to come from the live texture rather than the
         // compile-time constants — otherwise a 480×320 game would see
         // taps land on the wrong pixels.
-        let scale_x = size.x / rect.width();
-        let scale_y = size.y / rect.height();
-        let game_x = (local.x * scale_x).clamp(0.0, size.x - 1.0) as u16;
-        let game_y = (local.y * scale_y).clamp(0.0, size.y - 1.0) as u16;
+        let (game_x, game_y) =
+            rotated_pointer_to_game(local, rect.size(), size, self.game_rotation);
         if response.drag_started() || response.is_pointer_button_down_on() {
             // Either freshly pressed, or holding & dragging — if we
             // weren't already tracking a press, fire PointerDown.
@@ -770,6 +862,11 @@ impl PocketLauncher {
             else {
                 continue;
             };
+            if key == egui::Key::F11 && pressed && !repeat {
+                let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+                continue;
+            }
             let Some(vk) = physical_vk(key) else {
                 continue;
             };
@@ -848,6 +945,7 @@ impl PocketLauncher {
         self.last_frame_texture = None;
         self.last_frame_status = None;
         self.frame_stats.reset();
+        self.game_rotation = GameRotation::Normal;
         self.screen = Screen::Run;
         self.running_game = Some(game.display_name.clone());
         let (frame_tx, frame_rx) = mpsc::channel();
@@ -866,6 +964,28 @@ impl PocketLauncher {
         });
         self.status = "Starting emulator...".to_string();
     }
+}
+
+fn rotated_pointer_to_game(
+    local: Vec2,
+    display_size: Vec2,
+    game_size: Vec2,
+    rotation: GameRotation,
+) -> (u16, u16) {
+    let u = (local.x / display_size.x).clamp(0.0, 1.0);
+    let v = (local.y / display_size.y).clamp(0.0, 1.0);
+    let (x, y) = match rotation {
+        GameRotation::Normal => (u, v),
+        GameRotation::Clockwise90 => (v, 1.0 - u),
+        GameRotation::HalfTurn => (1.0 - u, 1.0 - v),
+        GameRotation::CounterClockwise90 => (1.0 - v, u),
+    };
+    let max_x = game_size.x.max(1.0) as u32 - 1;
+    let max_y = game_size.y.max(1.0) as u32 - 1;
+    (
+        ((x * game_size.x).floor() as u32).min(max_x) as u16,
+        ((y * game_size.y).floor() as u32).min(max_y) as u16,
+    )
 }
 
 fn physical_vk(key: egui::Key) -> Option<u16> {
