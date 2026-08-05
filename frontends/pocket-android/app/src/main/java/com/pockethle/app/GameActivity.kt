@@ -12,7 +12,6 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
-import android.widget.ImageButton
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -41,10 +40,7 @@ class GameActivity : AppCompatActivity() {
     private lateinit var progress: ProgressBar
     private lateinit var status: TextView
     private lateinit var fpsOverlay: TextView
-    private lateinit var toolbar: Toolbar
     private lateinit var glRenderer: FrameRenderer
-    private lateinit var controls: View
-    private lateinit var fullscreenButton: ImageButton
 
     /** Cached handle from `nativeStartGame` (`0` once we've finished). */
     @Volatile private var session: Long = 0
@@ -74,7 +70,6 @@ class GameActivity : AppCompatActivity() {
     private var showFps: Boolean = true
 
     private var fullscreen: Boolean = false
-    private var controlsVisible: Boolean = true
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -107,12 +102,11 @@ class GameActivity : AppCompatActivity() {
         fullscreen = config.fullscreen
         requestedOrientation = orientationFor(config.orientation)
         setContentView(R.layout.activity_game)
-        toolbar = findViewById(R.id.toolbar)
-        setSupportActionBar(toolbar)
-        controlsVisible = !fullscreen
-        controls = findViewById(R.id.game_controls)
-        fullscreenButton = findViewById(R.id.btn_fullscreen)
-        fullscreenButton.setOnClickListener { toggleControlsFullscreen() }
+        setSupportActionBar(findViewById<Toolbar>(R.id.toolbar))
+        if (fullscreen) {
+            findViewById<Toolbar>(R.id.toolbar).visibility = View.GONE
+            hideSystemBars()
+        }
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
 
         val name = intent.getStringExtra(EXTRA_GAME_NAME) ?: "PocketHLE"
@@ -128,7 +122,6 @@ class GameActivity : AppCompatActivity() {
         status = findViewById(R.id.status)
 
         showFps = readShowFpsPreference()
-        updateControlsVisibility()
 
         wireSurfaceTouchInput()
         wireVirtualGamepad()
@@ -149,7 +142,7 @@ class GameActivity : AppCompatActivity() {
         }
         session = handle
         startAudio(handle)
-        status.text = "Running…"
+        status.text = "Backend: Unicorn (ARM)\nRunning…"
         // The spinner gets hidden the moment the first frame arrives.
         mainHandler.postDelayed(pollTick, POLL_INTERVAL_MS)
     }
@@ -177,12 +170,6 @@ class GameActivity : AppCompatActivity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (fullscreen) {
-            controlsVisible = true
-            fullscreen = false
-            updateControlsVisibility()
-            return
-        }
         // Ask the emulator to wind down gracefully; the polling
         // tick will notice the worker exited and call finishSession.
         if (session != 0L) {
@@ -382,28 +369,6 @@ class GameActivity : AppCompatActivity() {
         }
     }
 
-    private fun showSystemBars() {
-        @Suppress("DEPRECATION")
-        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-        window.decorView.setOnSystemUiVisibilityChangeListener(null)
-    }
-
-    private fun toggleControlsFullscreen() {
-        controlsVisible = !controlsVisible
-        fullscreen = !controlsVisible
-        updateControlsVisibility()
-    }
-
-    private fun updateControlsVisibility() {
-        val hidden = !controlsVisible
-        controls.visibility = if (hidden) View.GONE else View.VISIBLE
-        toolbar.visibility = if (hidden) View.GONE else View.VISIBLE
-        status.visibility = if (hidden) View.GONE else View.VISIBLE
-        fpsOverlay.visibility = if (!hidden && showFps) View.VISIBLE else View.GONE
-        fullscreenButton.setImageResource(if (hidden) R.drawable.ic_fullscreen_exit else R.drawable.ic_fullscreen)
-        if (hidden) hideSystemBars() else showSystemBars()
-    }
-
     private fun readLauncherConfig(): LauncherConfig {
         val raw = NativeBridge.readConfig(LibraryPaths.root(this))
         return runCatching {
@@ -462,10 +427,29 @@ class GameActivity : AppCompatActivity() {
             val mapped = mapTouchToGame(v, event, frame) ?: return@setOnTouchListener true
             val (gx, gy) = mapped
             when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_DOWN, gx, gy)
-                MotionEvent.ACTION_MOVE -> NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_MOVE, gx, gy)
+                MotionEvent.ACTION_DOWN -> {
+                    NativeBridge.nativeSendInput(
+                        handle,
+                        NativeBridge.INPUT_POINTER_DOWN,
+                        gx,
+                        gy,
+                    )
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    NativeBridge.nativeSendInput(
+                        handle,
+                        NativeBridge.INPUT_POINTER_MOVE,
+                        gx,
+                        gy,
+                    )
+                }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_UP, gx, gy)
+                    NativeBridge.nativeSendInput(
+                        handle,
+                        NativeBridge.INPUT_POINTER_UP,
+                        gx,
+                        gy,
+                    )
                     v.performClick()
                 }
             }
