@@ -336,6 +336,9 @@ impl PocketLauncher {
                 .max(1.0) as usize;
             egui::Grid::new("library_grid")
                 .num_columns(columns)
+                .min_col_width(card_size.x)
+                .max_col_width(card_size.x)
+                .min_row_height(card_size.y)
                 .spacing(Vec2::splat(gap))
                 .show(ui, |ui| {
                     for (index, game) in games.iter().enumerate() {
