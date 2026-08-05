@@ -72,6 +72,7 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
     match kind {
         ArchiveKind::Cab => prepare_cab(path),
         ArchiveKind::Zip => prepare_zip(path),
+        ArchiveKind::InstallShieldSfx => prepare_installshield_sfx(path),
         ArchiveKind::Pe => Ok(Launcher {
             exe: path.to_path_buf(),
             mount_dir: None,
@@ -89,6 +90,7 @@ pub fn prepare(path: &Path) -> Result<Launcher> {
 enum ArchiveKind {
     Cab,
     Zip,
+    InstallShieldSfx,
     Pe,
 }
 
@@ -98,12 +100,87 @@ impl ArchiveKind {
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase);
+        if matches!(ext.as_deref(), Some("exe")) && is_installshield_sfx(path) {
+            return Self::InstallShieldSfx;
+        }
         match ext.as_deref() {
             Some("cab") => Self::Cab,
             Some("zip") => Self::Zip,
             _ => Self::Pe,
         }
     }
+}
+
+fn is_installshield_sfx(path: &Path) -> bool {
+    let Ok(data) = std::fs::read(path) else {
+        return false;
+    };
+    data.windows(8).any(|window| window == b"_winzip_")
+        && data.windows(4).any(|window| window == b"\x13\x5d\x65\x8c")
+}
+
+fn prepare_installshield_sfx(path: &Path) -> Result<Launcher> {
+    let tmp = TempDir::with_prefix("pockethle-sfx-")
+        .with_context(|| format!("creating temp dir for {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut outer = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading WinZip self-extractor {}", path.display()))?;
+    let mut data_z_path = None;
+    for index in 0..outer.len() {
+        let mut entry = outer.by_index(index)?;
+        let Some(name) = entry.enclosed_name().map(Path::to_path_buf) else {
+            continue;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let destination = tmp.path().join(&name);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut output = File::create(&destination)?;
+        std::io::copy(&mut entry, &mut output)?;
+        if name
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("data.z"))
+        {
+            data_z_path = Some(destination);
+        }
+    }
+    let data_z_path =
+        data_z_path.ok_or_else(|| anyhow!("{} has no data.z payload", path.display()))?;
+    let mut archive = unshield::Archive::new(File::open(&data_z_path)?)
+        .with_context(|| format!("opening InstallShield data.z from {}", path.display()))?;
+    let cab_name = archive
+        .list()
+        .map(|entry| entry.path.clone())
+        .find(|name| name.to_ascii_lowercase().ends_with("pacman.ppc_arm.cab"))
+        .or_else(|| {
+            archive
+                .list()
+                .map(|entry| entry.path.clone())
+                .find(|name| name.to_ascii_lowercase().ends_with("_arm.cab"))
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "{} contains no ARM Windows Mobile CAB",
+                data_z_path.display()
+            )
+        })?;
+    let cab_bytes = archive
+        .load(&cab_name)
+        .with_context(|| format!("extracting {cab_name} from data.z"))?;
+    let cab_path = tmp.path().join("pacman.PPC_ARM.CAB");
+    std::fs::write(&cab_path, cab_bytes)?;
+    let mut launcher = prepare_cab(&cab_path)?;
+    launcher.origin = format!(
+        "InstallShield SFX {} -> {}",
+        path.display(),
+        launcher.origin
+    );
+    launcher._tempdir = Some(merge_tempdirs(tmp, launcher._tempdir));
+    Ok(launcher)
 }
 
 fn prepare_cab(path: &Path) -> Result<Launcher> {

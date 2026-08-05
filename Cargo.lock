@@ -213,6 +213,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arraydeque"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0ffd3d69bd89910509a5d31d1f1353f38ccffdd116dd0099bbd6627f7bd8ad8"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1125,6 +1131,15 @@ name = "error-code"
 version = "3.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
+
+[[package]]
+name = "explode"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46695dd0a1b7a2a6c3e0800604bd9738c2699682b9fc325d4886b6c1a78025ac"
+dependencies = [
+ "arraydeque",
+]
 
 [[package]]
 name = "fastrand"
@@ -2662,6 +2677,7 @@ dependencies = [
  "pocket-core",
  "pocket-library",
  "tempfile",
+ "unshield",
  "zip",
 ]
 
@@ -3622,6 +3638,16 @@ dependencies = [
  "cmake",
  "heck",
  "pkg-config",
+]
+
+[[package]]
+name = "unshield"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dd29bc2ffd8a674b7de402169d86b3c083229373d05c388526d626408416c5c"
+dependencies = [
+ "byteorder",
+ "explode",
 ]
 
 [[package]]
