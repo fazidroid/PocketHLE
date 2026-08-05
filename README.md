@@ -41,16 +41,16 @@ The project is inspired by [touchHLE](https://github.com/touchHLE/touchHLE) and 
 
 ## Games Tested
 
-| Asphalt 4 Elite Racing | Spore Origins |
+| Asphalt 4 Elite Racing | Call of Duty 2 |
 | :---: | :---: |
-| ![Asphalt 4 gameplay](./proof/games/asphalt-4-elite-racing.jpg) | ![Spore Origins](./proof/games/spore-origins.jpg) |
+| ![Asphalt 4 gameplay](./proof/games/asphalt-4-elite-racing.jpg) | ![Call of Duty 2](./proof/games/call-of-duty-2.jpg) |
 
 | Zuma Deluxe | Bejeweled |
 | :---: | :---: |
 | ![Zuma Deluxe](./proof/games/zuma-deluxe.jpg) | ![Bejeweled](./proof/games/bejeweled.jpg) |
 
 > [!IMPORTANT]
-> The screenshots above are representative game references supplied for the project presentation. The checked-in, reproducible emulator proof currently covers Asphalt 4 WVGA. Spore Origins, Zuma Deluxe and Bejeweled have game-specific compatibility work in the codebase, but should not be described as fully verified here without a corresponding checked-in run capture.
+> The screenshots above are representative game references supplied for the project presentation. The checked-in, reproducible emulator proof currently covers Asphalt 4 WVGA and Call of Duty 2's title-screen boot through the OpenGL ES layer. Zuma Deluxe and Bejeweled have game-specific compatibility work in the codebase, but should not be described as fully verified here without a corresponding checked-in run capture.
 
 Additional compatibility probes and rendering captures are available under [`proof/`](proof/), including Asphalt 2 3D, Crazy Taxi, Diamond Twister, Splinter Cell Conviction and other Windows Mobile titles.
 
