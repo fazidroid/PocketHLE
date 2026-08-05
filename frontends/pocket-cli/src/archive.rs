@@ -294,6 +294,7 @@ fn materialise_long_names(
     if setup.renames.is_empty() {
         return;
     }
+    let install_root = setup.install_root();
     for (short, long) in &setup.renames {
         let source_suffix = short.rsplit('.').next().unwrap_or(short);
         let Some(src) = files
@@ -311,10 +312,15 @@ fn materialise_long_names(
             log::debug!("setup.xml mentions {short} but cab has no such file; skipping");
             continue;
         };
-        // Replace any '\' / '/' so a malicious or atypical XML can't
-        // escape the temp dir.
-        let safe = long.replace(['\\', '/'], "_");
-        let dest = root.join(&safe);
+        // `long` is now a full guest path; extract the relative tail
+        // so the directory hierarchy survives extraction.
+        let Some(relative) = setup.relative_destination(long, install_root.as_deref()) else {
+            continue;
+        };
+        let dest = relative
+            .split('\\')
+            .filter(|s| !s.is_empty())
+            .fold(root.to_path_buf(), |acc, seg| acc.join(seg));
         if dest == *src {
             continue;
         }
@@ -328,7 +334,7 @@ fn materialise_long_names(
                 dest.display()
             );
         } else {
-            log::debug!("materialised {} as {}", short, safe);
+            log::debug!("materialised {} as {}", short, dest.display());
         }
     }
 }
@@ -495,8 +501,15 @@ fn find_main_exe(
             .filter(|path| is_arm_pe(path).unwrap_or(false))
             .max_by_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
     };
+    let install_root = setup.install_root();
+    // `renames` now carries full guest paths, so the on-disk copy sits
+    // at the same relative offset `materialise_long_names` wrote it to.
     let materialised = |long: &str| -> Option<PathBuf> {
-        let candidate = parent.join(long.replace(['\\', '/'], "_"));
+        let relative = setup.relative_destination(long, install_root.as_deref())?;
+        let candidate = relative
+            .split('\\')
+            .filter(|s| !s.is_empty())
+            .fold(parent.to_path_buf(), |acc, seg| acc.join(seg));
         is_arm_pe(&candidate).unwrap_or(false).then_some(candidate)
     };
 
@@ -505,9 +518,8 @@ fn find_main_exe(
     // binaries (Sonic Unleashed ships a `GetRealDPI.exe` probe) that
     // are perfectly valid ARM PEs but exit immediately.
     if let Some(target) = &setup.shortcut_target {
-        let name = target.rsplit(['\\', '/']).next().unwrap_or(target);
-        if name.to_ascii_lowercase().ends_with(".exe") {
-            if let Some(path) = materialised(name) {
+        if target.to_ascii_lowercase().ends_with(".exe") {
+            if let Some(path) = materialised(target) {
                 return Some(path);
             }
         }

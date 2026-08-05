@@ -571,17 +571,18 @@ impl Library {
             .and_then(|f| fs::read(&f.extracted_path).ok())
             .map(|bytes| pocket_cab::WinCeSetupScript::parse_bytes(&bytes));
         let materialised_exe = setup.as_ref().and_then(|script| {
-            let by_basename = |name: &str| {
-                long_names.iter().find_map(|(_, path)| {
-                    let basename = path.file_name()?.to_string_lossy();
-                    (basename.eq_ignore_ascii_case(name) && is_guest_exe(path))
-                        .then_some(path.clone())
-                })
+            let install_root = script.install_root();
+            let by_long_path = |long: &str| {
+                let relative = script.relative_destination(long, install_root.as_deref())?;
+                let candidate = relative
+                    .split('\\')
+                    .filter(|s| !s.is_empty())
+                    .fold(extracted_dir.to_path_buf(), |acc, seg| acc.join(seg));
+                (is_guest_exe(&candidate)).then_some(candidate)
             };
             if let Some(target) = &script.shortcut_target {
-                let name = target.rsplit(['\\', '/']).next().unwrap_or(target);
-                if name.to_ascii_lowercase().ends_with(".exe") {
-                    if let Some(path) = by_basename(name) {
+                if target.to_ascii_lowercase().ends_with(".exe") {
+                    if let Some(path) = by_long_path(target) {
                         return Some(path);
                     }
                 }
@@ -589,8 +590,8 @@ impl Library {
             script
                 .renames
                 .iter()
-                .filter(|(_, name)| name.to_ascii_lowercase().ends_with(".exe"))
-                .filter_map(|(_, name)| by_basename(name))
+                .filter(|(_, long)| long.to_ascii_lowercase().ends_with(".exe"))
+                .filter_map(|(_, long)| by_long_path(long))
                 .max_by_key(|path| fs::metadata(path).map(|m| m.len()).unwrap_or(0))
         });
         let (mut exe_abs, _) = if let Some(path) = materialised_exe {
@@ -1137,27 +1138,10 @@ fn setup_install_dir(files: &[pocket_cab::CabFile]) -> Option<String> {
         .iter()
         .find(|f| f.short_name.eq_ignore_ascii_case("_setup.xml"))?;
     let data = fs::read(&setup.extracted_path).ok()?;
-    let script = pocket_cab::WinCeSetupScript::parse_bytes(&data);
-    // `install_dirs` lists every directory the script touches, which
-    // includes the Start-menu folders the shortcut lives in
-    // (`%CE2%\\Start Menu`, `%CE14%`). Those are never where a game
-    // reads its assets from, so prefer a real `\\Program Files\\`
-    // destination and fall back to the declared `InstallDir`.
-    let usable = |dir: &String| dir.len() > 1 && !dir.contains('%') && !is_shell_dir(dir);
-    script
-        .install_dirs
-        .iter()
-        .filter(|dir| usable(dir))
-        .find(|dir| dir.to_ascii_lowercase().starts_with("\\program files\\"))
-        .or_else(|| script.install_dirs.iter().find(|dir| usable(dir)))
-        .or_else(|| script.install_dir.as_ref().filter(|dir| usable(dir)))
-        .cloned()
-}
-
-/// `\\Windows\\…` holds the shell's own folders (Start menu, shortcuts),
-/// never a game's install directory.
-fn is_shell_dir(dir: &str) -> bool {
-    dir.to_ascii_lowercase().starts_with("\\windows\\")
+    // `install_root` strips the trailing separator; the manifest stores
+    // the directory form every other guest path is built against.
+    let root = pocket_cab::WinCeSetupScript::parse_bytes(&data).install_root()?;
+    Some(format!("{root}\\"))
 }
 
 fn infer_install_dir(files: &[pocket_cab::CabFile]) -> Option<String> {

@@ -34,9 +34,9 @@ use pocket_kernel::msgbox::MessageBox;
 use pocket_kernel::{
     module_file_name, CreateStage, DispatchOutcome, GuestCallFrame, GuestThread, InputEvent,
     KernelError, KernelState, LoadedModule, ModalDialog, QsortFrame, VectorIterFrame,
-    WaveCallbackKind, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE, MODULE_REGION_END,
-    MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
-    USER_KDATA_TLS_ARRAY_VA,
+    WaveCallbackKind, DEFAULT_STACK_TOP, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE,
+    MODULE_REGION_END, MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE, SLOT_ALIAS_BASE,
+    THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
 };
 use pocket_pe::{ResourceEntry, ResourceKey};
 
@@ -225,6 +225,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "_vsnprintf", vsnprintf);
     d.register_handler(dll, "vsnprintf", vsnprintf);
     d.register_handler(dll, "_snprintf", snprintf);
+    d.register_handler(dll, "sscanf", sscanf);
+    d.register_handler(dll, "swscanf", swscanf);
     d.register_handler(dll, "_snwprintf", snwprintf);
     d.register_handler(dll, "vswprintf", vswprintf);
     d.register_handler(dll, "_vsnwprintf", vsnwprintf);
@@ -258,13 +260,13 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "FindFirstFileW", find_first_file_w);
     d.register_handler(dll, "FindNextFileW", find_next_file_w);
     d.register_handler(dll, "FindClose", find_close);
-    d.register_constant(dll, "DeleteFileW", 1, one_returning);
+    d.register_handler(dll, "DeleteFileW", delete_file_w);
     d.register_constant(dll, "SetFileAttributesW", 1, one_returning);
     d.register_handler(dll, "GetFileAttributesW", get_file_attributes_w);
-    d.register_constant(dll, "CreateDirectoryW", 1, one_returning);
+    d.register_handler(dll, "CreateDirectoryW", create_directory_w);
     d.register_handler(dll, "RemoveDirectoryW", remove_directory_w);
     d.register_constant(dll, "CopyFileW", 1, one_returning);
-    d.register_constant(dll, "MoveFileW", 1, one_returning);
+    d.register_handler(dll, "MoveFileW", move_file_w);
     d.register_constant(dll, "SetEndOfFile", 1, one_returning);
     d.register_constant(dll, "GetFileInformationByHandle", 0, zero_returning);
     d.register_constant(dll, "OpenProcess", 0, zero_returning);
@@ -281,7 +283,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "fgetpos", crt_fgetpos);
     d.register_handler(dll, "fsetpos", crt_fsetpos);
     d.register_handler(dll, "feof", crt_feof);
-    d.register_constant(dll, "fflush", 1, one_returning);
+    d.register_handler(dll, "fflush", crt_fflush);
     d.register_handler(dll, "fgetc", crt_fgetc);
     d.register_handler(dll, "fputc", crt_fputc);
     d.register_handler(dll, "fgets", crt_fgets);
@@ -400,6 +402,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "SetActiveWindow", FAKE_HWND, one_returning);
     d.register_handler(dll, "GetKeyState", get_key_state);
     d.register_handler(dll, "GetAsyncKeyState", get_async_key_state);
+    d.register_handler(dll, "keybd_event", keybd_event);
     d.register_handler(dll, "GetFocus", get_focus);
     d.register_handler(dll, "GetCapture", get_capture);
     d.register_constant(dll, "SetCapture", FAKE_HWND, one_returning);
@@ -521,6 +524,11 @@ pub fn register(d: &mut WinCeDispatcher) {
 
     // ---- GDI (real, framebuffer-backed) ----
     d.register_handler(dll, "GetDC", get_dc);
+    // Same DC: this HLE has one screen surface and no non-client area to
+    // distinguish. An EGL/GL renderer asks for the window DC to build
+    // its surface, and a NULL here reads as "no display" and aborts
+    // start-up.
+    d.register_handler(dll, "GetWindowDC", get_dc);
     d.register_constant(dll, "ReleaseDC", 1, one_returning);
     d.register_handler(dll, "BeginPaint", begin_paint);
     d.register_handler(dll, "EndPaint", end_paint);
@@ -1769,10 +1777,31 @@ fn get_module_handle_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
         0x1000_0001
     } else if name == "commctrl.dll" || name == "commctrl" {
         0x1000_0002
+    } else if let Some(h) = gles_module_handle(&name) {
+        h
     } else {
         FAKE_MODULE_HANDLE
     };
     Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
+/// Map a `libGLES_*` module name to the handle
+/// [`pocket_kernel::build_dynamic_exports`] filed its thunks under.
+/// Returns `None` for anything that is not one of the two client
+/// libraries we emulate.
+pub(crate) fn gles_module_handle(name: &str) -> Option<u32> {
+    let stem = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    // Guests spell these every which way — `libGLES_CM.dll`,
+    // `libgles_cm`, `\Windows\libGLES_CL.dll`. WinCE filenames are
+    // case-insensitive, so fold before matching or the real-world
+    // spelling misses and `GetProcAddress` hands back null.
+    let stem = stem.to_ascii_lowercase();
+    let stem = stem.strip_suffix(".dll").unwrap_or(&stem);
+    match stem {
+        "libgles_cm" => Some(pocket_kernel::GLES_CM_MODULE_HANDLE),
+        "libgles_cl" => Some(pocket_kernel::GLES_CL_MODULE_HANDLE),
+        _ => None,
+    }
 }
 
 fn get_module_information(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -1826,6 +1855,19 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
             0
         };
         log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    if let Some(handle) = gles_module_handle(&name) {
+        // Only report success if the loader actually synthesized
+        // thunks for this library — otherwise `GetProcAddress` would
+        // hand back null for every entry point and the guest would be
+        // worse off than if the load had failed outright.
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&handle) {
+            handle
+        } else {
+            0
+        };
+        log::info!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE GLES)");
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
     // Already resident? CE hands back the same base and bumps the
@@ -3384,6 +3426,409 @@ fn snprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(bytes.len() as u32 - 1))
 }
 
+/// The shared engine behind `sscanf`. `input` is the subject string,
+/// `fmt` the format, and `next_arg` yields successive pointer
+/// arguments (register args then stack args, exactly like the
+/// printf side).
+///
+/// Returns the number of *assigned* conversions, or `-1` for an early
+/// input failure — the same `EOF`-vs-zero distinction real `sscanf`
+/// makes, which callers use to tell "nothing matched" from "the string
+/// ran out first".
+fn run_sscanf(
+    ctx: &mut CallCtx<'_>,
+    input: &str,
+    fmt: &str,
+    mut next_arg: impl FnMut(&mut CallCtx<'_>) -> Result<u32, KernelError>,
+) -> Result<i32, KernelError> {
+    let src = input.as_bytes();
+    let f = fmt.as_bytes();
+    let mut si = 0usize;
+    let mut fi = 0usize;
+    let mut assigned = 0i32;
+
+    while fi < f.len() {
+        let fc = f[fi];
+
+        // Whitespace in the format matches any run of input whitespace,
+        // including none at all.
+        if fc.is_ascii_whitespace() {
+            fi += 1;
+            while si < src.len() && src[si].is_ascii_whitespace() {
+                si += 1;
+            }
+            continue;
+        }
+
+        if fc != b'%' {
+            // Literal: must match exactly.
+            if si >= src.len() {
+                return Ok(if assigned == 0 { -1 } else { assigned });
+            }
+            if src[si] != fc {
+                return Ok(assigned);
+            }
+            si += 1;
+            fi += 1;
+            continue;
+        }
+
+        fi += 1;
+        if fi >= f.len() {
+            break;
+        }
+        if f[fi] == b'%' {
+            while si < src.len() && src[si].is_ascii_whitespace() {
+                si += 1;
+            }
+            if si >= src.len() || src[si] != b'%' {
+                return Ok(if assigned == 0 && si >= src.len() {
+                    -1
+                } else {
+                    assigned
+                });
+            }
+            si += 1;
+            fi += 1;
+            continue;
+        }
+
+        // `*` suppresses the assignment: the conversion still happens
+        // and still has to succeed, it just consumes no argument.
+        let suppress = f[fi] == b'*';
+        if suppress {
+            fi += 1;
+        }
+
+        // Field width.
+        let mut width = 0usize;
+        while fi < f.len() && f[fi].is_ascii_digit() {
+            width = width * 10 + (f[fi] - b'0') as usize;
+            fi += 1;
+        }
+        let width = if width == 0 { usize::MAX } else { width };
+
+        // Length modifiers. `ll` (and the MSVC `I64`) widen to 64 bits;
+        // `h` narrows to 16. `l` on a float means `double`.
+        let mut short_form = false;
+        let mut long_count = 0u32;
+        loop {
+            match f.get(fi) {
+                Some(b'h') => {
+                    short_form = true;
+                    fi += 1;
+                }
+                Some(b'l') | Some(b'L') => {
+                    long_count += 1;
+                    fi += 1;
+                }
+                Some(b'I') if f[fi..].starts_with(b"I64") => {
+                    long_count = 2;
+                    fi += 3;
+                }
+                _ => break,
+            }
+        }
+        let long_long = long_count >= 2;
+
+        let Some(&conv) = f.get(fi) else { break };
+        fi += 1;
+
+        // Every conversion except `%c`, `%[` and `%n` skips leading
+        // whitespace first.
+        if !matches!(conv, b'c' | b'[' | b'n') {
+            while si < src.len() && src[si].is_ascii_whitespace() {
+                si += 1;
+            }
+        }
+
+        match conv {
+            b'n' => {
+                // Not a conversion: reports how far we have read. Never
+                // counts toward the return value.
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    scanf_store_int(ctx, addr, si as i64, short_form, long_long)?;
+                }
+            }
+            b'd' | b'i' | b'u' | b'x' | b'X' | b'o' | b'p' => {
+                let start = si;
+                let mut neg = false;
+                if si < src.len() && (src[si] == b'+' || src[si] == b'-') {
+                    neg = src[si] == b'-';
+                    si += 1;
+                }
+                // `%i` sniffs the base from the prefix; `%x` accepts an
+                // optional `0x`; the rest are fixed.
+                let mut radix: u32 = match conv {
+                    b'x' | b'X' | b'p' => 16,
+                    b'o' => 8,
+                    b'i' => 0,
+                    _ => 10,
+                };
+                if (radix == 16 || radix == 0)
+                    && src.len() > si + 1
+                    && src[si] == b'0'
+                    && (src[si + 1] | 0x20) == b'x'
+                {
+                    si += 2;
+                    radix = 16;
+                } else if radix == 0 {
+                    radix = if src.get(si) == Some(&b'0') { 8 } else { 10 };
+                }
+                let digits_from = si;
+                let limit = start.saturating_add(width);
+                let mut acc: i64 = 0;
+                let mut any = false;
+                while si < src.len() && si < limit {
+                    let Some(d) = (src[si] as char).to_digit(radix) else {
+                        break;
+                    };
+                    acc = acc.wrapping_mul(radix as i64).wrapping_add(d as i64);
+                    any = true;
+                    si += 1;
+                }
+                if !any {
+                    // A lone `0x` with no hex digits still yields the 0.
+                    if radix == 16 && digits_from > start && digits_from - start >= 2 {
+                        si = digits_from - 1;
+                        acc = 0;
+                    } else {
+                        return Ok(if assigned == 0 { -1 } else { assigned });
+                    }
+                }
+                if neg {
+                    acc = acc.wrapping_neg();
+                }
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    scanf_store_int(ctx, addr, acc, short_form, long_long)?;
+                    assigned += 1;
+                }
+            }
+            b'f' | b'e' | b'E' | b'g' | b'G' | b'a' => {
+                let start = si;
+                let limit = start.saturating_add(width);
+                let mut end = si;
+                if end < src.len() && (src[end] == b'+' || src[end] == b'-') {
+                    end += 1;
+                }
+                while end < src.len() && end < limit && src[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end < src.len() && end < limit && src[end] == b'.' {
+                    end += 1;
+                    while end < src.len() && end < limit && src[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                }
+                // Only accept an exponent if it actually has digits, so
+                // "1e" parses as 1.0 and leaves the 'e' unread.
+                if end < src.len() && end < limit && (src[end] | 0x20) == b'e' {
+                    let mut probe = end + 1;
+                    if probe < src.len() && (src[probe] == b'+' || src[probe] == b'-') {
+                        probe += 1;
+                    }
+                    if probe < src.len() && src[probe].is_ascii_digit() {
+                        while probe < src.len() && probe < limit && src[probe].is_ascii_digit() {
+                            probe += 1;
+                        }
+                        end = probe;
+                    }
+                }
+                let text = std::str::from_utf8(&src[start..end]).unwrap_or("");
+                let Ok(value) = text.parse::<f64>() else {
+                    return Ok(if assigned == 0 { -1 } else { assigned });
+                };
+                si = end;
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    if addr != 0 {
+                        // Bare `%f` writes a 4-byte float; `%lf` a
+                        // double. Getting this backwards silently
+                        // corrupts the caller's next field.
+                        if long_count >= 1 {
+                            ctx.cpu.write_mem(addr, &value.to_bits().to_le_bytes())?;
+                        } else {
+                            ctx.cpu
+                                .write_mem(addr, &(value as f32).to_bits().to_le_bytes())?;
+                        }
+                    }
+                    assigned += 1;
+                }
+            }
+            b'c' => {
+                let n = if width == usize::MAX { 1 } else { width };
+                if si + n > src.len() {
+                    return Ok(if assigned == 0 { -1 } else { assigned });
+                }
+                let bytes = src[si..si + n].to_vec();
+                si += n;
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    if addr != 0 {
+                        // `%c` does *not* append a terminator.
+                        ctx.cpu.write_mem(addr, &bytes)?;
+                    }
+                    assigned += 1;
+                }
+            }
+            b's' => {
+                let start = si;
+                let limit = start.saturating_add(width);
+                while si < src.len() && si < limit && !src[si].is_ascii_whitespace() {
+                    si += 1;
+                }
+                if si == start {
+                    return Ok(if assigned == 0 { -1 } else { assigned });
+                }
+                let mut bytes = src[start..si].to_vec();
+                bytes.push(0);
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    if addr != 0 {
+                        ctx.cpu.write_mem(addr, &bytes)?;
+                    }
+                    assigned += 1;
+                }
+            }
+            b'[' => {
+                let (negated, members, next_fi) = scanf_scanset(f, fi);
+                fi = next_fi;
+                let start = si;
+                let limit = start.saturating_add(width);
+                while si < src.len() && si < limit {
+                    let hit = members.contains(&src[si]);
+                    if hit == negated {
+                        break;
+                    }
+                    si += 1;
+                }
+                if si == start {
+                    return Ok(if assigned == 0 { -1 } else { assigned });
+                }
+                let mut bytes = src[start..si].to_vec();
+                bytes.push(0);
+                if !suppress {
+                    let addr = next_arg(ctx)?;
+                    if addr != 0 {
+                        ctx.cpu.write_mem(addr, &bytes)?;
+                    }
+                    assigned += 1;
+                }
+            }
+            other => {
+                log::warn!("sscanf: unsupported conversion %{}", other as char);
+                return Ok(assigned);
+            }
+        }
+    }
+
+    Ok(assigned)
+}
+
+/// `int sscanf(const char *src, const char *fmt, ...)`.
+///
+/// Games use this to parse their own config and asset text — Call of
+/// Duty 2 runs it ~40 times during startup on material and shader
+/// definitions. Returning a bogus value here leaves the parsed structs
+/// full of stack garbage, so it is worth doing properly.
+fn sscanf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let src_p = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    if src_p == 0 || fmt_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(-1i32 as u32));
+    }
+    let input = read_cstr_string(ctx, src_p, 0x4000)?;
+    let fmt = read_cstr_string(ctx, fmt_p, 0x4000)?;
+    let mut idx = 2u8;
+    let n = run_sscanf(ctx, &input, &fmt, move |c| {
+        let a = c.arg_u32(idx)?;
+        idx += 1;
+        Ok(a)
+    })?;
+    Ok(DispatchOutcome::ReturnedR0(n as u32))
+}
+
+/// `int swscanf(const wchar_t *src, const wchar_t *fmt, ...)`.
+/// Widens to the same engine: every conversion Pocket PC titles use is
+/// ASCII-representable, and the `%s` / `%c` stores are narrow because
+/// the guest asked for wide chars only in the format string.
+fn swscanf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let src_p = ctx.arg_u32(0)?;
+    let fmt_p = ctx.arg_u32(1)?;
+    if src_p == 0 || fmt_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(-1i32 as u32));
+    }
+    let input = String::from_utf16_lossy(&read_wstr(ctx, src_p, 0x4000)?);
+    let fmt = String::from_utf16_lossy(&read_wstr(ctx, fmt_p, 0x4000)?);
+    let mut idx = 2u8;
+    let n = run_sscanf(ctx, &input, &fmt, move |c| {
+        let a = c.arg_u32(idx)?;
+        idx += 1;
+        Ok(a)
+    })?;
+    Ok(DispatchOutcome::ReturnedR0(n as u32))
+}
+
+/// Store an integer conversion result through a guest pointer,
+/// honouring the `h` / `ll` length modifiers that decide how wide the
+/// destination actually is.
+fn scanf_store_int(
+    ctx: &mut CallCtx<'_>,
+    addr: u32,
+    value: i64,
+    short_form: bool,
+    long_long: bool,
+) -> Result<(), KernelError> {
+    if addr == 0 {
+        return Ok(());
+    }
+    if long_long {
+        ctx.cpu.write_mem(addr, &(value as u64).to_le_bytes())?;
+    } else if short_form {
+        ctx.cpu.write_mem(addr, &(value as u16).to_le_bytes())?;
+    } else {
+        ctx.cpu.write_mem(addr, &(value as u32).to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// Parse the body of a `%[...]` scanset, starting just past the `[`.
+/// Returns `(negated, members, index_of_closing_bracket + 1)`.
+///
+/// A `]` immediately after `[` or `[^` is a literal member, not the
+/// terminator — that is what lets `%[^]]` mean "everything but a
+/// bracket".
+fn scanf_scanset(fmt: &[u8], mut fi: usize) -> (bool, Vec<u8>, usize) {
+    let mut negated = false;
+    if fmt.get(fi) == Some(&b'^') {
+        negated = true;
+        fi += 1;
+    }
+    let mut members = Vec::new();
+    if fmt.get(fi) == Some(&b']') {
+        members.push(b']');
+        fi += 1;
+    }
+    while fi < fmt.len() && fmt[fi] != b']' {
+        // `a-z` ranges. A trailing `-` is a literal.
+        if fmt[fi] == b'-' && fi + 1 < fmt.len() && fmt[fi + 1] != b']' && !members.is_empty() {
+            let lo = *members.last().unwrap();
+            let hi = fmt[fi + 1];
+            for c in lo..=hi {
+                members.push(c);
+            }
+            fi += 2;
+            continue;
+        }
+        members.push(fmt[fi]);
+        fi += 1;
+    }
+    // Step past the `]` if it is there; a malformed set runs to the end.
+    (negated, members, (fi + 1).min(fmt.len()))
+}
+
 /// `int vswprintf(wchar_t *dst, const wchar_t *fmt, va_list args)`.
 fn vswprintf(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let dst = ctx.arg_u32(0)?;
@@ -3873,9 +4318,8 @@ fn write_file(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 
 fn flush_file_buffers(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let handle = ctx.arg_u32(0)?;
-    Ok(DispatchOutcome::ReturnedR0(u32::from(
-        ctx.kernel.vfs.is_open(handle),
-    )))
+    let ok = ctx.kernel.vfs.flush(handle).is_ok();
+    Ok(DispatchOutcome::ReturnedR0(u32::from(ok)))
 }
 
 fn close_handle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -3911,6 +4355,41 @@ fn get_file_size(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
 /// it must succeed. Refusing to delete through a mount is deliberate:
 /// mounts point at the extracted CAB (or whatever `--rom-dir` names),
 /// and a guest should not be able to erase host content.
+fn create_directory_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let name = String::from_utf16_lossy(&read_wstr(ctx, name_p, 260)?);
+    let ok = ctx.kernel.vfs.create_dir(&name);
+    log::debug!("CreateDirectoryW({name:?}) -> {ok}");
+    Ok(DispatchOutcome::ReturnedR0(u32::from(ok)))
+}
+
+fn delete_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let name_p = ctx.arg_u32(0)?;
+    if name_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let name = String::from_utf16_lossy(&read_wstr(ctx, name_p, 260)?);
+    let ok = ctx.kernel.vfs.delete_file(&name);
+    log::debug!("DeleteFileW({name:?}) -> {ok}");
+    Ok(DispatchOutcome::ReturnedR0(u32::from(ok)))
+}
+
+fn move_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let from_p = ctx.arg_u32(0)?;
+    let to_p = ctx.arg_u32(1)?;
+    if from_p == 0 || to_p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let from = String::from_utf16_lossy(&read_wstr(ctx, from_p, 260)?);
+    let to = String::from_utf16_lossy(&read_wstr(ctx, to_p, 260)?);
+    let ok = ctx.kernel.vfs.move_file(&from, &to);
+    log::debug!("MoveFileW({from:?}, {to:?}) -> {ok}");
+    Ok(DispatchOutcome::ReturnedR0(u32::from(ok)))
+}
+
 fn remove_directory_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let name_p = ctx.arg_u32(0)?;
     if name_p == 0 {
@@ -3999,7 +4478,9 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
     let create = mode.starts_with('w') || mode.starts_with('a') || mode.contains('+');
     // Pocket PC games sometimes pass `Game/data.bin` without a leading
     // backslash; the VFS expects `\Game\…`. Try both spellings so the
-    // ROM lookup succeeds.
+    // ROM lookup succeeds. Writable paths must try the rooted form
+    // first so the writable save overlay wins over broader read-only
+    // mounts such as `\Application\`.
     let normalized = path.replace('/', "\\").trim_start_matches('\\').to_string();
     let normalized_lower = normalized.to_ascii_lowercase();
     let without_program_files = normalized
@@ -4011,21 +4492,28 @@ fn open_cstr_path(ctx: &mut CallCtx<'_>, path: &str, mode: &str) -> u32 {
                 .unwrap_or(0)..,
         )
         .unwrap_or(&normalized);
-    let mut candidates = vec![
-        normalized.clone(),
-        format!("\\{without_program_files}"),
-        if normalized.starts_with('\\') {
-            normalized.clone()
-        } else {
-            format!("\\{normalized}")
-        },
+    let rooted = format!("\\{normalized}");
+    let mut candidates = if create {
+        vec![
+            rooted.clone(),
+            format!("\\{without_program_files}"),
+            normalized.clone(),
+        ]
+    } else {
+        vec![
+            normalized.clone(),
+            format!("\\{without_program_files}"),
+            rooted.clone(),
+        ]
+    };
+    candidates.extend([
         format!("\\Application\\{normalized}"),
         format!("\\Program Files\\{normalized}"),
         format!("\\Program Files\\OmniGSoft\\MiniKayak1.1\\{normalized}"),
         format!("\\Program Files\\OmniGSoft\\MiniKayak1.1\\resources\\{normalized}"),
         format!("\\Program Files\\Game\\{normalized}"),
         format!("\\Program Files\\Atomic Dreams\\{normalized}"),
-    ];
+    ]);
     // Last resort: look for the bare file name in every mount root.
     //
     // A game usually hard-codes the install directory a real setup.exe
@@ -4060,6 +4548,13 @@ fn crt_fopen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let name = read_cstr_string(ctx, name_p, 260)?;
     let mode = read_cstr_string(ctx, mode_p, 8)?;
     let h = open_cstr_path(ctx, &name, &mode);
+    // A game that silently gets a NULL `FILE*` usually goes on to spin
+    // or bail somewhere far away from here, so say which path missed.
+    if h == 0 {
+        log::debug!("fopen({name:?}, {mode:?}) -> NULL");
+    } else {
+        log::trace!("fopen({name:?}, {mode:?}) -> 0x{h:08x}");
+    }
     Ok(DispatchOutcome::ReturnedR0(h))
 }
 
@@ -4071,13 +4566,35 @@ fn crt_wfopen(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let name = String::from_utf16_lossy(&name_w);
     let mode = String::from_utf16_lossy(&mode_w);
     let h = open_cstr_path(ctx, &name, &mode);
+    // Same reasoning as `crt_fopen`: a NULL `FILE*` surfaces as a hang
+    // or a bail-out far from the open, so name the path that missed.
+    if h == 0 {
+        log::debug!("_wfopen({name:?}, {mode:?}) -> NULL");
+    } else {
+        log::trace!("_wfopen({name:?}, {mode:?}) -> 0x{h:08x}");
+    }
     Ok(DispatchOutcome::ReturnedR0(h))
 }
 
 fn crt_fclose(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let h = ctx.arg_u32(0)?;
-    ctx.kernel.vfs.close(h);
-    Ok(DispatchOutcome::ReturnedR0(0))
+    let result = if ctx.kernel.vfs.flush(h).is_ok() && ctx.kernel.vfs.close(h) {
+        0
+    } else {
+        u32::MAX
+    };
+    Ok(DispatchOutcome::ReturnedR0(result))
+}
+
+fn crt_fflush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let h = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(
+        if ctx.kernel.vfs.flush(h).is_ok() {
+            0
+        } else {
+            u32::MAX
+        },
+    ))
 }
 
 fn crt_fread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -4504,7 +5021,24 @@ fn get_process_heap(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
 
 fn virtual_alloc(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect)
+    let addr = ctx.arg_u32(0)?;
     let size = ctx.arg_u32(1)?;
+
+    // The reserve/commit split does not exist here: a reservation is
+    // already backed by real heap memory. So a commit naming an address
+    // inside a live reservation has nothing left to do and must hand
+    // that same address back. Allocating a second block instead would
+    // double the guest's footprint — a game that reserves 29 MB and
+    // then commits it would consume 58 MB and exhaust the heap on its
+    // next request.
+    if addr != 0 {
+        let base = ctx.kernel.heap.base();
+        let end = base.saturating_add(ctx.kernel.heap.size());
+        let fits = addr >= base && addr.checked_add(size).is_some_and(|a| a <= end);
+        if fits {
+            return Ok(DispatchOutcome::ReturnedR0(addr));
+        }
+    }
     do_alloc(ctx, size)
 }
 
@@ -5670,6 +6204,22 @@ fn get_async_key_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     Ok(DispatchOutcome::ReturnedR0(key_state_value(ctx, vk)))
 }
 
+fn keybd_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    let vk = ctx.arg_u32(0)? as u16;
+    let flags = ctx.arg_u32(2)?;
+    let event = if flags & KEYEVENTF_KEYUP != 0 {
+        InputEvent::KeyUp { vk }
+    } else {
+        InputEvent::KeyDown { vk }
+    };
+    if ctx.kernel.pending_input.len() < 256 {
+        ctx.kernel.pending_input.push_back(event);
+    }
+    log::debug!("keybd_event(vk=0x{vk:02x}, flags=0x{flags:08x}) -> {event:?}");
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 /// `HWND GetFocus()` — the focused control if the user has tapped one,
 /// otherwise the top-level window.
 fn get_focus(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -6360,11 +6910,14 @@ fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 fn end_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // The guest has finished filling its client area; the child controls
-    // paint on top, as sibling windows would on a device.
-    repaint_controls(ctx);
-    repaint_status_bar(ctx);
-    ctx.kernel.framebuffer.mark_dirty();
+    // The game has already presented its completed surface when it calls
+    // EndPaint. Repainting the shell here can expose an all-white DIB
+    // frame before the next game frame is ready. Controls are composited
+    // by the frame hook at the presentation boundary instead.
+    if !ctx.kernel.fb_mapped {
+        repaint_controls(ctx);
+        repaint_status_bar(ctx);
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -8965,18 +9518,34 @@ fn enum_display_settings(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 /// 240-pixel-wide framebuffer, so a third of every frame was clipped
 /// away.
 ///
-/// We honour two spellings of the request: an explicit
-/// `dmPelsWidth`/`dmPelsHeight` mode, and `DM_DISPLAYORIENTATION`
-/// (`DMDO_90` / `DMDO_270` mean "swap the axes").
+/// Three spellings of the request are honoured: an explicit
+/// `dmPelsWidth`/`dmPelsHeight` mode, Windows CE's
+/// `DM_DISPLAYORIENTATION` (`dmDisplayOrientation` at the *end* of
+/// `DEVMODEW`, not the desktop `dmOrientation` printer field), and the
+/// CE-only `DM_DISPLAYQUERYORIENTATION` probe that asks which
+/// orientations the driver can do before requesting one. Xtrakt sends
+/// the probe first and, when the answer is "none", gives up on rotating
+/// and draws its landscape layout sideways into the portrait panel.
 fn change_display_settings_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     const DM_PELSWIDTH_FLAG: u32 = 0x0008_0000;
     const DM_PELSHEIGHT_FLAG: u32 = 0x0010_0000;
-    const DM_DISPLAYORIENTATION_FLAG: u32 = 0x0000_0080;
+    /// CE-only: "rotate to `dmDisplayOrientation`".
+    const DM_DISPLAYORIENTATION_FLAG: u32 = 0x0080_0000;
+    /// CE-only: "report the rotations you support, do not change mode".
+    const DM_DISPLAYQUERYORIENTATION_FLAG: u32 = 0x0100_0000;
     // Offsets inside `DEVMODEW` (see `enum_display_settings`).
     const OFF_FIELDS: u32 = 72;
-    const OFF_ORIENTATION: u32 = 76;
     const OFF_PELSWIDTH: u32 = 172;
     const OFF_PELSHEIGHT: u32 = 176;
+    /// `dmDisplayOrientation`, the last DWORD of CE's 192-byte DEVMODEW.
+    const OFF_DISPLAYORIENTATION: u32 = 188;
+    /// CE's `DMDO_*` are chosen so a driver can OR them into a
+    /// capability mask: 90=1, 180=2, 270=4, with 0 meaning upright.
+    const DMDO_0: u32 = 0;
+    const DMDO_90: u32 = 1;
+    const DMDO_270: u32 = 4;
+    /// "Report whether this mode is possible, but do not apply it."
+    const CDS_TEST: u32 = 0x0000_0002;
     /// Refuse absurd modes; a bad DEVMODE would otherwise allocate
     /// gigabytes for the panel.
     const MAX_EDGE: u32 = 2048;
@@ -8987,7 +9556,31 @@ fn change_display_settings_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, 
         return Ok(DispatchOutcome::ReturnedR0(0));
     }
     let fields = read_u32(ctx, dm + OFF_FIELDS)?;
+    let flags = ctx.arg_u32(3)?;
     let (cur_w, cur_h) = screen_dims(ctx);
+
+    if fields & DM_DISPLAYQUERYORIENTATION_FLAG != 0 {
+        // We can present any rotation, because rotating is only a
+        // matter of what shape we hand the guest — it draws in the
+        // rotated coordinate system itself.
+        let caps = (DMDO_90 | 2 | DMDO_270).to_le_bytes();
+        ctx.cpu.write_mem(dm + OFF_DISPLAYORIENTATION, &caps)?;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
+    // `CDS_TEST` with `DM_DISPLAYORIENTATION` is a read, not a write:
+    // the driver reports the orientation currently in effect and
+    // changes nothing. Xtrakt uses it to decide whether it needs to
+    // un-rotate the panel before drawing, so answering with the
+    // capability mask left over from the probe above would send it
+    // chasing a rotation that never happened.
+    if fields & DM_DISPLAYORIENTATION_FLAG != 0 && flags & CDS_TEST != 0 {
+        // The emulated panel is never rotated out from under the guest.
+        ctx.cpu
+            .write_mem(dm + OFF_DISPLAYORIENTATION, &DMDO_0.to_le_bytes())?;
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+
     let mut want: Option<(u32, u32)> = None;
 
     if fields & (DM_PELSWIDTH_FLAG | DM_PELSHEIGHT_FLAG) != 0 {
@@ -8998,9 +9591,8 @@ fn change_display_settings_ex(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, 
         }
     }
     if want.is_none() && fields & DM_DISPLAYORIENTATION_FLAG != 0 {
-        // DMDO_DEFAULT=0, DMDO_90=1, DMDO_180=2, DMDO_270=3.
-        let orientation = read_u32(ctx, dm + OFF_ORIENTATION)? & 0xffff;
-        let landscape = matches!(orientation, 1 | 3);
+        let orientation = read_u32(ctx, dm + OFF_DISPLAYORIENTATION)?;
+        let landscape = matches!(orientation, DMDO_90 | DMDO_270);
         let (long_edge, short_edge) = if cur_w >= cur_h {
             (cur_w, cur_h)
         } else {
@@ -9263,17 +9855,36 @@ fn tls_set_value(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `GetSystemInfo(LPSYSTEM_INFO)`.
+///
+/// `SYSTEM_INFO` has no `dwLength` — the first member is the union
+/// `{ DWORD dwOemId; WORD wProcessorArchitecture, wReserved; }`. Laying
+/// it out as if a length came first shifts every later field by four
+/// bytes, which leaves `dwAllocationGranularity` reading as zero.
+/// Allocators size their pools by rounding up to that granularity, so a
+/// zero makes the round-up collapse to nothing and the pool base ends up
+/// a small integer — the guest then writes through it and faults on a
+/// near-null address rather than reporting out of memory.
 fn get_system_info(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let p = ctx.arg_u32(0)?;
     if p != 0 {
         let mut data = [0u8; 36];
-        data[0..4].copy_from_slice(&36u32.to_le_bytes());
-        data[4..8].copy_from_slice(&1u32.to_le_bytes());
-        data[8..12].copy_from_slice(&1u32.to_le_bytes());
-        data[12..16].copy_from_slice(&5u32.to_le_bytes());
-        data[16..20].copy_from_slice(&0u32.to_le_bytes());
-        data[20..24].copy_from_slice(&1u32.to_le_bytes());
-        data[24..28].copy_from_slice(&4096u32.to_le_bytes());
+        // wProcessorArchitecture = PROCESSOR_ARCHITECTURE_ARM (5),
+        // wReserved = 0.
+        data[0..2].copy_from_slice(&5u16.to_le_bytes());
+        data[2..4].copy_from_slice(&0u16.to_le_bytes());
+        data[4..8].copy_from_slice(&4096u32.to_le_bytes()); // dwPageSize
+        data[8..12].copy_from_slice(&SLOT_ALIAS_BASE.to_le_bytes()); // lpMinimumApplicationAddress
+        data[12..16].copy_from_slice(&DEFAULT_STACK_TOP.to_le_bytes()); // lpMaximumApplicationAddress
+        data[16..20].copy_from_slice(&1u32.to_le_bytes()); // dwActiveProcessorMask
+        data[20..24].copy_from_slice(&1u32.to_le_bytes()); // dwNumberOfProcessors
+                                                           // dwProcessorType = PROCESSOR_STRONGARM.
+        data[24..28].copy_from_slice(&2577u32.to_le_bytes());
+        // dwAllocationGranularity: WinCE reserves virtual memory in 64K
+        // blocks, and guests use this to size their own pools.
+        data[28..32].copy_from_slice(&65536u32.to_le_bytes());
+        data[32..34].copy_from_slice(&4u16.to_le_bytes()); // wProcessorLevel
+        data[34..36].copy_from_slice(&0u16.to_le_bytes()); // wProcessorRevision
         ctx.cpu.write_mem(p, &data)?;
     }
     Ok(DispatchOutcome::ReturnedR0(0))
@@ -11863,6 +12474,26 @@ fn find_first_file_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErr
     let pattern_p = ctx.arg_u32(0)?;
     let out = ctx.arg_u32(1)?;
     let pattern = String::from_utf16_lossy(&read_wstr(ctx, pattern_p, 520)?);
+    if !pattern.contains('*') && !pattern.contains('?') {
+        if let Some(host) = ctx.kernel.vfs.resolve(&pattern) {
+            if let Ok(meta) = std::fs::metadata(&host) {
+                let name = pattern
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(".")
+                    .to_string();
+                let entry = (name, meta.len(), meta.is_dir());
+                write_find_data(ctx, out, &entry)?;
+                let handle = FIND_HANDLE_BASE.saturating_add(ctx.kernel.next_find_handle);
+                ctx.kernel.next_find_handle = ctx.kernel.next_find_handle.wrapping_add(1);
+                ctx.kernel
+                    .find_handles
+                    .insert(handle, std::collections::VecDeque::new());
+                return Ok(DispatchOutcome::ReturnedR0(handle));
+            }
+        }
+    }
     let (dir, mask) = split_search_pattern(&pattern);
     let entries = ctx.kernel.vfs.list_dir(&dir).unwrap_or_default();
     let mut matches: std::collections::VecDeque<(String, u64, bool)> = entries
@@ -11914,7 +12545,10 @@ fn find_close(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 mod tests {
     use super::*;
     use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu, Prot};
-    use pocket_kernel::{vfs::Vfs, Heap, KernelState, Thunk};
+    use pocket_kernel::{
+        vfs::{Access, Vfs},
+        Heap, KernelState, Thunk,
+    };
     use pocket_pe::ImportBinding;
 
     fn fresh_kernel() -> KernelState {
@@ -11949,6 +12583,7 @@ mod tests {
             dib_decode_scratch: Vec::new(),
             gx_last_pushed_counter: 0,
             gx_guest_signature: None,
+            gles_strings: std::collections::HashMap::new(),
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,
@@ -12400,6 +13035,60 @@ mod tests {
     }
 
     #[test]
+    fn file_mutation_handlers_write_through_vfs() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        kernel.vfs.mount("\\Save\\", dir.path());
+        cpu.map_region(0x1000, 0x2000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let wide = |text: &str| -> Vec<u8> {
+            text.encode_utf16()
+                .chain(std::iter::once(0))
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        };
+        cpu.write_mem(0x1000, &wide("\\Save\\old.dat")).unwrap();
+        cpu.write_mem(0x1400, &wide("\\Save\\new.dat")).unwrap();
+        cpu.write_mem(0x1800, b"data").unwrap();
+        cpu.write_mem(0x1c00, &wide("\\Save\\nested")).unwrap();
+        cpu.write_reg(ArmReg::R0, 0x1c00).unwrap();
+        cpu.write_mem(0x1e00, &wide("\\Save\\nested\\old.dat"))
+            .unwrap();
+        cpu.write_mem(0x2200, &wide("\\Save\\nested\\new.dat"))
+            .unwrap();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(
+            create_directory_w(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        let handle = c
+            .kernel
+            .vfs
+            .open("\\Save\\nested\\old.dat", Access::Write, true)
+            .unwrap();
+        c.cpu.write_reg(ArmReg::R0, handle).unwrap();
+        c.cpu.write_reg(ArmReg::R1, 0x1800).unwrap();
+        c.cpu.write_reg(ArmReg::R2, 4).unwrap();
+        c.cpu.write_reg(ArmReg::R3, 0).unwrap();
+        assert_eq!(write_file(&mut c).unwrap(), DispatchOutcome::ReturnedR0(1));
+        c.cpu.write_reg(ArmReg::R0, 0x1e00).unwrap();
+        c.cpu.write_reg(ArmReg::R1, 0x2200).unwrap();
+        assert_eq!(move_file_w(&mut c).unwrap(), DispatchOutcome::ReturnedR0(1));
+        c.cpu.write_reg(ArmReg::R0, 0x2200).unwrap();
+        assert_eq!(
+            delete_file_w(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(1)
+        );
+        assert!(!dir.path().join("nested").join("new.dat").exists());
+    }
+
+    #[test]
     fn get_store_information_writes_store_size_and_free_size() {
         let mut cpu = StubCpu::new();
         let mut kernel = fresh_kernel();
@@ -12710,5 +13399,201 @@ mod tests {
             call(&mut cpu, &mut kernel, hidden),
             DispatchOutcome::ReturnedR0(1)
         );
+    }
+
+    /// Drive `sscanf` with `input`/`fmt` and up to four out-pointers,
+    /// all pointing into a scratch page. Returns the raw `int` result.
+    fn run_scanf(
+        cpu: &mut StubCpu,
+        kernel: &mut KernelState,
+        input: &str,
+        fmt: &str,
+        outs: &[u32],
+    ) -> i32 {
+        const SRC: u32 = 0x1000;
+        const FMT: u32 = 0x1400;
+        cpu.write_mem(SRC, format!("{input}\0").as_bytes()).unwrap();
+        cpu.write_mem(FMT, format!("{fmt}\0").as_bytes()).unwrap();
+        cpu.write_reg(ArmReg::R0, SRC).unwrap();
+        cpu.write_reg(ArmReg::R1, FMT).unwrap();
+        for (i, o) in outs.iter().enumerate() {
+            match i {
+                0 => cpu.write_reg(ArmReg::R2, *o).unwrap(),
+                1 => cpu.write_reg(ArmReg::R3, *o).unwrap(),
+                n => {
+                    // Args 4+ live on the stack at the ABI offset.
+                    let sp = cpu.read_reg(ArmReg::Sp).unwrap();
+                    let off = sp + cpu.stack_arg_offset() + (n as u32 - 2) * 4;
+                    cpu.write_mem(off, &o.to_le_bytes()).unwrap();
+                }
+            }
+        }
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu,
+            thunk: &t,
+            kernel,
+        };
+        match sscanf(&mut c).unwrap() {
+            DispatchOutcome::ReturnedR0(v) => v as i32,
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    fn scanf_cpu() -> StubCpu {
+        let mut cpu = StubCpu::new();
+        cpu.map_region(0x1000, 0x4000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.map_region(0x8000, 0x2000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_reg(ArmReg::Sp, 0x9000).unwrap();
+        cpu
+    }
+
+    #[test]
+    fn sscanf_parses_several_integers_and_counts_them() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let (a, b, c) = (0x2000, 0x2004, 0x2008);
+        let n = run_scanf(&mut cpu, &mut kernel, "12 -34 56", "%d %d %d", &[a, b, c]);
+        assert_eq!(n, 3);
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 12);
+        assert_eq!(cpu.read_u32_le(b).unwrap() as i32, -34);
+        assert_eq!(cpu.read_u32_le(c).unwrap(), 56);
+    }
+
+    #[test]
+    fn sscanf_stops_at_the_first_mismatch_and_reports_the_partial_count() {
+        // The classic caller idiom is `if (sscanf(..) != 3) error;`, so
+        // the count has to reflect only what was really assigned.
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let (a, b) = (0x2000, 0x2004);
+        cpu.write_mem(b, &0xdead_beefu32.to_le_bytes()).unwrap();
+        let n = run_scanf(&mut cpu, &mut kernel, "7 oops", "%d %d", &[a, b]);
+        assert_eq!(n, 1);
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 7);
+        assert_eq!(
+            cpu.read_u32_le(b).unwrap(),
+            0xdead_beef,
+            "second out must be untouched"
+        );
+    }
+
+    #[test]
+    fn sscanf_reads_a_bare_float_as_four_bytes_not_eight() {
+        // `%f` writing 8 bytes would clobber whatever field follows.
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        cpu.write_mem(a + 4, &0xa5a5_a5a5u32.to_le_bytes()).unwrap();
+        let n = run_scanf(&mut cpu, &mut kernel, "1.5", "%f", &[a]);
+        assert_eq!(n, 1);
+        assert_eq!(f32::from_bits(cpu.read_u32_le(a).unwrap()), 1.5);
+        assert_eq!(
+            cpu.read_u32_le(a + 4).unwrap(),
+            0xa5a5_a5a5,
+            "%f must not write 8 bytes"
+        );
+    }
+
+    #[test]
+    fn sscanf_reads_a_long_float_as_a_double() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        let n = run_scanf(&mut cpu, &mut kernel, "-2.25e2", "%lf", &[a]);
+        assert_eq!(n, 1);
+        let lo = cpu.read_u32_le(a).unwrap() as u64;
+        let hi = cpu.read_u32_le(a + 4).unwrap() as u64;
+        assert_eq!(f64::from_bits((hi << 32) | lo), -225.0);
+    }
+
+    #[test]
+    fn sscanf_reads_hex_with_and_without_the_prefix() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let (a, b) = (0x2000, 0x2004);
+        let n = run_scanf(&mut cpu, &mut kernel, "0x1f ff", "%x %x", &[a, b]);
+        assert_eq!(n, 2);
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 0x1f);
+        assert_eq!(cpu.read_u32_le(b).unwrap(), 0xff);
+    }
+
+    #[test]
+    fn sscanf_copies_a_string_with_a_terminator_and_honours_width() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        let n = run_scanf(&mut cpu, &mut kernel, "texture_wall diffuse", "%4s", &[a]);
+        assert_eq!(n, 1);
+        let raw = cpu.read_mem(a, 5).unwrap();
+        assert_eq!(&raw, b"text\0");
+    }
+
+    #[test]
+    fn sscanf_suppressed_fields_consume_input_without_consuming_an_argument() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        // Only one out-pointer is supplied even though there are two
+        // conversions — the `%*d` must not eat it.
+        let n = run_scanf(&mut cpu, &mut kernel, "10 20", "%*d %d", &[a]);
+        assert_eq!(n, 1);
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 20);
+    }
+
+    #[test]
+    fn sscanf_matches_literals_and_a_scanset() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let (a, b) = (0x2000, 0x2100);
+        let n = run_scanf(
+            &mut cpu,
+            &mut kernel,
+            "id=42;name=rifle",
+            "id=%d;name=%[a-z]",
+            &[a, b],
+        );
+        assert_eq!(n, 2);
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 42);
+        let raw = cpu.read_mem(b, 6).unwrap();
+        assert_eq!(&raw, b"rifle\0");
+    }
+
+    #[test]
+    fn sscanf_returns_negative_one_when_the_input_ends_before_any_conversion() {
+        // Callers distinguish this EOF case from "matched nothing".
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        let n = run_scanf(&mut cpu, &mut kernel, "   ", "%d", &[a]);
+        assert_eq!(n, -1);
+    }
+
+    #[test]
+    fn sscanf_percent_n_reports_offset_without_counting_as_a_conversion() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let (a, b) = (0x2000, 0x2004);
+        let n = run_scanf(&mut cpu, &mut kernel, "123abc", "%d%n", &[a, b]);
+        assert_eq!(n, 1, "%n must not be counted");
+        assert_eq!(cpu.read_u32_le(a).unwrap(), 123);
+        assert_eq!(cpu.read_u32_le(b).unwrap(), 3);
+    }
+
+    #[test]
+    fn sscanf_short_modifier_writes_only_two_bytes() {
+        let mut cpu = scanf_cpu();
+        let mut kernel = fresh_kernel();
+        let a = 0x2000;
+        cpu.write_mem(a, &0u32.to_le_bytes()).unwrap();
+        cpu.write_mem(a + 2, &0xbeefu16.to_le_bytes()).unwrap();
+        let n = run_scanf(&mut cpu, &mut kernel, "300", "%hd", &[a]);
+        assert_eq!(n, 1);
+        let lo = u16::from_le_bytes(cpu.read_mem(a, 2).unwrap().try_into().unwrap());
+        let hi = u16::from_le_bytes(cpu.read_mem(a + 2, 2).unwrap().try_into().unwrap());
+        assert_eq!(lo, 300);
+        assert_eq!(hi, 0xbeef, "%hd must not write past two bytes");
     }
 }

@@ -467,6 +467,13 @@ impl WinCeSetupScript {
             "Shortcut",
             "Registry",
         ];
+        // The enclosing `<characteristic type="%CE1%\Xtrakt\data">`
+        // block is the only place the destination *directory* appears —
+        // the file's own `type=` is a bare name. Remember the most
+        // recent directory so the rename records a full guest path;
+        // dropping it flattens `data\arch0.par` onto the install root
+        // and Xtrakt bails out with "Failed to initialize game".
+        let mut current_dir: Option<String> = None;
         let mut current_long: Option<String> = None;
         for raw in s.split(['\n', '>']) {
             let line = raw.trim();
@@ -475,13 +482,17 @@ impl WinCeSetupScript {
                 if is_dir {
                     let dir = canonicalise_install_dir(&t);
                     if !script.install_dirs.contains(&dir) {
-                        script.install_dirs.push(dir);
+                        script.install_dirs.push(dir.clone());
                     }
+                    current_dir = Some(dir);
                 } else if !structural.contains(&t.as_str()) {
                     if t.to_ascii_lowercase().ends_with(".lnk") {
                         current_long = None;
                     } else {
-                        current_long = Some(t);
+                        current_long = Some(match &current_dir {
+                            Some(dir) => format!("{dir}{t}"),
+                            None => t,
+                        });
                     }
                 }
             }
@@ -565,6 +576,9 @@ impl WinCeSetupScript {
             if let Some(target) = script.shortcut_target.as_mut() {
                 *target = substitute_install_dir(target, &install_dir);
             }
+            for (_short, long) in script.renames.iter_mut() {
+                *long = substitute_install_dir(long, &install_dir);
+            }
             for value in script.registry.iter_mut() {
                 if let Some(text) = value.string.as_mut() {
                     *text = substitute_install_dir(text, &install_dir)
@@ -576,6 +590,84 @@ impl WinCeSetupScript {
 
         script
     }
+
+    /// The shallowest directory every installed file sits under, without
+    /// a trailing separator.
+    ///
+    /// `install_dirs` — the directories the `FileOperation` block really
+    /// writes into — wins over the declared `InstallDir`, because the
+    /// two frequently disagree: Gameloft's Sonic Unleashed declares
+    /// `%CE1%\SONIC` but installs into `%CE1%\Gameloft\SONIC`, which is
+    /// the path the game hard-codes. Preferring whichever string is
+    /// merely shorter would pick the declaration and mount the payload
+    /// at a directory no file was written to.
+    ///
+    /// Two filters matter. `install_dirs` also lists the Start-menu
+    /// folders the shortcut lives in (`\Windows\Start Menu\…`), which
+    /// are never where a game reads its assets from and which would win
+    /// on length. And only a candidate that actually prefixes every
+    /// destination qualifies — anchoring on a sibling would push assets
+    /// above the extract root. Xtrakt is the case that forced the
+    /// shallowest-of-the-real-directories rule: taking the first usable
+    /// entry gave `\Program Files\Xtrakt\data\music\`, so the mount
+    /// prefix sat two levels below the install root and the game could
+    /// not open `data\arch0.par`.
+    pub fn install_root(&self) -> Option<String> {
+        let usable = |dir: &String| {
+            dir.len() > 1
+                && !dir.contains('%')
+                && !dir.to_ascii_lowercase().starts_with("\\windows\\")
+        };
+        let anchors_every_file = |dir: &String| {
+            self.renames
+                .iter()
+                .all(|(_, long)| !long.starts_with('\\') || long.starts_with(dir.as_str()))
+        };
+        self.install_dirs
+            .iter()
+            .filter(|dir| usable(dir) && anchors_every_file(dir))
+            .min_by_key(|dir| dir.len())
+            .or_else(|| self.install_dir.as_ref().filter(|dir| usable(dir)))
+            .map(|dir| dir.trim_end_matches('\\').to_string())
+    }
+
+    /// Path of an installed file relative to [`Self::install_root`],
+    /// using backslash separators — `data\arch0.par` for Xtrakt's
+    /// `\Program Files\Xtrakt\data\arch0.par`.
+    ///
+    /// Strips the *root* install directory rather than the deepest
+    /// matching one: matching the longest prefix would flatten the
+    /// `data\` / `data\music\` hierarchy the game opens back onto the
+    /// install root, which is what made Xtrakt fail to initialise.
+    /// Returns `None` for a traversal attempt or an empty tail.
+    pub fn relative_destination<'a>(&self, long: &'a str, root: Option<&str>) -> Option<&'a str> {
+        let relative = root
+            .and_then(|prefix| {
+                long.strip_prefix(prefix)
+                    .and_then(|tail| tail.strip_prefix('\\'))
+            })
+            .unwrap_or_else(|| {
+                // No install root to anchor against (or the file lands
+                // outside it): keep the historical basename behaviour.
+                long.rsplit('\\')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(long)
+            });
+        let safe = !relative.is_empty()
+            && !relative.starts_with('\\')
+            && relative.split('\\').all(|seg| seg != ".." && seg != ".");
+        safe.then_some(relative)
+    }
+}
+
+/// Join a backslash-separated guest-relative path onto a host directory
+/// one segment at a time, so `\` stays a separator on every platform.
+fn join_guest_relative(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('\\')
+        .filter(|seg| !seg.is_empty())
+        .fold(root.to_path_buf(), |acc, seg| acc.join(seg))
 }
 
 /// Replace a literal `%InstallDir%` with the script's expanded install
@@ -753,6 +845,8 @@ pub fn materialise_setup_names(root: &Path, files: &[CabFile]) -> Vec<(PathBuf, 
     else {
         return Vec::new();
     };
+    let install_root = script.install_root();
+
     let mut created = Vec::new();
     for (short, long) in &script.renames {
         let Some(src) = files
@@ -762,19 +856,23 @@ pub fn materialise_setup_names(root: &Path, files: &[CabFile]) -> Vec<(PathBuf, 
             log::debug!("_setup.xml names {short} but the cab has no such file; skipping");
             continue;
         };
-        // The destination may carry a device path (`%CE1%\Game\x.bar`);
-        // only the basename matters next to the executable.
-        let long = long.replace('/', "\\");
-        let Some(basename) = long.rsplit('\\').next().filter(|s| !s.is_empty()) else {
+        let Some(relative) = script.relative_destination(long, install_root.as_deref()) else {
             continue;
         };
-        if basename.contains("..") {
-            continue;
-        }
-        let dest = root.join(basename);
+
+        let dest = join_guest_relative(root, relative);
         if dest == src.extracted_path {
             continue;
         }
+
+        // `data\music\` only exists on the host once we create it.
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                log::debug!("could not create {}: {e}", parent.display());
+                continue;
+            }
+        }
+
         match fs::copy(&src.extracted_path, &dest) {
             Ok(_) => {
                 log::debug!("materialised {} as {}", src.short_name, dest.display());
@@ -835,6 +933,94 @@ mod tests {
         assert_eq!(sanitize_name("../../etc/passwd"), "_.._etc_passwd");
         assert_eq!(sanitize_name("JUMPYB~1.002"), "JUMPYB~1.002");
         assert_eq!(sanitize_name("a\\b/c"), "a_b_c");
+    }
+
+    #[test]
+    fn renames_carry_the_enclosing_directory() {
+        // Xtrakt's cab nests each file's `type=` inside a directory
+        // `characteristic`. Recording only the leaf name flattened
+        // `data\arch0.par` onto the install root and the game quit
+        // with "Failed to initialize game".
+        let script = WinCeSetupScript::parse_bytes(
+            br#"<wap-provisioningdoc>
+<characteristic type="Install">
+<parm name="AppName" value="Southend Xtrakt" />
+<parm name="InstallDir" value="%CE1%\Xtrakt" translation="install" />
+</characteristic>
+<characteristic type="FileOperation">
+<characteristic type="%CE1%\Xtrakt\data\music" translation="install">
+<characteristic type="MakeDir" />
+<characteristic type="xtrakt_music.xm" translation="install">
+<characteristic type="Extract">
+<parm name="Source" value="XTRAKT~1.010" />
+</characteristic>
+</characteristic>
+</characteristic>
+<characteristic type="%CE1%\Xtrakt\data" translation="install">
+<characteristic type="MakeDir" />
+<characteristic type="arch0.par" translation="install">
+<characteristic type="Extract">
+<parm name="Source" value="000arch0.005" />
+</characteristic>
+</characteristic>
+</characteristic>
+<characteristic type="%CE1%\Xtrakt" translation="install">
+<characteristic type="Xtrakt.exe" translation="install">
+<characteristic type="Extract">
+<parm name="Source" value="00Xtrakt.000" />
+</characteristic>
+</characteristic>
+</characteristic>
+</characteristic>
+</wap-provisioningdoc>"#,
+        );
+        assert_eq!(
+            script.renames,
+            vec![
+                (
+                    "XTRAKT~1.010".to_string(),
+                    r"\Program Files\Xtrakt\data\music\xtrakt_music.xm".to_string()
+                ),
+                (
+                    "000arch0.005".to_string(),
+                    r"\Program Files\Xtrakt\data\arch0.par".to_string()
+                ),
+                (
+                    "00Xtrakt.000".to_string(),
+                    r"\Program Files\Xtrakt\Xtrakt.exe".to_string()
+                ),
+            ]
+        );
+
+        // The root anchor is the shallowest directory, not the deepest
+        // match — anchoring on `…\Xtrakt\data` would flatten the tree
+        // right back.
+        let root = script.install_root();
+        assert_eq!(root.as_deref(), Some(r"\Program Files\Xtrakt"));
+        assert_eq!(
+            script.relative_destination(&script.renames[0].1, root.as_deref()),
+            Some(r"data\music\xtrakt_music.xm")
+        );
+        assert_eq!(
+            script.relative_destination(&script.renames[2].1, root.as_deref()),
+            Some("Xtrakt.exe")
+        );
+    }
+
+    #[test]
+    fn relative_destination_rejects_traversal() {
+        let script = WinCeSetupScript::default();
+        let root = Some(r"\Program Files\Game");
+        assert_eq!(
+            script.relative_destination(r"\Program Files\Game\..\..\Windows\evil.dll", root),
+            None
+        );
+        // A destination outside the install root keeps the historical
+        // basename fallback rather than escaping the extract dir.
+        assert_eq!(
+            script.relative_destination(r"\Windows\fmodce.dll", root),
+            Some("fmodce.dll")
+        );
     }
 
     #[test]

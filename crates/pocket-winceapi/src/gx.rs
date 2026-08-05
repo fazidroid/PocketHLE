@@ -252,14 +252,17 @@ fn gx_get_display_properties(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu};
     use pocket_kernel::framebuffer::FB_BYTES;
     use pocket_kernel::{vfs::Vfs, Framebuffer, GdiState, Heap, KernelState, Thunk};
     use pocket_pe::ImportBinding;
 
-    fn fresh_kernel() -> KernelState {
+    /// A blank `KernelState`. Shared with the other DLL test modules
+    /// (see [`crate::gles`]) so the ~100-field literal lives in one
+    /// place.
+    pub(crate) fn fresh_kernel() -> KernelState {
         use pocket_kernel::audio::{AudioEngine, GuestFormat};
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
@@ -289,6 +292,7 @@ mod tests {
             dib_decode_scratch: Vec::new(),
             gx_last_pushed_counter: 0,
             gx_guest_signature: None,
+            gles_strings: std::collections::HashMap::new(),
             synthetic_message_count: 0,
             synthetic_message_budget: 240,
             wnd_proc: 0,

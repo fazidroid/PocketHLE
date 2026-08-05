@@ -2710,6 +2710,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pocket-gles"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "once_cell",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pocket-kernel"
 version = "0.1.0"
 dependencies = [
@@ -2763,6 +2773,7 @@ dependencies = [
  "log",
  "once_cell",
  "pocket-cpu",
+ "pocket-gles",
  "pocket-kernel",
  "pocket-pe",
  "serde",

@@ -118,6 +118,9 @@ impl Registry {
     /// Information" control panel), and games read the owner name to
     /// personalise menus. MetalStrike additionally reads its own
     /// licence pair, which earlier work established as `1739` / `0`.
+    /// The `Drivers\BuiltIn` entries describe hardware the emulated
+    /// device claims to have; a title that polls for a missing driver
+    /// tends to give up and exit rather than fall back.
     pub fn with_device_defaults() -> Self {
         let mut reg = Self::new();
         reg.set_value(
@@ -133,6 +136,42 @@ impl Registry {
         reg.set_value(
             r"HKLM\SOFTWARE\Greatelsoft.Com\MetalStrike",
             "SN-Key2",
+            RegistryValue::Dword(0),
+        );
+        // The g-sensor. Tilt-controlled titles find the accelerometer by
+        // opening its driver key rather than by asking a sensor API, so
+        // a device without this key reads as a device without a sensor —
+        // Xtrakt polls for it (`RegOpenKeyEx`, `Sleep(10)`, retry) and
+        // shuts down when the retries run out.
+        //
+        // `poll_delay` is the sampling interval in milliseconds and
+        // `resolution` the counts-per-g the driver reports; both are the
+        // values shipped on the HTC handsets these games targeted.
+        reg.set_value(
+            r"HKLM\Drivers\BuiltIn\Accelerometer",
+            "poll_delay",
+            RegistryValue::Dword(20),
+        );
+        reg.set_value(
+            r"HKLM\Drivers\BuiltIn\Accelerometer",
+            "resolution",
+            RegistryValue::Dword(1000),
+        );
+        // Which way up the driver currently believes the device is.
+        // `0` is the unrotated portrait orientation, which is what an
+        // emulated screen always is.
+        reg.set_value(
+            r"HKLM\Drivers\BuiltIn\Accelerometer",
+            "current_rotation",
+            RegistryValue::Dword(0),
+        );
+        // The companion screen-rotation service. A game that rotates
+        // itself reads `OverrideCounter` to suppress the shell's own
+        // auto-rotation while it is in the foreground; zero means
+        // nothing is currently overriding it.
+        reg.set_value(
+            r"HKLM\Services\MultiService\mods\Rotation",
+            "OverrideCounter",
             RegistryValue::Dword(0),
         );
         reg

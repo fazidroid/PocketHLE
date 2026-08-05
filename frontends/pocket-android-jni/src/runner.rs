@@ -338,7 +338,9 @@ fn run_game_to_completion(
     // Push one last framebuffer so the UI ends up showing whatever
     // the guest left on screen even if it stopped between frames.
     if let Some(p) = emu.process() {
-        push_frame(state, FrameSnapshot::from_framebuffer(&p.state.framebuffer));
+        if !p.state.framebuffer.is_all_black() {
+            push_frame(state, FrameSnapshot::from_framebuffer(&p.state.framebuffer));
+        }
     }
 
     summary_lines.join("\n")
@@ -378,6 +380,7 @@ struct SessionHook {
     input_disconnected: bool,
     last_emit_at: Option<Instant>,
     scratch: Vec<u8>,
+    saw_non_black: bool,
 }
 
 impl SessionHook {
@@ -389,6 +392,7 @@ impl SessionHook {
             input_disconnected: false,
             last_emit_at: None,
             scratch: Vec::new(),
+            saw_non_black: false,
         }
     }
 }
@@ -414,6 +418,15 @@ impl FrameHook for SessionHook {
         // Stream a fresh framebuffer if the guest produced one.
         let counter = kernel.framebuffer.frame_counter;
         if counter != self.last_frame {
+            if kernel.framebuffer.is_all_black() && self.saw_non_black {
+                return if stop_requested {
+                    kernel.should_stop = true;
+                    FrameAction::Stop
+                } else {
+                    FrameAction::Continue
+                };
+            }
+            self.saw_non_black = !kernel.framebuffer.is_all_black();
             let now = Instant::now();
             let due = self
                 .last_emit_at
