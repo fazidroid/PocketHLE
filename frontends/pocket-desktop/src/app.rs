@@ -356,11 +356,11 @@ impl PocketLauncher {
             .inner_margin(12.0);
         frame.show(ui, |ui| {
             ui.set_width(width);
-            ui.set_min_height(330.0);
-            let icon_size = (width - 24.0).min(196.0);
+            ui.set_min_height(230.0);
+            let icon_size = (width - 24.0).min(112.0);
             ui.allocate_ui_with_layout(
                 Vec2::new(width, icon_size + 8.0),
-                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                egui::Layout::centered_and_justified(egui::Direction::TopDown),
                 |ui| {
                     let icon_path = game.icon_path(self.library.root());
                     if let Some(path) = icon_path {
