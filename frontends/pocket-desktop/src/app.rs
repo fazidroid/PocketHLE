@@ -614,7 +614,6 @@ impl PocketLauncher {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label("Rotation");
-            ui.label("Rotation");
             egui::ComboBox::from_id_source("game_rotation")
                 .selected_text(self.game_rotation.label())
                 .show_ui(ui, |ui| {
