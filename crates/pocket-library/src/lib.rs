@@ -332,6 +332,8 @@ pub struct LauncherConfig {
     pub show_fps: bool,
     #[serde(default)]
     pub fullscreen: bool,
+    #[serde(default = "default_fullscreen_mode")]
+    pub fullscreen_mode: String,
     #[serde(default = "default_orientation")]
     pub orientation: String,
 }
@@ -344,6 +346,10 @@ fn default_orientation() -> String {
     "auto".to_string()
 }
 
+fn default_fullscreen_mode() -> String {
+    "with_controls".to_string()
+}
+
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
@@ -353,6 +359,7 @@ impl Default for LauncherConfig {
             last_import_dir: None,
             show_fps: default_show_fps(),
             fullscreen: false,
+            fullscreen_mode: default_fullscreen_mode(),
             orientation: default_orientation(),
         }
     }
@@ -628,9 +635,9 @@ impl Library {
             .map(|p| p.to_path_buf())
             .unwrap_or(exe_abs.clone());
 
-        let display_name = header
-            .as_ref()
-            .and_then(|h| h.app_name.clone())
+        let setup_app_name = setup.as_ref().and_then(|script| script.app_name.clone());
+        let display_name = setup_app_name
+            .or_else(|| header.as_ref().and_then(|h| h.app_name.clone()))
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| pretty_id(&id));
         let provider = header.as_ref().and_then(|h| h.provider.clone());
