@@ -142,7 +142,7 @@ class GameActivity : AppCompatActivity() {
         }
         session = handle
         startAudio(handle)
-        status.text = "Backend: Unicorn (ARM)\nRunning…"
+        status.text = "Running…"
         // The spinner gets hidden the moment the first frame arrives.
         mainHandler.postDelayed(pollTick, POLL_INTERVAL_MS)
     }
