@@ -45,7 +45,7 @@ class GameAdapter(
     inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         private val icon = view.findViewById<android.widget.ImageView>(R.id.game_icon)
         private val title: TextView = view.findViewById(R.id.game_title)
-        private val backendLabel: TextView = view.findViewById(R.id.game_backend)
+        private val publisherLabel: TextView = view.findViewById(R.id.game_publisher)
         private val moreBtn: ImageButton = view.findViewById(R.id.btn_more)
 
         fun bind(entry: GameEntry) {
@@ -59,9 +59,10 @@ class GameAdapter(
                 icon.setImageResource(R.drawable.ic_game)
                 icon.imageTintList = itemView.context.getColorStateList(com.google.android.material.R.color.material_dynamic_primary40)
             }
-            backendLabel.text = itemView.context.getString(
-                R.string.backend_label,
-                entry.settings.cpuBackend.replaceFirstChar { c -> c.uppercase() },
+            publisherLabel.text = itemView.context.getString(
+                R.string.publisher_label,
+                entry.provider?.takeIf { it.isNotBlank() }
+                    ?: itemView.context.getString(R.string.publisher_unknown),
             )
             itemView.setOnClickListener { onRun(entry) }
             moreBtn.setOnClickListener { anchor -> showOverflowMenu(anchor, entry) }
