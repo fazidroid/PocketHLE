@@ -136,8 +136,8 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
 
     let exe_path = match find_main_exe(&files, &setup, header.as_ref()) {
         Some(p) => p,
-        None => pick_arm_pe(files.iter().map(|f| f.extracted_path.as_path()))
-            .with_context(|| format!("looking for an ARM PE inside {}", path.display()))?,
+        None => pick_entrypoint_pe(files.iter().map(|f| f.extracted_path.as_path()))
+            .with_context(|| format!("looking for a launchable PE inside {}", path.display()))?,
     };
 
     let mut origin = format!("CAB {} -> {}", path.display(), exe_path.display());
@@ -510,7 +510,7 @@ fn find_main_exe(
             .split('\\')
             .filter(|s| !s.is_empty())
             .fold(parent.to_path_buf(), |acc, seg| acc.join(seg));
-        is_arm_pe(&candidate).unwrap_or(false).then_some(candidate)
+        is_entrypoint_candidate(&candidate).then_some(candidate)
     };
 
     // The Start-menu shortcut names the executable the user launches.
@@ -652,10 +652,9 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
         return Ok(inner);
     }
 
-    let exe_path = pick_arm_pe(written.iter().map(PathBuf::as_path)).with_context(|| {
+    let exe_path = pick_entrypoint_pe(written.iter().map(PathBuf::as_path)).with_context(|| {
         format!(
-            "no ARM PE found in {}: {} contains only desktop binaries; \
-             try the matching `.cab` instead",
+            "no launchable PE found in {}: {} contains no supported game entry point",
             path.display(),
             path.file_name().unwrap_or_default().to_string_lossy(),
         )
@@ -709,9 +708,11 @@ fn is_supported_guest_machine(machine: u16) -> bool {
     )
 }
 
-/// Walk `paths` and return the largest one whose PE header advertises
-/// ARM or little-endian MIPS.
-fn pick_arm_pe<'a, I>(paths: I) -> Result<PathBuf>
+/// Walk `paths` and return the largest PE that PocketHLE can identify as
+/// a process entry point. Native ARM/MIPS images are handled by the HLE;
+/// managed WinCE images are retained so the loader can report the missing
+/// .NET Compact Framework runtime instead of claiming the cabinet is empty.
+fn pick_entrypoint_pe<'a, I>(paths: I) -> Result<PathBuf>
 where
     I: IntoIterator<Item = &'a Path>,
 {
@@ -720,47 +721,59 @@ where
         let Ok(meta) = std::fs::metadata(p) else {
             continue;
         };
-        if !meta.is_file() {
+        if !meta.is_file() || !is_entrypoint_candidate(p) {
             continue;
         }
-        if is_arm_pe(p).unwrap_or(false) {
-            candidates.push((meta.len(), p.to_path_buf()));
-        }
+        candidates.push((meta.len(), p.to_path_buf()));
     }
     candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
     candidates
         .into_iter()
         .next()
         .map(|(_, p)| p)
-        .ok_or_else(|| anyhow!("no PE32 ARM executable found"))
+        .ok_or_else(|| anyhow!("no launchable PE executable found"))
 }
 
 /// Cheap check for the PE/COFF header: read 0x40 bytes, follow the
 /// `e_lfanew` offset, verify `PE\0\0` and read the machine type.
 /// Returns `Ok(false)` for short reads or non-PE files (so we skip
 /// them silently rather than failing the whole launch).
-fn is_arm_pe(path: &Path) -> std::io::Result<bool> {
+fn pe_header_fields(path: &Path) -> std::io::Result<Option<(u16, u16)>> {
     let mut f = File::open(path)?;
     let mut head = [0u8; 0x40];
-    let n = f.read(&mut head)?;
-    if n < 0x40 {
-        return Ok(false);
-    }
-    if &head[0..2] != b"MZ" {
-        return Ok(false);
+    if f.read(&mut head)? < head.len() || &head[0..2] != b"MZ" {
+        return Ok(None);
     }
     let lfanew = u32::from_le_bytes(head[0x3c..0x40].try_into().unwrap()) as u64;
     use std::io::{Seek, SeekFrom};
     f.seek(SeekFrom::Start(lfanew))?;
-    let mut sig = [0u8; 6];
-    if f.read(&mut sig)? < 6 {
-        return Ok(false);
+    let mut coff = [0u8; 24];
+    if f.read(&mut coff)? < coff.len() || &coff[0..4] != b"PE\0\0" {
+        return Ok(None);
     }
-    if &sig[0..4] != b"PE\0\0" {
-        return Ok(false);
-    }
-    let machine = u16::from_le_bytes([sig[4], sig[5]]);
-    Ok(is_supported_guest_machine(machine))
+    Ok(Some((
+        u16::from_le_bytes([coff[4], coff[5]]),
+        u16::from_le_bytes([coff[22], coff[23]]),
+    )))
+}
+
+fn is_arm_pe(path: &Path) -> std::io::Result<bool> {
+    Ok(pe_header_fields(path)?.is_some_and(|(machine, _)| is_supported_guest_machine(machine)))
+}
+
+fn is_entrypoint_candidate(path: &Path) -> bool {
+    let Ok(image) = pocket_core::pe::load_file(path) else {
+        return false;
+    };
+    (is_supported_guest_machine(image.machine) || image.managed_runtime.is_some())
+        && !is_guest_dll(path)
+}
+
+fn is_guest_dll(path: &Path) -> bool {
+    pe_header_fields(path)
+        .ok()
+        .flatten()
+        .is_some_and(|(_, characteristics)| characteristics & 0x2000 != 0)
 }
 
 #[cfg(test)]
@@ -796,7 +809,7 @@ mod tests {
         buf[0..2].copy_from_slice(b"MZ");
         // e_lfanew at 0x80
         buf[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
-        buf.resize(0x90, 0);
+        buf.resize(0x98, 0);
         buf[0x80..0x84].copy_from_slice(b"PE\0\0");
         buf[0x84..0x86].copy_from_slice(&IMAGE_FILE_MACHINE_ARM.to_le_bytes());
         std::fs::File::create(&path)
