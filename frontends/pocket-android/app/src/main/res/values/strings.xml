@@ -53,6 +53,8 @@
     <string name="pref_show_fps_summary">Overlay frames-per-second on top of the running game (j2me-loader style).</string>
     <string name="pref_fullscreen_title">Fullscreen without system bars</string>
     <string name="pref_fullscreen_summary">Hide the status and navigation bars while a game is running.</string>
+    <string name="pref_fullscreen_mode_title">Fullscreen controls</string>
+    <string name="pref_fullscreen_mode_summary">Choose whether virtual buttons remain visible in fullscreen.</string>
     <string name="pref_orientation_title">Android orientation</string>
     <string name="pref_orientation_summary">Choose automatic rotation, portrait, or landscape for games.</string>
     <string name="pref_library_root_title">Library root</string>
@@ -82,6 +84,14 @@
         <item>landscape</item>
         <item>small_portrait</item>
         <item>wvga</item>
+    </string-array>
+    <string-array name="fullscreen_mode_entries">
+        <item>Fullscreen with controls</item>
+        <item>Fullscreen without controls</item>
+    </string-array>
+    <string-array name="fullscreen_mode_values">
+        <item>with_controls</item>
+        <item>without_controls</item>
     </string-array>
     <string-array name="orientation_entries">
         <item>Automatic</item>

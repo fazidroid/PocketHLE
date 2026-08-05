@@ -43,6 +43,7 @@ class GameActivity : AppCompatActivity() {
     private lateinit var fpsOverlay: TextView
     private lateinit var toolbar: Toolbar
     private lateinit var fullscreenButton: ImageButton
+    private lateinit var gameControls: View
     private lateinit var glRenderer: FrameRenderer
 
     /** Cached handle from `nativeStartGame` (`0` once we've finished). */
@@ -73,6 +74,7 @@ class GameActivity : AppCompatActivity() {
     private var showFps: Boolean = true
 
     private var fullscreen: Boolean = false
+    private var fullscreenMode: String = "with_controls"
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -103,12 +105,15 @@ class GameActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         val config = readLauncherConfig()
         fullscreen = config.fullscreen
+        fullscreenMode = config.fullscreenMode
         requestedOrientation = orientationFor(config.orientation)
         setContentView(R.layout.activity_game)
         toolbar = findViewById(R.id.toolbar)
         setSupportActionBar(toolbar)
         fullscreenButton = findViewById(R.id.btn_fullscreen)
         fullscreenButton.setOnClickListener { toggleFullscreenWithControls() }
+        gameControls = findViewById(R.id.game_controls)
+        updateFullscreenLayout()
         if (fullscreen) {
             toolbar.visibility = View.GONE
             hideSystemBars()
@@ -384,7 +389,7 @@ class GameActivity : AppCompatActivity() {
             exitFullscreenWithControls()
         } else {
             fullscreen = true
-            toolbar.visibility = View.GONE
+            updateFullscreenLayout()
             fullscreenButton.setImageResource(R.drawable.ic_fullscreen_exit)
             hideSystemBars()
         }
@@ -392,9 +397,14 @@ class GameActivity : AppCompatActivity() {
 
     private fun exitFullscreenWithControls() {
         fullscreen = false
-        toolbar.visibility = View.VISIBLE
+        updateFullscreenLayout()
         fullscreenButton.setImageResource(R.drawable.ic_fullscreen)
         showSystemBars()
+    }
+
+    private fun updateFullscreenLayout() {
+        toolbar.visibility = if (fullscreen) View.GONE else View.VISIBLE
+        gameControls.visibility = if (fullscreen && fullscreenMode == "without_controls") View.GONE else View.VISIBLE
     }
 
     private fun showSystemBars() {
