@@ -331,19 +331,19 @@ impl PocketLauncher {
         ScrollArea::vertical().show(ui, |ui| {
             let gap = 16.0;
             let card_width = 224.0;
-            let card_height = 224.0;
             let columns = ((ui.available_width() + gap) / (card_width + gap))
                 .floor()
                 .max(1.0) as usize;
             egui::Grid::new("library_grid")
                 .num_columns(columns)
-                .min_col_width(card_width)
-                .max_col_width(card_width)
-                .min_row_height(card_height)
                 .spacing(Vec2::splat(gap))
                 .show(ui, |ui| {
                     for (index, game) in games.iter().enumerate() {
-                        self.ui_game_card(ui, game, card_width, card_height);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(card_width, 260.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| self.ui_game_card(ui, game, card_width),
+                        );
                         if (index + 1) % columns == 0 {
                             ui.end_row();
                         }
@@ -355,7 +355,7 @@ impl PocketLauncher {
         });
     }
 
-    fn ui_game_card(&mut self, ui: &mut egui::Ui, game: &GameEntry, width: f32, height: f32) {
+    fn ui_game_card(&mut self, ui: &mut egui::Ui, game: &GameEntry, width: f32) {
         let frame = egui::Frame::none()
             .fill(Color32::from_rgb(35, 38, 46))
             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(82, 86, 96)))
@@ -364,11 +364,11 @@ impl PocketLauncher {
         let card = frame.show(ui, |ui| {
             ui.set_min_width(width);
             ui.set_max_width(width);
-            ui.set_min_height(height);
-            ui.set_max_height(height);
+            ui.set_min_height(260.0);
+            ui.set_max_height(260.0);
             ui.vertical(|ui| {
                 ui.set_width(width);
-                ui.set_height(height);
+                ui.set_height(260.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.menu_button(RichText::new("⋮").size(24.0), |ui| {
                         if ui.button("Settings").clicked() {
