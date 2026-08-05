@@ -329,11 +329,13 @@ impl PocketLauncher {
             return;
         }
         ScrollArea::vertical().show(ui, |ui| {
-            let avail = ui.available_width();
-            let card_width = 248.0_f32.min(avail);
+            let avail = ui.available_width().max(1.0);
             let gap = 16.0;
-            let columns = ((avail + gap) / (card_width + gap)).floor() as usize;
-            let columns = columns.max(1);
+            let min_card_width = 248.0;
+            let columns = ((avail + gap) / (min_card_width + gap)).floor() as usize;
+            let columns = columns.clamp(1, games.len().max(1));
+            let card_width = ((avail - gap * (columns.saturating_sub(1) as f32)) / columns as f32)
+                .max(min_card_width);
             egui::Grid::new("library_grid")
                 .num_columns(columns)
                 .spacing(Vec2::splat(gap))
@@ -343,6 +345,9 @@ impl PocketLauncher {
                         if (i + 1) % columns == 0 {
                             ui.end_row();
                         }
+                    }
+                    if !games.len().is_multiple_of(columns) {
+                        ui.end_row();
                     }
                 });
         });
@@ -356,65 +361,77 @@ impl PocketLauncher {
             .inner_margin(12.0);
         frame.show(ui, |ui| {
             ui.set_width(width);
+            ui.set_max_width(width);
             ui.set_min_height(230.0);
-            let icon_size = (width - 24.0).min(112.0);
-            ui.allocate_ui_with_layout(
-                Vec2::new(width, icon_size + 8.0),
-                egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                |ui| {
-                    let icon_path = game.icon_path(self.library.root());
-                    if let Some(path) = icon_path {
-                        if let Ok(bytes) = std::fs::read(path) {
-                            if let Ok(image) = load_image_bytes(&bytes) {
-                                let texture =
-                                    self.icon_cache.entry(game.id.clone()).or_insert_with(|| {
-                                        ui.ctx().load_texture(
-                                            format!("icon-{}", game.id),
-                                            image,
-                                            egui::TextureOptions::LINEAR,
-                                        )
-                                    });
-                                ui.add(
-                                    egui::Image::from_texture(&*texture)
-                                        .fit_to_exact_size(Vec2::splat(icon_size)),
-                                );
-                                return;
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                let content_width = (width - 24.0).max(1.0);
+                let icon_size = content_width.min(112.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(content_width, icon_size + 8.0),
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        let icon_path = game.icon_path(self.library.root());
+                        if let Some(path) = icon_path {
+                            if let Ok(bytes) = std::fs::read(path) {
+                                if let Ok(image) = load_image_bytes(&bytes) {
+                                    let texture = self
+                                        .icon_cache
+                                        .entry(game.id.clone())
+                                        .or_insert_with(|| {
+                                            ui.ctx().load_texture(
+                                                format!("icon-{}", game.id),
+                                                image,
+                                                egui::TextureOptions::LINEAR,
+                                            )
+                                        });
+                                    ui.add(
+                                        egui::Image::from_texture(&*texture)
+                                            .fit_to_exact_size(Vec2::splat(icon_size)),
+                                    );
+                                    return;
+                                }
                             }
                         }
-                    }
-                    ui.label(RichText::new("📱").size(64.0));
-                },
-            );
+                        ui.label(RichText::new("📱").size(64.0));
+                    },
+                );
 
-            ui.add_space(8.0);
-            ui.label(RichText::new(&game.display_name).strong().size(18.0));
-            let publisher = game
-                .provider
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("Unknown");
-            ui.label(
-                RichText::new(format!("Publisher: {publisher}"))
-                    .size(14.0)
-                    .color(Color32::from_gray(180)),
-            );
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button("Run").clicked() {
-                    self.spawn_run(game);
-                }
-                if ui.button("Settings").clicked() {
-                    self.selected_game = Some(game.id.clone());
-                    self.game_settings_draft = Some((game.id.clone(), game.settings.clone()));
-                    self.screen = Screen::GameSettings;
-                }
-                if ui.button("Remove").clicked() {
-                    if let Err(e) = self.library.remove(&game.id) {
-                        self.status = format!("Remove failed: {e}");
-                    } else {
-                        self.status = format!("Removed {}", game.display_name);
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(RichText::new(&game.display_name).strong().size(18.0))
+                        .truncate(true),
+                );
+                let publisher = game
+                    .provider
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("Unknown");
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("Publisher: {publisher}"))
+                            .size(14.0)
+                            .color(Color32::from_gray(180)),
+                    )
+                    .truncate(true),
+                );
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Run").clicked() {
+                        self.spawn_run(game);
                     }
-                }
+                    if ui.button("Settings").clicked() {
+                        self.selected_game = Some(game.id.clone());
+                        self.game_settings_draft = Some((game.id.clone(), game.settings.clone()));
+                        self.screen = Screen::GameSettings;
+                    }
+                    if ui.button("Remove").clicked() {
+                        if let Err(e) = self.library.remove(&game.id) {
+                            self.status = format!("Remove failed: {e}");
+                        } else {
+                            self.status = format!("Removed {}", game.display_name);
+                        }
+                    }
+                });
             });
         });
     }
