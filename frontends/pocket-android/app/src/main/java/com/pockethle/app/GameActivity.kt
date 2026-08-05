@@ -75,7 +75,6 @@ class GameActivity : AppCompatActivity() {
 
     private var fullscreen: Boolean = false
     private var controlsVisible: Boolean = true
-    private var gestureStartY: Float = 0f
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -178,6 +177,12 @@ class GameActivity : AppCompatActivity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
+        if (fullscreen) {
+            controlsVisible = true
+            fullscreen = false
+            updateControlsVisibility()
+            return
+        }
         // Ask the emulator to wind down gracefully; the polling
         // tick will notice the worker exited and call finishSession.
         if (session != 0L) {
@@ -451,38 +456,20 @@ class GameActivity : AppCompatActivity() {
     @SuppressLint("ClickableViewAccessibility")
     private fun wireSurfaceTouchInput() {
         surface.setOnTouchListener { v, event ->
-            if (!controlsVisible) {
-                when (event.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> {
-                        gestureStartY = event.rawY
-                        true
-                    }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        if (event.actionMasked == MotionEvent.ACTION_UP && event.rawY - gestureStartY < -80f) {
-                            controlsVisible = true
-                            fullscreen = false
-                            updateControlsVisibility()
-                        }
-                        true
-                    }
-                    else -> true
+            val handle = session
+            if (handle == 0L) return@setOnTouchListener false
+            val frame = lastFrame ?: return@setOnTouchListener true
+            val mapped = mapTouchToGame(v, event, frame) ?: return@setOnTouchListener true
+            val (gx, gy) = mapped
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_DOWN, gx, gy)
+                MotionEvent.ACTION_MOVE -> NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_MOVE, gx, gy)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_UP, gx, gy)
+                    v.performClick()
                 }
-            } else {
-                val handle = session
-                if (handle == 0L) return@setOnTouchListener false
-                val frame = lastFrame ?: return@setOnTouchListener true
-                val mapped = mapTouchToGame(v, event, frame) ?: return@setOnTouchListener true
-                val (gx, gy) = mapped
-                when (event.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_DOWN, gx, gy)
-                    MotionEvent.ACTION_MOVE -> NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_MOVE, gx, gy)
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        NativeBridge.nativeSendInput(handle, NativeBridge.INPUT_POINTER_UP, gx, gy)
-                        v.performClick()
-                    }
-                }
-                true
             }
+            true
         }
     }
 
