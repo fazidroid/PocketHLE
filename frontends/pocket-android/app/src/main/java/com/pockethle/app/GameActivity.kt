@@ -108,7 +108,8 @@ class GameActivity : AppCompatActivity() {
         fullscreen = config.fullscreen
         requestedOrientation = orientationFor(config.orientation)
         setContentView(R.layout.activity_game)
-        setSupportActionBar(findViewById<Toolbar>(R.id.toolbar))
+        toolbar = findViewById(R.id.toolbar)
+        setSupportActionBar(toolbar)
         controlsVisible = !fullscreen
         controls = findViewById(R.id.game_controls)
         fullscreenButton = findViewById(R.id.btn_fullscreen)
