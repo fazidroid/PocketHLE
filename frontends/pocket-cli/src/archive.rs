@@ -312,7 +312,11 @@ fn guest_exe_path(
             .next()
             .is_some_and(|leaf| leaf.eq_ignore_ascii_case(&name))
     };
-    if let Some(target) = header.shortcut_target.as_deref().filter(|t| matches_name(t)) {
+    if let Some(target) = header
+        .shortcut_target
+        .as_deref()
+        .filter(|t| matches_name(t))
+    {
         return Some(target.to_string());
     }
     if let Some(dest) = header

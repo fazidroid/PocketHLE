@@ -1319,7 +1319,10 @@ impl WinCeInstallHeader {
     /// long-name copy is what `GetModuleFileNameW` reports back, and
     /// games rebuild their asset paths from that string.
     pub fn host_path(&self, root: &Path, destination: &str) -> Option<PathBuf> {
-        let install_root = self.install_dir.as_deref().map(|d| d.trim_end_matches('\\'));
+        let install_root = self
+            .install_dir
+            .as_deref()
+            .map(|d| d.trim_end_matches('\\'));
         let relative = relative_to_root(destination, install_root)?;
         Some(join_guest_relative(root, relative))
     }
@@ -1343,7 +1346,10 @@ pub fn materialise_install_header_names(
     files: &[CabFile],
     header: &WinCeInstallHeader,
 ) -> Vec<(PathBuf, PathBuf)> {
-    let install_root = header.install_dir.as_deref().map(|d| d.trim_end_matches('\\'));
+    let install_root = header
+        .install_dir
+        .as_deref()
+        .map(|d| d.trim_end_matches('\\'));
 
     // Index the cabinet by numeric extension: the spec is explicit that
     // only the extension identifies an entry, the 8.3 stem is generated
@@ -1751,7 +1757,13 @@ mod tests {
 
         // A file name carrying a separator would escape the extract
         // directory once it is turned into a host path.
-        assert_eq!(relative_to_root(r"\Program Files\Game\..\evil.dll", Some(r"\Program Files\Game")), None);
+        assert_eq!(
+            relative_to_root(
+                r"\Program Files\Game\..\evil.dll",
+                Some(r"\Program Files\Game")
+            ),
+            None
+        );
         // A file installed outside the install root keeps its bare name
         // rather than escaping.
         assert_eq!(
