@@ -35,8 +35,8 @@ use pocket_kernel::{
     module_file_name, CreateStage, DispatchOutcome, GuestCallFrame, GuestThread, InputEvent,
     KernelError, KernelState, LoadedModule, ModalDialog, QsortFrame, VectorIterFrame,
     WaveCallbackKind, DEFAULT_STACK_TOP, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE,
-    MODULE_REGION_END, MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE, SLOT_ALIAS_BASE,
-    SYNTHETIC_FRAMEBUFFER_BASE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
+    HSS_MODULE_HANDLE, MODULE_REGION_END, MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE,
+    SLOT_ALIAS_BASE, SYNTHETIC_FRAMEBUFFER_BASE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
     USER_KDATA_TLS_ARRAY_VA,
 };
 use pocket_pe::{ResourceEntry, ResourceKey};
@@ -1858,6 +1858,15 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
             0
         };
         log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    if name.ends_with("hss.dll") || name == "hss" {
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&HSS_MODULE_HANDLE) {
+            HSS_MODULE_HANDLE
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE HSS)");
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
     if let Some(handle) = gles_module_handle(&name) {
