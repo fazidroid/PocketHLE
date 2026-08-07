@@ -2247,7 +2247,11 @@ pub fn run_main_loop_with_hook(
                         // Some other host-installed hook (e.g.
                         // `--watch` from the CLI). Dump CPU state
                         // and halt cleanly.
-                        log::warn!("watch hit at 0x{addr:08x}\n{regs}", regs = dump_regs(cpu),);
+                        log::warn!(
+                            "watch hit at 0x{addr:08x}\n{regs}{mem}",
+                            regs = dump_regs(cpu),
+                            mem = dump_mem_around(cpu, addr, 64),
+                        );
                         return Ok(());
                     }
                 };
