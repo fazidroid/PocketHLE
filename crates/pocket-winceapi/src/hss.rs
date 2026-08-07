@@ -59,7 +59,7 @@ fn ok(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         .thunk
         .friendly_name
         .as_deref()
-        .or_else(|| match &ctx.thunk.binding {
+        .or(match &ctx.thunk.binding {
             pocket_pe::ImportBinding::Name(name) => Some(name.as_str()),
             pocket_pe::ImportBinding::Ordinal(_) => None,
         })
@@ -75,15 +75,8 @@ fn ok(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         || name.contains("volume@hssSound@@QAAIXZ")
     {
         0
-    } else if name.contains("load@hssSound") || name.contains("load@hssMusic") {
-        1
     } else if name.contains("bufferLength@hssSpeaker") {
         4096
-    } else if name.contains("open@hssSpeaker")
-        || name.contains("playSound@hssSpeaker")
-        || name.contains("playMusic@hssSpeaker")
-    {
-        1
     } else {
         1
     };
