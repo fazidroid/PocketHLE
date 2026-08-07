@@ -36,7 +36,8 @@ use pocket_kernel::{
     KernelError, KernelState, LoadedModule, ModalDialog, QsortFrame, VectorIterFrame,
     WaveCallbackKind, DEFAULT_STACK_TOP, FAKE_CURRENT_PROCESS_HANDLE, FAKE_CURRENT_THREAD_HANDLE,
     MODULE_REGION_END, MODULE_REGION_STRIDE, PROCESS_INSTANCE_HANDLE, SLOT_ALIAS_BASE,
-    THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT, USER_KDATA_TLS_ARRAY_VA,
+    SYNTHETIC_FRAMEBUFFER_BASE, THREAD_EXIT_TRAMPOLINE_BASE, TLS_SLOT_COUNT,
+    USER_KDATA_TLS_ARRAY_VA,
 };
 use pocket_pe::{ResourceEntry, ResourceKey};
 
@@ -563,6 +564,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetBkMode", set_bk_mode);
     d.register_handler(dll, "SetBkColor", set_bk_color);
     d.register_handler(dll, "SetTextColor", set_text_color);
+    d.register_handler(dll, "SetTextAlign", set_text_align);
     d.register_handler(dll, "TextOutW", text_out_w);
     d.register_handler(dll, "ExtTextOutW", ext_text_out_w);
     d.register_handler(dll, "ExtEscape", ext_escape);
@@ -2417,7 +2419,36 @@ fn memcpy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     }
     ctx.cpu.read_mem_into(src, &mut scratch[..len])?;
     ctx.cpu.write_mem(dst, &scratch[..len])?;
+    sync_direct_framebuffer_write(ctx, dst, len)?;
     Ok(DispatchOutcome::ReturnedR0(dst))
+}
+
+fn sync_direct_framebuffer_write(
+    ctx: &mut CallCtx<'_>,
+    dst: u32,
+    len: usize,
+) -> Result<(), KernelError> {
+    let base = SYNTHETIC_FRAMEBUFFER_BASE;
+    let end = base.saturating_add(ctx.kernel.framebuffer.byte_size());
+    let write_end = dst.saturating_add(len as u32);
+    if dst >= end || write_end <= base {
+        return Ok(());
+    }
+    let fb_len = ctx.kernel.framebuffer.pixels.len();
+    if ctx.kernel.gx_readback_scratch.len() != fb_len {
+        ctx.kernel.gx_readback_scratch.resize(fb_len, 0);
+    }
+    ctx.cpu
+        .read_mem_into(base, &mut ctx.kernel.gx_readback_scratch)?;
+    if ctx.kernel.gx_readback_scratch != ctx.kernel.framebuffer.pixels {
+        ctx.kernel
+            .framebuffer
+            .pixels
+            .copy_from_slice(&ctx.kernel.gx_readback_scratch);
+        ctx.kernel.framebuffer.mark_dirty();
+        ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+    }
+    Ok(())
 }
 
 fn memchr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -7021,6 +7052,22 @@ fn set_text_color(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(0))
 }
 
+fn set_text_align(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dc = ctx.arg_u32(0)?;
+    let mode = ctx.arg_u32(1)?;
+    let previous = ctx
+        .kernel
+        .gdi
+        .dc_mut(dc)
+        .map(|d| {
+            let previous = d.text_align;
+            d.text_align = mode;
+            previous
+        })
+        .unwrap_or(0);
+    Ok(DispatchOutcome::ReturnedR0(previous))
+}
+
 /// Borrow either the framebuffer or a memory bitmap as a writable
 /// surface, given a DC handle.
 fn surface_for_dc<'a>(state: &'a mut pocket_kernel::KernelState, dc: u32) -> Option<Surface<'a>> {
@@ -9428,6 +9475,26 @@ fn ext_text_out_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+fn aligned_text_origin(
+    dc: &pocket_kernel::gdi::Dc,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (i32, i32) {
+    let x = match dc.text_align & 0x6 {
+        0x6 => x - width / 2,
+        0x2 => x - width,
+        _ => x,
+    };
+    let y = if dc.text_align & 0x18 == 0x18 {
+        y - height
+    } else {
+        y
+    };
+    (x, y)
+}
+
 fn blit_text_at(
     ctx: &mut CallCtx<'_>,
     hdc: u32,
@@ -9462,6 +9529,7 @@ fn blit_text_at(
     let color = colorref_to_rgb565(dc_meta.text_color);
     let bk_color = colorref_to_rgb565(dc_meta.bk_color);
     let pixel_w = chars.len() as i32 * pocket_kernel::font::GLYPH_W;
+    let (x, y) = aligned_text_origin(&dc_meta, x, y, pixel_w, pocket_kernel::font::GLYPH_H);
     if let Some(mut surf) = surface_for_dc(ctx.kernel, hdc) {
         if !dc_meta.bk_transparent {
             surf.fill_rect(x, y, pixel_w, pocket_kernel::font::GLYPH_H, bk_color);

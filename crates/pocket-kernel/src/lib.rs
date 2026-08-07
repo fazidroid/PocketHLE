@@ -1926,6 +1926,30 @@ impl<F: FnMut(&mut KernelState) -> FrameAction> FrameHook for F {
     }
 }
 
+fn sync_guest_framebuffer(cpu: &mut dyn Cpu, state: &mut KernelState) {
+    if !state.fb_mapped || state.framebuffer.frame_counter != state.gx_last_pushed_counter {
+        return;
+    }
+    let len = state.framebuffer.pixels.len();
+    if state.gx_readback_scratch.len() != len {
+        state.gx_readback_scratch.resize(len, 0);
+    }
+    if let Err(error) =
+        cpu.read_mem_into(SYNTHETIC_FRAMEBUFFER_BASE, &mut state.gx_readback_scratch)
+    {
+        log::warn!("unable to read the GAPI framebuffer: {error}");
+        return;
+    }
+    if state.gx_readback_scratch != state.framebuffer.pixels {
+        state
+            .framebuffer
+            .pixels
+            .copy_from_slice(&state.gx_readback_scratch);
+        state.framebuffer.mark_dirty();
+        state.gx_last_pushed_counter = state.framebuffer.frame_counter;
+    }
+}
+
 /// Drive emulated execution in a loop, dispatching each thunk hit
 /// through `dispatcher` until a [`DispatchOutcome::Halt`] is returned
 /// or the configured instruction budget is exhausted.
@@ -2248,6 +2272,7 @@ pub fn run_main_loop_with_hook(
             StopReason::Requested | StopReason::OutOfBounds => return Ok(()),
         }
         if let Some(hook) = frame_hook.as_deref_mut() {
+            sync_guest_framebuffer(cpu, &mut process.state);
             process.state.composite_controls();
             if hook.on_frame(&mut process.state) == FrameAction::Stop {
                 log::info!("frame hook requested stop");
