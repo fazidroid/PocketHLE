@@ -6156,7 +6156,7 @@ fn input_to_message(ev: pocket_kernel::InputEvent) -> Option<(u32, u32, u32)> {
         }
         pocket_kernel::InputEvent::PointerUp { x, y } => {
             let lparam = ((y as u32) << 16) | (x as u32);
-            Some((WM_LBUTTONUP, 0, lparam))
+            Some((WM_LBUTTONUP, MK_LBUTTON, lparam))
         }
         pocket_kernel::InputEvent::PointerMove { x, y } => {
             let lparam = ((y as u32) << 16) | (x as u32);
