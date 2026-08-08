@@ -21,6 +21,7 @@
 //! and they get called many thousands of times before the game ever
 //! reaches `WinMain`.
 
+use image::GenericImageView;
 use pocket_cpu::regs::ArmReg;
 use pocket_cpu::Prot;
 use pocket_kernel::controls::{ControlAction, ControlClass, Controls};
@@ -101,6 +102,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "GetProcAddress", get_proc_address_a);
     d.register_handler(dll, "GetProcAddressA", get_proc_address_a);
     d.register_handler(dll, "LoadLibraryW", load_library_w);
+    d.register_handler(dll, "DecompressImageIndirect", decompress_image_indirect);
+    d.register_handler(dll, "#1", decompress_image_indirect);
+    d.register_handler(dll, "_strupr", strupr);
     d.register_constant(dll, "FreeLibrary", 1, one_returning);
 
     // ---- CRT prologue helpers ----
@@ -428,6 +432,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
     d.register_handler(dll, "CallWindowProcW", call_window_proc_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
+    d.register_handler(dll, "GetMessagePos", get_message_pos);
     d.register_handler(dll, "PeekMessageW", peek_message_w);
     d.register_constant(dll, "TranslateMessage", 1, one_returning);
     d.register_handler(dll, "PostQuitMessage", post_quit_message);
@@ -676,6 +681,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "EventModify", 1, one_returning);
     d.register_handler(dll, "CreateEventW", create_event_w);
     d.register_handler(dll, "CreateEventA", create_event_w);
+    d.register_handler(dll, "OpenEventW", open_event_w);
+    d.register_handler(dll, "OpenEventA", open_event_w);
     d.register_handler(dll, "SetEvent", set_event);
     d.register_handler(dll, "PulseEvent", set_event);
     d.register_handler(dll, "ResetEvent", reset_event);
@@ -997,6 +1004,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // ---- Locale ----
     d.register_handler(dll, "GetSystemDefaultLangID", get_system_default_lang_id);
     d.register_handler(dll, "GetThreadLocale", get_thread_locale);
+    d.register_handler(dll, "GetLocaleInfoW", get_locale_info_w);
 
     // ---- Codepage / dynamic loader ----
     d.register_handler(dll, "MultiByteToWideChar", multi_byte_to_wide_char);
@@ -1867,6 +1875,15 @@ fn load_library_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
             0
         };
         log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE HSS)");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    if name.ends_with("imgdecmp.dll") || name == "imgdecmp" {
+        let handle = if ctx.kernel.dynamic_exports.contains_key(&FAKE_MODULE_HANDLE) {
+            FAKE_MODULE_HANDLE
+        } else {
+            0
+        };
+        log::debug!("LoadLibraryW({name:?}) -> 0x{handle:08x} (PocketHLE image decoder)");
         return Ok(DispatchOutcome::ReturnedR0(handle));
     }
     if let Some(handle) = gles_module_handle(&name) {
@@ -4199,6 +4216,17 @@ fn toupper(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         c
     };
     Ok(DispatchOutcome::ReturnedR0(value))
+}
+
+fn strupr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let p = ctx.arg_u32(0)?;
+    if p == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = read_cstr(ctx, p, 0x10000)?;
+    let upper: Vec<u8> = bytes.into_iter().map(|c| c.to_ascii_uppercase()).collect();
+    ctx.cpu.write_mem(p, &upper)?;
+    Ok(DispatchOutcome::ReturnedR0(p))
 }
 
 fn to_lower_w(c: u16) -> u16 {
@@ -6605,6 +6633,10 @@ fn next_message_if_due(ctx: &mut CallCtx<'_>) -> Option<(u32, u32, u32, u32)> {
 /// return so the loop tears down cleanly. Real user input from the
 /// host frontend (mouse / D-pad / keyboard) is delivered before any
 /// synthetic message; see [`next_message`].
+fn get_message_pos(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     // A real driver retires wave buffers on its own thread; the
     // message pump is our equivalent "time has passed" hook, so do it
@@ -8987,6 +9019,31 @@ fn create_event_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
 /// `BOOL SetEvent(HANDLE)` — also serves `PulseEvent`. We have no
 /// blocked waiters to release synchronously, so a pulse is just a set;
 /// the next wait consumes it (auto-reset) or sees it (manual).
+fn open_event_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _access = ctx.arg_u32(0)?;
+    let _inherit = ctx.arg_u32(1)?;
+    let name_ptr = ctx.arg_u32(2)?;
+    let name = if name_ptr == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&read_wstr(ctx, name_ptr, 260).unwrap_or_default())
+    };
+    if let Some((&handle, _)) = ctx.kernel.events.iter().find(|(_, event)| event.signalled) {
+        log::debug!("OpenEvent({name:?}) -> existing 0x{handle:08x}");
+        return Ok(DispatchOutcome::ReturnedR0(handle));
+    }
+    let handle = 0xDEAD_E001u32.wrapping_add(ctx.kernel.events.len() as u32);
+    ctx.kernel.events.insert(
+        handle,
+        pocket_kernel::EventObject {
+            manual_reset: false,
+            signalled: false,
+        },
+    );
+    log::debug!("OpenEvent({name:?}) -> 0x{handle:08x}");
+    Ok(DispatchOutcome::ReturnedR0(handle))
+}
+
 fn set_event(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let handle = ctx.arg_u32(0)?;
     if let Some(ev) = ctx.kernel.events.get_mut(&handle) {
@@ -10683,6 +10740,27 @@ fn get_thread_locale(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     Ok(DispatchOutcome::ReturnedR0(0x0409))
 }
 
+fn get_locale_info_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _locale = ctx.arg_u32(0)?;
+    let kind = ctx.arg_u32(1)?;
+    let dst = ctx.arg_u32(2)?;
+    let cap = ctx.arg_u32(3)?;
+    let value = match kind {
+        0x00000002 => "en-US",
+        0x00000004 => "English",
+        0x0000000e => "US",
+        0x0000000f => "USD",
+        _ => "",
+    };
+    if dst == 0 || cap == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(
+            (value.encode_utf16().count() + 1) as u32,
+        ));
+    }
+    let written = write_wide_str(ctx.cpu, dst, cap, value)?;
+    Ok(DispatchOutcome::ReturnedR0(written + 1))
+}
+
 // ---------- Codepage conversion ----------
 //
 // Most PPC games call `MultiByteToWideChar` / `WideCharToMultiByte`
@@ -10982,6 +11060,67 @@ fn resolve_dynamic_export(ctx: &CallCtx<'_>, module: u32, name: &str) -> u32 {
                 0
             }
         })
+}
+
+fn decompress_image_indirect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const E_INVALIDARG: u32 = 0x8007_0057;
+    const IMGDECOMP_E_NOIMAGE: u32 = 0x800b_0100;
+    let info = ctx.arg_u32(0)?;
+    if info == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(E_INVALIDARG));
+    }
+    let header = ctx.cpu.read_mem(info, 60)?;
+    let buffer = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    let buffer_max = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    let buffer_current = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    let bitmap_out = u32::from_le_bytes(header[16..20].try_into().unwrap());
+    let bit_depth = i32::from_le_bytes(header[24..28].try_into().unwrap());
+    let max_width = u32::from_le_bytes(header[40..44].try_into().unwrap());
+    let max_height = u32::from_le_bytes(header[44..48].try_into().unwrap());
+    if buffer == 0 || bitmap_out == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(E_INVALIDARG));
+    }
+    let available = if buffer_current == 0 {
+        buffer_max
+    } else {
+        buffer_current.min(buffer_max)
+    }
+    .min(16 * 1024 * 1024);
+    if available == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(IMGDECOMP_E_NOIMAGE));
+    }
+    let bytes = ctx.cpu.read_mem(buffer, available)?;
+    let decoded = match image::load_from_memory(&bytes) {
+        Ok(image) => image,
+        Err(error) => {
+            log::debug!("DecompressImageIndirect: image decode failed: {error}");
+            return Ok(DispatchOutcome::ReturnedR0(IMGDECOMP_E_NOIMAGE));
+        }
+    };
+    let (source_width, source_height) = decoded.dimensions();
+    let width = source_width.min(max_width.max(1));
+    let height = source_height.min(max_height.max(1));
+    let decoded = if width != source_width || height != source_height {
+        decoded.resize_exact(width, height, image::imageops::FilterType::Nearest)
+    } else {
+        decoded
+    };
+    let rgba = decoded.to_rgba8();
+    let handle = ctx.kernel.gdi.create_compatible_bitmap(width, height);
+    if let Some(bitmap) = ctx.kernel.gdi.bitmap_mut(handle) {
+        bitmap.bpp = if bit_depth > 0 { bit_depth as u16 } else { 16 };
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = rgba.get_pixel(x, y).0;
+                let rgb565 = pocket_kernel::framebuffer::pack_rgb565(pixel[0], pixel[1], pixel[2]);
+                let offset = ((y * width + x) * 2) as usize;
+                bitmap.pixels[offset..offset + 2].copy_from_slice(&rgb565.to_le_bytes());
+            }
+        }
+    }
+    ctx.cpu.write_mem(bitmap_out, &handle.to_le_bytes())?;
+    log::debug!("DecompressImageIndirect decoded {width}x{height} -> 0x{handle:08x}");
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn get_cursor_pos(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {

@@ -45,7 +45,7 @@ fn zero_returning(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError
 
 /// `HRESULT CoCreateInstance` returns E_NOTIMPL for unsupported COM classes.
 fn e_notimpl(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    let ppv = ctx.arg_u32(6)?;
+    let ppv = ctx.arg_u32(4)?;
     if ppv != 0 {
         ctx.cpu.write_mem(ppv, &0u32.to_le_bytes())?;
     }
