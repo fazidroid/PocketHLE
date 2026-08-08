@@ -1348,6 +1348,8 @@ impl Heap {
 pub const GLES_CM_MODULE_HANDLE: u32 = 0x1000_0004;
 /// Fake `HMODULE` for `libGLES_CL.dll`, the Common-Lite profile.
 pub const GLES_CL_MODULE_HANDLE: u32 = 0x1000_0005;
+/// Fake `HMODULE` for the Hekkus Sound System compatibility layer.
+pub const HSS_MODULE_HANDLE: u32 = 0x1000_0006;
 
 /// The whole emulated process state owned by the kernel.
 fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>> {
@@ -1383,8 +1385,14 @@ fn build_dynamic_exports(thunks: &[Thunk]) -> HashMap<u32, HashMap<String, u32>>
             commctrl.insert(name.clone(), thunk.thunk_va);
             if let ImportBinding::Ordinal(ord) = &thunk.binding {
                 commctrl.insert(format!("#{}", ord), thunk.thunk_va);
-            } else if let Some(ord) = name.strip_prefix("ord:") {
-                commctrl.insert(format!("#{ord}"), thunk.thunk_va);
+            }
+        } else if thunk.dll.eq_ignore_ascii_case("hss.dll") {
+            let table = exports
+                .entry(HSS_MODULE_HANDLE)
+                .or_insert_with(HashMap::new);
+            table.insert(name.clone(), thunk.thunk_va);
+            if let ImportBinding::Ordinal(ord) = &thunk.binding {
+                table.insert(format!("#{ord}"), thunk.thunk_va);
             }
         } else if thunk.dll.eq_ignore_ascii_case("libgles_cm.dll")
             || thunk.dll.eq_ignore_ascii_case("libgles_cl.dll")
@@ -1616,6 +1624,7 @@ impl Process {
             "ddraw.dll",
             "libgles_cm.dll",
             "libgles_cl.dll",
+            "hss.dll",
         ] {
             dynamic_exports_to_add.extend(
                 dispatcher
@@ -2238,7 +2247,11 @@ pub fn run_main_loop_with_hook(
                         // Some other host-installed hook (e.g.
                         // `--watch` from the CLI). Dump CPU state
                         // and halt cleanly.
-                        log::warn!("watch hit at 0x{addr:08x}\n{regs}", regs = dump_regs(cpu),);
+                        log::warn!(
+                            "watch hit at 0x{addr:08x}\n{regs}{mem}",
+                            regs = dump_regs(cpu),
+                            mem = dump_mem_around(cpu, addr, 64),
+                        );
                         return Ok(());
                     }
                 };
