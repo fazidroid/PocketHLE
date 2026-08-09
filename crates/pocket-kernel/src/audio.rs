@@ -663,16 +663,26 @@ impl AudioEngine {
         let shared = Arc::clone(&self.shared);
         let shutdown = Arc::clone(&self.shutdown);
         shutdown.store(false, std::sync::atomic::Ordering::SeqCst);
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("pockethle-audio".to_string())
             .spawn(move || run_audio_worker(shared, shutdown))
-            .ok();
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                log::warn!("AudioEngine: could not spawn audio thread — running silently: {e}");
+                None
+            }
+        };
         self.worker = handle;
     }
 
     #[cfg(not(feature = "audio-cpal"))]
     fn start_impl(&mut self) {
-        log::info!("AudioEngine: built without audio-cpal feature, running silently");
+        // A build with the feature off can never make a sound, and the
+        // guest cannot tell — so this is a warning, not a note. It is
+        // the first thing to rule out when a packaged binary is silent
+        // but a local one is not.
+        log::warn!("AudioEngine: built without the audio-cpal feature — running silently");
     }
 
     /// Stop the host stream and clear any pending samples. The
@@ -791,14 +801,24 @@ fn run_audio_worker(shared: Arc<Mutex<Shared>>, shutdown: Arc<std::sync::atomic:
     let device = match host.default_output_device() {
         Some(d) => d,
         None => {
-            log::info!("AudioEngine: no default output device — running silently");
+            // Every early return in this function means the run is
+            // silent. That is a user-visible failure, not a detail, so
+            // these log at `warn`: the desktop GUI is built with
+            // `windows_subsystem = "windows"` and has no console, so an
+            // `info` line reaches nobody and "no sound" arrives with no
+            // explanation attached.
+            log::warn!("AudioEngine: no default output device — running silently");
             return;
         }
     };
+    let device_name = device.name().unwrap_or_else(|_| "<unnamed>".to_string());
     let config = match device.default_output_config() {
         Ok(c) => c,
         Err(e) => {
-            log::info!("AudioEngine: device.default_output_config() failed: {e}");
+            log::warn!(
+                "AudioEngine: default_output_config() failed on {device_name:?} \
+                 — running silently: {e}"
+            );
             return;
         }
     };
@@ -844,23 +864,31 @@ fn run_audio_worker(shared: Arc<Mutex<Shared>>, shutdown: Arc<std::sync::atomic:
             )
         }
         other => {
-            log::info!("AudioEngine: unsupported host sample format {other:?}");
+            log::warn!(
+                "AudioEngine: host device {device_name:?} wants sample format \
+                 {other:?}, which is not supported — running silently"
+            );
             return;
         }
     };
     let stream = match stream {
         Ok(s) => s,
         Err(e) => {
-            log::info!("AudioEngine: build_output_stream failed: {e}");
+            log::warn!(
+                "AudioEngine: build_output_stream failed on {device_name:?} \
+                 ({host_rate} Hz / {host_channels} ch / {sample_format:?}) \
+                 — running silently: {e}"
+            );
             return;
         }
     };
     if let Err(e) = stream.play() {
-        log::info!("AudioEngine: stream.play() failed: {e}");
+        log::warn!("AudioEngine: stream.play() failed on {device_name:?} — running silently: {e}");
         return;
     }
     log::info!(
-        "AudioEngine: opened {} Hz / {} ch ({:?})",
+        "AudioEngine: opened {:?} at {} Hz / {} ch ({:?})",
+        device_name,
         host_rate,
         host_channels,
         sample_format

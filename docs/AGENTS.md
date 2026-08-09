@@ -451,6 +451,31 @@ laid end to end — 499 seconds of WAV. This is the right tool for "did
 any PCM reach the engine", and the wrong tool for "what would a user
 hear".
 
+**A capture proves submission, not audibility.** The two questions come
+apart, and "the WAV looks fine but there is no sound" is the normal way
+an audio bug presents. The host side is `run_audio_worker`, and *every*
+one of its failure paths — no default device, `default_output_config`
+failing, an unsupported sample format, `build_output_stream` failing,
+`stream.play()` failing, the thread failing to spawn, or the
+`audio-cpal` feature being off — leaves the run silent while the guest
+carries on submitting samples and noticing nothing. They all log at
+`warn` for that reason: a silent run is a user-visible failure, not a
+detail. The one line that confirms real output is
+
+```
+AudioEngine: opened "<device>" at 44100 Hz / 2 ch (F32)
+```
+
+If that line is absent, the problem is the host device, not the decoder.
+
+**The desktop GUI has no console on Windows.** `main.rs` is built with
+`windows_subsystem = "windows"` so launching it does not flash up a
+terminal, which also means stderr goes nowhere and log output reaches
+nobody. It therefore tees `log` to `<library root>/pockethle-gui.log`,
+truncated per launch. When diagnosing "no sound in the GUI but the CLI
+is fine", read that file first — and prefer reproducing through the CLI,
+which has a console and takes the same code path.
+
 ## 12. Working on this repo
 
 ```bash
