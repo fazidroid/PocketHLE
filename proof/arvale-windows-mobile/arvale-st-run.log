@@ -16,3 +16,8 @@ Registered API stubs: 2586
 [2026-08-09T14:05:43Z INFO  pocket_winceapi::gx] GXOpenDisplay() -> 1 (FB at 0x78000000, 240×320×16bpp, pc=0x700232e0, lr=0x000245ac)
 Final framebuffer snapshot written to /tmp/pockethle-final.ppm (230415 bytes, frame_counter=18)
 Emulator exited cleanly.
+
+Corrective verification (2026-08-09):
+ExtEscape escape=0x00020001 out_count=24 ... fb_mapped=true
+Final framebuffer snapshot ... frame_counter=18
+Emulator exited cleanly.
