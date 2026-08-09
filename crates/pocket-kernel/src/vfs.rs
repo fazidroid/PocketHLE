@@ -231,6 +231,27 @@ impl Vfs {
         Some(p)
     }
 
+    fn find_basename_recursive(root: &Path, wanted: &str) -> Option<PathBuf> {
+        let mut pending = vec![(root.to_path_buf(), 0usize)];
+        while let Some((dir, depth)) = pending.pop() {
+            let entries = std::fs::read_dir(&dir).ok()?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                if name.to_string_lossy().eq_ignore_ascii_case(wanted) {
+                    if path.is_file() {
+                        return Some(path);
+                    }
+                    continue;
+                }
+                if depth < 16 && path.is_dir() {
+                    pending.push((path, depth + 1));
+                }
+            }
+        }
+        None
+    }
+
     /// Translate a guest path to a host path. Existing files fall back
     /// through broader mounts, allowing a writable save overlay to sit
     /// above a read-only extracted game directory.
@@ -238,6 +259,9 @@ impl Vfs {
         let normalised = self.normalise_guest_path(guest_path);
         let mounts = self.matching_mounts(&normalised);
         let mut fallback = None;
+        let basename = Path::new(&normalised)
+            .file_name()
+            .map(|name| name.to_string_lossy());
         for mount in mounts {
             let path = self.host_path_for_mount(mount, &normalised)?;
             if fallback.is_none() {
@@ -245,6 +269,15 @@ impl Vfs {
             }
             if path.exists() {
                 return Some(path);
+            }
+            let root = mount.prefix.trim_end_matches('/');
+            if normalised != root {
+                if let Some(name) = basename.as_deref() {
+                    if let Some(found) = Self::find_basename_recursive(&mount.host_dir, name) {
+                        log::debug!("vfs.resolve: basename fallback {normalised:?} -> {found:?}");
+                        return Some(found);
+                    }
+                }
             }
         }
         fallback

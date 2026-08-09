@@ -9636,11 +9636,56 @@ fn blit_text_at(
     Ok(())
 }
 
-fn ext_escape(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // ExtEscape is used to query device-specific capabilities
-    // (rotation hints, GAPI fast paths). Reporting "unsupported" (0)
-    // makes the game fall back to the default GDI path.
-    Ok(DispatchOutcome::ReturnedR0(0))
+fn ext_escape(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    const GETGXINFO: u32 = 0x0002_0000;
+    const GETRAWFRAMEBUFFER: u32 = 0x0002_0001;
+    const KF_DIRECT565: u32 = 0x0000_0080;
+    let escape = ctx.arg_u32(1)?;
+    let out_count = ctx.arg_u32(4)?;
+    let out_data = ctx.arg_u32(5)?;
+    if out_data == 0 || out_count == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if matches!(escape, GETRAWFRAMEBUFFER | GETGXINFO) && !ctx.kernel.fb_mapped {
+        let bytes = (ctx.kernel.framebuffer.byte_size() + 0xfff) & !0xfff;
+        ctx.cpu
+            .map_region(SYNTHETIC_FRAMEBUFFER_BASE, bytes, Prot::READ | Prot::WRITE)?;
+        ctx.cpu
+            .write_mem(SYNTHETIC_FRAMEBUFFER_BASE, &ctx.kernel.framebuffer.pixels)?;
+        ctx.kernel.gx_last_pushed_counter = ctx.kernel.framebuffer.frame_counter;
+        ctx.kernel.fb_mapped = true;
+    }
+    log::debug!(
+        "ExtEscape escape=0x{escape:08x} out_count={out_count} out_data=0x{out_data:08x} fb_mapped={}",
+        ctx.kernel.fb_mapped
+    );
+    match escape {
+        GETRAWFRAMEBUFFER if out_count >= 24 => {
+            let mut raw = [0u8; 24];
+            raw[0..2].copy_from_slice(&1u16.to_le_bytes());
+            raw[2..4].copy_from_slice(&(ctx.kernel.framebuffer.bpp as u16).to_le_bytes());
+            raw[4..8].copy_from_slice(&pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE.to_le_bytes());
+            raw[8..12].copy_from_slice(&(ctx.kernel.framebuffer.bpp / 8).to_le_bytes());
+            raw[12..16].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
+            raw[16..20].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
+            raw[20..24].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
+            ctx.cpu.write_mem(out_data, &raw)?;
+            Ok(DispatchOutcome::ReturnedR0(24))
+        }
+        GETGXINFO if out_count >= 0x84 => {
+            let mut info = [0u8; 0x84];
+            info[0..4].copy_from_slice(&100u32.to_le_bytes());
+            info[4..8].copy_from_slice(&pocket_kernel::SYNTHETIC_FRAMEBUFFER_BASE.to_le_bytes());
+            info[8..12].copy_from_slice(&ctx.kernel.framebuffer.stride_bytes().to_le_bytes());
+            info[12..16].copy_from_slice(&ctx.kernel.framebuffer.width.to_le_bytes());
+            info[16..20].copy_from_slice(&ctx.kernel.framebuffer.height.to_le_bytes());
+            info[20..24].copy_from_slice(&ctx.kernel.framebuffer.bpp.to_le_bytes());
+            info[24..28].copy_from_slice(&KF_DIRECT565.to_le_bytes());
+            ctx.cpu.write_mem(out_data, &info)?;
+            Ok(DispatchOutcome::ReturnedR0(0x84))
+        }
+        _ => Ok(DispatchOutcome::ReturnedR0(0)),
+    }
 }
 
 /// `BOOL EnumDisplaySettings(LPCTSTR device, DWORD iModeNum, DEVMODE *dm)`
