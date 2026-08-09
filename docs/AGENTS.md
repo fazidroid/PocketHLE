@@ -48,13 +48,22 @@ refactor.
 6. **`WaitForSingleObject` must respect real event state.** Answering
    every wait with `WAIT_OBJECT_0` makes worker threads exit on their
    first iteration; Asphalt 2 3D opens its wave device and then never
-   writes a single buffer.
+   writes a single buffer. An `INFINITE` wait from a *worker* is also a
+   scheduling point: it re-parks the thread at its own thunk so the call
+   re-runs with its arguments intact — see §10.
 7. **Worker threads never receive the window queue's synthetic traffic.**
    A worker running its own pump would dispatch forever and the thread
    that actually renders would never get the CPU back
    (`crates/pocket-winceapi/src/coredll.rs:6686` and `:6743`).
 8. **`arch_all` is deliberately disabled on `unicorn-engine`.** Enabling
    it breaks the Android NDK cross-compile on QEMU's x86 `cpuid.h`.
+9. **`CreateThread` returns to its creator; it never enters the new
+   thread.** Every thread parks at its entry point, `CREATE_SUSPENDED` or
+   not — see §10.
+10. **`frame_counter` moves only when pixels change.** It is the host's
+    "a new frame is ready" signal, and every frontend's frame budget is
+    spent off it. `InvalidateRect` bumping it cost Toy Golf its entire
+    `--max-frames` budget on identical black startup frames — see §6.
 
 ## 2. Crate graph
 
@@ -212,7 +221,7 @@ One module per emulated DLL in `crates/pocket-winceapi/src/`: `aygshell`,
 `commctrl`, `coredll`, `ddraw`, `dlgtemplate`, `game_dlls`, `gles`, `gx`,
 `hss`, `ole32`, plus `ordinals` and `lib`. Host-side subsystems live in
 `crates/pocket-kernel/src/`: `audio`, `controls`, `font`, `framebuffer`,
-`gapi`, `gdi`, `msgbox`, `native_thunks`, `registry`, `vfs`.
+`gapi`, `gdi`, `msgbox`, `native_thunks`, `registry`, `tracker`, `vfs`.
 
 ## 6. Presentation — two paths
 
@@ -237,9 +246,21 @@ correct. The fix is guarded by `ctx.kernel.fb_mapped` in
 `crates/pocket-winceapi/src/gles.rs` and pinned by
 `swap_buffers_pushes_pixels_into_a_mapped_gapi_framebuffer`.
 
-`frame_counter` is the liveness diagnostic. `frame_counter=0` after a run
-that reported no errors means the guest executed fine and nothing reached
-a presentation point — look at the two paths above, not at the CPU.
+`frame_counter` is the liveness diagnostic *and* the host's "new pixels
+are ready" signal — the CLI's frame-dump hook and `--max-frames` both
+fire off it. `frame_counter=0` after a run that reported no errors means
+the guest executed fine and nothing reached a presentation point — look
+at the two paths above, not at the CPU.
+
+The inverse failure is subtler and cost a day on Toy Golf: a handler that
+bumps the counter *without* changing pixels spends the frame budget on
+duplicates. `InvalidateRect` did exactly that, 99,490 times from Toy
+Golf's idle loop, so every captured frame was the same black startup
+image and the run ended before the game drew a thing — with 153,600
+non-zero pixels sitting in the framebuffer the whole time. Only
+`eglSwapBuffers` and `sync_guest_framebuffer` may move the counter.
+`--dump-frame-stride` thins the captures of a GDI title that legitimately
+blits far more often than it changes anything interesting.
 
 Two rasterizer details that look like bugs and are not: an incomplete
 texture samples as opaque white (matching GL ES), and the software GL
@@ -317,7 +338,120 @@ via `JumpTo(ctx.thunk.thunk_va)`, capped at `MESSAGE_BOX_MAX_SPINS`
 records in a trace are that mechanism working, not a spin — they are what
 lets the host present frames while the box is up.
 
-## 10. Working on this repo
+## 10. Threads and the cooperative scheduler
+
+One guest thread runs at a time. There is no host thread per guest
+thread; the scheduler is cooperative and the only scheduling points are
+`Sleep`, `WaitForSingleObject`, `WaitForMultipleObjects`, `GetMessageW`
+and `PeekMessageW`. A guest that spins without calling one of those
+starves every other thread by construction.
+
+**`CreateThread` parks the new thread and returns the handle to its
+creator** (invariant 9). It does not enter the thread, `CREATE_SUSPENDED`
+or not — that flag only decides whether `started` is set, i.e. whether
+the scheduler may pick the thread up yet. Entering immediately is the
+obvious-looking implementation and it breaks Toy Golf: its audio thread
+dereferences the mixer at `[r5,#0x38]` that its creator has not stored
+yet, faulting on a NULL read at `0x00000038`.
+
+Two park helpers, both in `coredll.rs`:
+
+| Helper | Use |
+| --- | --- |
+| `park_worker_at(.., return_r0)` | The call is finished. Resume past it, optionally with a return value in `r0`. |
+| `park_worker_and_reevaluate` | The call is *blocked*. Re-park at `ctx.thunk.thunk_va` so it re-runs later with its arguments untouched. |
+
+The distinction is not cosmetic. An `INFINITE` `WaitForSingleObject` that
+resumes through `park_worker_at` finds `r0` overwritten with a return
+value and waits on that instead of its handle. When the *main* thread
+issues an infinite wait, nothing can signal the object from there, so the
+permissive `WAIT_OBJECT_0` stays — honouring it would deadlock.
+
+`retire_wave_buffer` must deliver **every** `WaveCallbackKind`, including
+`Event`, which signals the event rather than calling anything. That event
+is typically a mixer thread's only back-pressure: leave it clear and the
+wait falls through, the thread refills as fast as the CPU allows, never
+yields, and the renderer never runs again. Toy Golf hung this way with
+1,036,104 `waveOutWrite` calls and exactly one thread switch.
+
+Worker threads never see the window queue's synthetic traffic
+(invariant 7) — a worker running its own pump would dispatch forever.
+
+## 11. Audio — two transports
+
+`AudioEngine` (`crates/pocket-kernel/src/audio.rs`) is fed by two
+independent paths that mix together. Which one a game uses decides where
+a silence bug lives.
+
+**`waveOut` (`coredll`).** The guest decodes audio itself and hands over
+finished PCM. `waveOutWrite` → `push_samples`. This is a *stream*: the
+guest owns timing and back-pressure, so `CALLBACK_EVENT` must really
+signal or the mixer thread spins (§10).
+
+**HSS (`hss.dll`).** Hekkus Sound System is a freeware C++ mixer bundled
+with a great many Pocket PC games. The guest hands over a *filename* and
+expects the library to decode it, so `crates/pocket-winceapi/src/hss.rs`
+owns a decoder for both formats HSS accepts: PCM `.wav` for effects and
+Protracker modules for music. Games commonly rename modules to `.tkm`, so
+`decode_clip` tries both decoders against the *content* — the extension
+is not load-bearing on a device and it isn't here either.
+
+HSS is C++ methods, so every handler takes `this` in `r0`. The guest-side
+object is opaque: whatever the real `hss.dll` would have written there, we
+never write. All state is host-side in `HssState`, keyed by that pointer.
+
+Two mangled-name traps, both of which cost a whole debugging session on
+JumpyBall:
+
+* `load` is overloaded. `?load@hssSound@@QAAHPBG@Z` takes
+  `const wchar_t*`; `?load@hssSound@@QAAHPAX_N@Z` takes `void*, bool`.
+  Registering one is not registering the other.
+* The volumes are setter/getter *pairs* that differ only in the mangled
+  signature — `?volumeSounds@hssSpeaker@@QAAXI@Z` sets,
+  `?volumeSounds@hssSpeaker@@QAAIXZ` gets. JumpyBall calls both halves
+  and reads back what it wrote.
+
+A stub that returns success for a name the game does import is worse than
+no stub: the game proceeds as though it has audio and there is no warning
+in the trace to find.
+
+**The Protracker renderer** is `crates/pocket-kernel/src/tracker.rs` —
+`Module::parse` then `Module::render(rate, max_seconds)`, no
+guest-memory awareness, so it is testable on its own. Two things it must
+get right that are easy to get wrong:
+
+* The sample number is split across two nibbles — high in cell byte 0,
+  low in the *high* nibble of byte 2. Getting this wrong selects an empty
+  slot and renders silence.
+* Source samples carry a large DC offset (means of +65 to +99 out of
+  ±128 in JumpyBall's tracks). An Amiga's AC-coupled output discarded it;
+  a modern DAC will not. The DC blocker on the mix bus is why music does
+  not arrive as a thump — don't remove it.
+
+Modules render once at load, not on the audio callback: measured at
+0.04–0.05 s per 30 s of audio in release. `MODULE_SECONDS` is
+deliberately generous so the renderer stops on the *order table* rather
+than the clock — a song cut short puts the loop seam mid-phrase, which is
+far more audible than the memory costs. Decodes are cached by path
+behind an `Arc`, because a game re-loads the same track into a fresh
+object on every level change.
+
+**Voice groups.** `play_voice_with` takes `VoiceParams { looped, group,
+volume }`. The groups exist so `stopMusics` can silence music without
+cutting the sound effects that are still playing — JumpyBall calls it on
+every level change. Voice mixing is `#[cfg(feature = "audio-cpal")]`;
+without that feature `play_voice` degrades to `push_samples`.
+
+**`--dump-audio-to` records at submission time**, inside
+`add_voice`/`push_samples` — not as a real-time mixdown. A capture WAV
+therefore shows what the guest *submitted*, in submission order, and its
+header takes the format of the first clip seen. A game that starts four
+tracks over an 8-frame run yields a capture of four full-length tracks
+laid end to end — 499 seconds of WAV. This is the right tool for "did
+any PCM reach the engine", and the wrong tool for "what would a user
+hear".
+
+## 12. Working on this repo
 
 ```bash
 cargo build --release -p pocket-cli --features unicorn   # → target/release/pockethle
@@ -346,8 +480,13 @@ below it:
    missing ordinal-table entry if the names show as `ord NNN` (§5).
 3. `frame_counter=0` with no errors? A presentation problem, not a CPU
    one (§6).
-4. Does the game map both GAPI and GL? Check the `eglSwapBuffers` push.
-5. Only then read guest disassembly.
+4. `frame_counter` huge but every captured frame identical? Something is
+   bumping the counter without drawing. Raise `--dump-frame-stride` to
+   confirm, then find the handler (§6).
+5. Hangs with one thread doing all the work? A missing wake-up, not a
+   slow CPU. Count "scheduling worker" lines in the trace (§10).
+6. Does the game map both GAPI and GL? Check the `eglSwapBuffers` push.
+7. Only then read guest disassembly.
 
 Conventions:
 

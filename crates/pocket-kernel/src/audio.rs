@@ -70,6 +70,33 @@ struct AudioVoice {
     position_q16: u64,
     looped: bool,
     volume: f32,
+    group: u32,
+}
+
+/// How a voice submitted through [`AudioEngine::play_voice_with`]
+/// should behave.
+///
+/// `group` exists so a caller can silence one class of sound without
+/// touching the rest: `hss.dll`'s `stopMusics` must stop the music
+/// without cutting off the sound effects that are still playing.
+#[derive(Debug, Clone, Copy)]
+pub struct VoiceParams {
+    pub looped: bool,
+    /// Tag for [`AudioEngine::stop_voice_group`]. Voices submitted
+    /// through [`AudioEngine::play_voice`] land in group 0.
+    pub group: u32,
+    /// Linear gain. 1.0 plays the samples as submitted.
+    pub volume: f32,
+}
+
+impl Default for VoiceParams {
+    fn default() -> Self {
+        Self {
+            looped: false,
+            group: 0,
+            volume: 1.0,
+        }
+    }
 }
 
 /// Inner state shared between the emulator thread (which calls
@@ -229,7 +256,12 @@ impl Shared {
     }
 
     #[cfg(feature = "audio-cpal")]
-    fn add_voice(&mut self, samples: Vec<i16>, format: GuestFormat, looped: bool) {
+    fn stop_voice_group(&mut self, group: u32) {
+        self.voices.retain(|v| v.group != group);
+    }
+
+    #[cfg(feature = "audio-cpal")]
+    fn add_voice(&mut self, samples: Vec<i16>, format: GuestFormat, params: VoiceParams) {
         if samples.is_empty() {
             return;
         }
@@ -240,8 +272,9 @@ impl Shared {
             samples,
             format,
             position_q16: 0,
-            looped,
-            volume: 1.0,
+            looped: params.looped,
+            volume: params.volume,
+            group: params.group,
         });
     }
 
@@ -475,10 +508,28 @@ impl AudioEngine {
     }
 
     pub fn play_voice(&self, samples: &[i16], format: GuestFormat, looped: bool) -> usize {
+        self.play_voice_with(
+            samples,
+            format,
+            VoiceParams {
+                looped,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Submit a voice with an explicit group and gain — see
+    /// [`VoiceParams`].
+    pub fn play_voice_with(
+        &self,
+        samples: &[i16],
+        format: GuestFormat,
+        params: VoiceParams,
+    ) -> usize {
         #[cfg(feature = "audio-cpal")]
         {
             if let Ok(mut s) = self.shared.lock() {
-                s.add_voice(samples.to_vec(), format, looped);
+                s.add_voice(samples.to_vec(), format, params);
                 samples.len()
             } else {
                 0
@@ -486,7 +537,7 @@ impl AudioEngine {
         }
         #[cfg(not(feature = "audio-cpal"))]
         {
-            let _ = (format, looped);
+            let _ = (format, params);
             self.push_samples(samples)
         }
     }
@@ -496,6 +547,18 @@ impl AudioEngine {
         if let Ok(mut s) = self.shared.lock() {
             s.stop_voices();
         }
+    }
+
+    /// Stop only the voices tagged with `group`, leaving every other
+    /// voice playing. Without the `audio-cpal` feature there are no
+    /// voices to stop and this does nothing.
+    pub fn stop_voice_group(&self, group: u32) {
+        #[cfg(feature = "audio-cpal")]
+        if let Ok(mut s) = self.shared.lock() {
+            s.stop_voice_group(group);
+        }
+        #[cfg(not(feature = "audio-cpal"))]
+        let _ = group;
     }
 
     /// Convenience for unsigned 8-bit PCM (the format `PlaySound` and

@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use byteorder::{ByteOrder, LittleEndian};
 use indexmap::IndexMap;
@@ -39,9 +40,10 @@ pub mod gdi;
 pub mod msgbox;
 pub mod native_thunks;
 pub mod registry;
+pub mod tracker;
 pub mod vfs;
 
-pub use audio::{AudioEngine, AudioTap, GuestFormat};
+pub use audio::{AudioEngine, AudioTap, GuestFormat, VoiceParams};
 pub use framebuffer::{Framebuffer, FB_BYTES, FB_HEIGHT, FB_WIDTH};
 pub use gdi::{GdiState, Surface};
 
@@ -304,6 +306,77 @@ pub struct WaveOutState {
     /// callback returns.
     pub function_frame: Option<GuestCallFrame>,
 }
+
+/// One `hssSound` or `hssMusic` object the guest constructed.
+///
+/// HSS is a C++ library: the game news up an object, calls `load` with
+/// a filename, and then hands the object's `this` pointer to
+/// `hssSpeaker::playSound` / `playMusic`. We keep the decoded PCM here,
+/// keyed by that same `this` pointer, because the guest-side object is
+/// opaque to us — it is whatever the real `hss.dll` would have put
+/// there, and we never run the real one.
+#[derive(Debug, Default, Clone)]
+pub struct HssClip {
+    /// Decoded interleaved PCM, ready for [`AudioEngine::play_voice_with`].
+    ///
+    /// Shared rather than owned: a game re-loads the same track into a
+    /// fresh object on every level change, and a rendered module runs
+    /// to tens of megabytes. The `Arc` lets those loads — and each
+    /// `play`, which needs the samples while `kernel` is borrowed —
+    /// alias one decode instead of copying it.
+    pub samples: Arc<Vec<i16>>,
+    pub format: GuestFormat,
+    /// Set by `hssSound::loop` / `hssMusic::loop`.
+    pub looped: bool,
+    /// Per-object volume, 0..=64 in HSS's own scale.
+    pub volume: u32,
+    /// Guest path the clip came from, for logging.
+    pub path: String,
+}
+
+/// Everything we track for `hss.dll`.
+#[derive(Debug)]
+pub struct HssState {
+    /// Loaded clips, keyed by the `this` pointer of the `hssSound` /
+    /// `hssMusic` object that owns them.
+    pub clips: HashMap<u32, HssClip>,
+    /// Decoded PCM keyed by guest path, so loading a file a second time
+    /// reuses the first decode. Rendering a Protracker module is the
+    /// expensive half of `load` — JumpyBall re-loads `mainmenu.tkm`
+    /// three times before the first level even starts — and the result
+    /// is a pure function of the file, so it is safe to keep.
+    pub decoded: HashMap<String, (GuestFormat, Arc<Vec<i16>>)>,
+    /// Mixer output rate from `hssSpeaker::open`. HSS resamples every
+    /// clip to this, and so do we — the guest picked it, so it is what
+    /// the game expects to hear.
+    pub format: GuestFormat,
+    /// Master volumes from `volumeSounds` / `volumeMusics`, 0..=64.
+    /// The getters the guest also imports have to return what it set.
+    pub sound_volume: u32,
+    pub music_volume: u32,
+    /// `true` once `hssSpeaker::open` has run.
+    pub opened: bool,
+}
+
+impl Default for HssState {
+    fn default() -> Self {
+        Self {
+            clips: HashMap::new(),
+            decoded: HashMap::new(),
+            format: GuestFormat::default(),
+            // HSS's own default, and what JumpyBall sets anyway.
+            sound_volume: 64,
+            music_volume: 64,
+            opened: false,
+        }
+    }
+}
+
+/// Voice group for `hssSpeaker::playSound`, so `stopSounds` can silence
+/// effects without touching the music.
+pub const HSS_SOUND_GROUP: u32 = 1;
+/// Voice group for `hssSpeaker::playMusic`.
+pub const HSS_MUSIC_GROUP: u32 = 2;
 
 /// A modal dialog put up by `DialogBoxIndirectParamW` / `DialogBoxParamW`.
 ///
@@ -914,6 +987,10 @@ pub struct KernelState {
     pub wave_out_format: GuestFormat,
     /// Buffer-done bookkeeping for the emulated `waveOut` device.
     pub wave_out: WaveOutState,
+    /// Clips and mixer settings for `hss.dll`. Independent of
+    /// [`Self::wave_out`]: HSS games talk to the library's C++ classes
+    /// and never touch `waveOut` themselves.
+    pub hss: HssState,
     /// Messages posted with `PostMessageW` (and the `MM_WOM_DONE`
     /// notifications we synthesise for `waveOut`), waiting to be
     /// handed to the guest by `GetMessageW` / `PeekMessageW`.
@@ -1866,6 +1943,7 @@ impl Process {
                 audio: AudioEngine::new(),
                 wave_out_format: GuestFormat::default(),
                 wave_out: Default::default(),
+                hss: Default::default(),
                 posted_messages: Default::default(),
                 msg_queues: HashMap::new(),
                 next_msg_queue_handle: 0xDEAD_E500,

@@ -680,6 +680,24 @@ pub fn register(d: &mut WinCeDispatcher) {
 
     // ---- Misc kernel/IPC stubs ----
     d.register_constant(dll, "KernelIoControl", 0, zero_returning);
+    // `SystemIdleTimerReset` tells the power manager the user is still
+    // there so the backlight and suspend timers restart. There is no
+    // idle timer to reset here, and the documented return is the number
+    // of milliseconds until the next timeout, which nothing checks.
+    //
+    // It has to be a constant rather than an unimplemented stub because
+    // games call it from the render loop to keep the screen alive: Toy
+    // Golf issues it once per frame, 79 240 times in a 60-frame run,
+    // and every one of those was a host round-trip plus a logged
+    // "unimplemented call" warning.
+    d.register_constant(dll, "SystemIdleTimerReset", 0, zero_returning);
+    // The IME is a text-entry service. No emulated guest has an input
+    // method open, so the correct answer to "give me the input context
+    // for this window" is NULL, and positioning a composition window
+    // that does not exist is a no-op. Toy Golf asks once at startup.
+    d.register_constant(dll, "ImmGetContext", 0, zero_returning);
+    d.register_constant(dll, "ImmReleaseContext", 1, one_returning);
+    d.register_constant(dll, "ImmSetCompositionWindow", 1, one_returning);
     d.register_constant(dll, "SystemParametersInfoW", 1, one_returning);
     d.register_constant(dll, "GetSystemPowerStatusEx", 1, one_returning);
     d.register_constant(dll, "EventModify", 1, one_returning);
@@ -1591,7 +1609,22 @@ fn current_thread_id(ctx: &CallCtx<'_>) -> u32 {
 /// yields again.
 fn park_worker_and_retry(ctx: &mut CallCtx<'_>) -> Result<Option<DispatchOutcome>, KernelError> {
     let thunk_va = ctx.thunk.thunk_va;
-    park_worker_at(ctx, 0, Some(thunk_va))
+    park_worker_at(ctx, Some(0), Some(thunk_va))
+}
+
+/// Park the running worker and re-run the call it is blocked in with
+/// its **arguments intact**.
+///
+/// [`park_worker_and_retry`] rewrites `r0` on the way out, which is
+/// harmless when the retried call re-reads its state from elsewhere but
+/// destroys the first argument of a call that has one. A blocking
+/// `WaitForSingleObject(handle, INFINITE)` has to see the same handle
+/// when it runs again, otherwise it wakes up waiting on handle 0.
+fn park_worker_and_reevaluate(
+    ctx: &mut CallCtx<'_>,
+) -> Result<Option<DispatchOutcome>, KernelError> {
+    let thunk_va = ctx.thunk.thunk_va;
+    park_worker_at(ctx, None, Some(thunk_va))
 }
 
 /// Park the worker thread that is currently running and give the CPU
@@ -1605,17 +1638,20 @@ fn park_worker(
     ctx: &mut CallCtx<'_>,
     return_r0: u32,
 ) -> Result<Option<DispatchOutcome>, KernelError> {
-    park_worker_at(ctx, return_r0, None)
+    park_worker_at(ctx, Some(return_r0), None)
 }
 
-/// Shared body of [`park_worker`] / [`park_worker_and_retry`].
+/// Shared body of [`park_worker`] / [`park_worker_and_retry`] /
+/// [`park_worker_and_reevaluate`].
 ///
 /// `resume_at` is where the worker continues when it is scheduled
 /// again: `None` means "after the call" (the normal case), `Some(va)`
 /// re-enters the API thunk so the blocking call runs again.
+/// `return_r0` of `None` leaves `r0` alone, which only makes sense
+/// together with a re-entering `resume_at`.
 fn park_worker_at(
     ctx: &mut CallCtx<'_>,
-    return_r0: u32,
+    return_r0: Option<u32>,
     resume_at: Option<u32>,
 ) -> Result<Option<DispatchOutcome>, KernelError> {
     let Some(thread_index) = ctx.kernel.current_thread.checked_sub(1) else {
@@ -1626,7 +1662,9 @@ fn park_worker_at(
         Some(va) => va,
         None => ctx.cpu.read_reg(ArmReg::Lr)?,
     };
-    regs[0] = return_r0;
+    if let Some(value) = return_r0 {
+        regs[0] = value;
+    }
     let main_regs = ctx
         .kernel
         .threads
@@ -4711,6 +4749,7 @@ fn crt_fread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         ctx.cpu.write_mem(buf, &tmp[..n])?;
     }
     let elements = (n as u32).checked_div(size).unwrap_or(0);
+    log::trace!("fread(0x{h:08x}, {size}x{count}) -> {elements} ({n} bytes)");
     Ok(DispatchOutcome::ReturnedR0(elements))
 }
 
@@ -4741,6 +4780,7 @@ fn crt_fseek(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         _ => SeekKind::Begin,
     };
     let r = ctx.kernel.vfs.seek(h, off, kind);
+    log::trace!("fseek(0x{h:08x}, {off}, {whence}) -> {r:?}");
     Ok(DispatchOutcome::ReturnedR0(if r.is_some() {
         0
     } else {
@@ -8462,13 +8502,48 @@ fn read_guest_file(ctx: &mut CallCtx<'_>, path: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Read a guest file by path. Shared with `hss.dll`, which loads its
+/// clips the same way `PlaySound` does.
+pub(crate) fn read_guest_file_for(ctx: &mut CallCtx<'_>, path: &str) -> Option<Vec<u8>> {
+    read_guest_file(ctx, path)
+}
+
+/// Read a NUL-terminated UTF-16 guest string as a `String`.
+pub(crate) fn read_guest_wstr_lossy(
+    ctx: &mut CallCtx<'_>,
+    p: u32,
+    max: u32,
+) -> Result<String, KernelError> {
+    Ok(String::from_utf16_lossy(&read_wstr(ctx, p, max)?))
+}
+
+/// Decode a PCM `.wav` into interleaved `i16` samples.
+///
+/// Split out of [`submit_wave_bytes`] so `hss.dll` can reuse it: both
+/// paths accept exactly the formats [`parse_pcm_wave`] admits, and a
+/// second decoder would be a second set of rounding bugs.
+pub(crate) fn decode_pcm_wave(
+    bytes: &[u8],
+) -> Option<(pocket_kernel::audio::GuestFormat, Vec<i16>)> {
+    let (fmt, data) = parse_pcm_wave(bytes)?;
+    let samples: Vec<i16> = match fmt.bits_per_sample {
+        8 => data.iter().map(|&b| (b as i16 - 128) * 256).collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect(),
+        _ => return None,
+    };
+    Some((fmt, samples))
+}
+
 fn submit_wave_bytes(
     ctx: &mut CallCtx<'_>,
     bytes: &[u8],
     flags: u32,
     source: &str,
 ) -> Result<bool, KernelError> {
-    let Some((fmt, data)) = parse_pcm_wave(bytes) else {
+    let Some((fmt, samples)) = decode_pcm_wave(bytes) else {
         log::debug!(
             "PlaySoundW {source}: unsupported/non-PCM WAV ({} bytes)",
             bytes.len()
@@ -8480,14 +8555,6 @@ fn submit_wave_bytes(
     if flags & 0x0040 != 0 {
         ctx.kernel.audio.flush();
     }
-    let samples: Vec<i16> = match fmt.bits_per_sample {
-        8 => data.iter().map(|&b| (b as i16 - 128) * 256).collect(),
-        16 => data
-            .chunks_exact(2)
-            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect(),
-        _ => return Ok(false),
-    };
     ctx.kernel
         .audio
         .play_voice(&samples, fmt, flags & 0x0008 != 0);
@@ -8566,10 +8633,27 @@ fn get_version(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(0x0439_1404))
 }
 
-fn invalidate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    // We don't model dirty rects yet, but bumping the framebuffer
-    // dirty counter means hosts (PPM dump, minifb display) re-upload.
-    ctx.kernel.framebuffer.mark_dirty();
+/// `BOOL InvalidateRect(HWND, const RECT*, BOOL bErase)`.
+///
+/// Marking a region invalid asks for a *future* `WM_PAINT`; it changes
+/// no pixels by itself. `frame_counter` is what the hosts use to decide
+/// a new frame is ready to present, so bumping it here fabricates
+/// frames out of a request to draw one.
+///
+/// Toy Golf makes that visible: it invalidates from its idle loop and
+/// calls this ~100 000 times over a couple of million slices, so the
+/// counter advanced on nearly every slice boundary. The CLI's dump hook
+/// spent its whole `--max-frames` budget on identical black frames
+/// captured before the game had drawn anything, and the run stopped
+/// with twelve black PPMs while the framebuffer went on to receive a
+/// fully rendered 320x240 image.
+///
+/// The pixels that do change all arrive through drawing calls that mark
+/// the framebuffer dirty themselves — `BitBlt`, `PatBlt`, the GDI
+/// primitives in `pocket_kernel::gdi`, and `sync_direct_framebuffer_write`
+/// for guests that write the mapping directly — so nothing needs this
+/// one to notice a repaint.
+fn invalidate_rect(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
@@ -9149,10 +9233,24 @@ fn wait_for_single_object(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kern
         return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
     }
 
-    // A live thread handle or an unsignalled event. An infinite wait
-    // cannot be honoured without deadlocking a single-threaded HLE, so
-    // report it as satisfied; a finite wait can honestly time out.
+    // A live thread handle or an unsignalled event.
+    //
+    // For a worker, yield: this HLE runs one guest thread at a time, so
+    // whoever would signal the object needs the CPU before the wait can
+    // possibly be satisfied. An infinite wait re-runs the call when the
+    // worker is scheduled again rather than returning a value --
+    // `WAIT_TIMEOUT` is a lie for `INFINITE`, and `WAIT_OBJECT_0` is the
+    // lie that kept Toy Golf's mixer thread spinning: it waits forever
+    // on the buffer-done event and, told the wait succeeded, refilled
+    // buffers without ever yielding, so the main thread drew two frames
+    // and then starved.
     if timeout == INFINITE {
+        if let Some(outcome) = park_worker_and_reevaluate(ctx)? {
+            return Ok(outcome);
+        }
+        // The main thread is the one waiting, and nothing else can make
+        // the object signalled from here. Honouring the wait would
+        // deadlock the process, so keep the permissive answer.
         return Ok(DispatchOutcome::ReturnedR0(WAIT_OBJECT_0));
     }
     if let Some(outcome) = park_worker(ctx, WAIT_TIMEOUT)? {
@@ -9243,32 +9341,37 @@ fn create_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
         "CreateThread entry=0x{entry:08x} parameter=0x{parameter:08x} stack={} suspended={suspended} -> handle=0x{handle:08x} id={thread_id}",
         stack_size,
     );
-    if suspended {
-        // `CREATE_SUSPENDED` is not a detail we can skip. A game that
-        // asks for it finishes wiring the thread's state up *after*
-        // `CreateThread` returns -- Asphalt 2's mixer thread waits on an
-        // event that `CreateEvent` has not produced yet -- so running
-        // the entry point straight away makes it read uninitialised
-        // fields and bail out. Park it at its entry point instead and
-        // let `ResumeThread` release it.
-        let mut worker_regs = [0u32; 17];
-        worker_regs[0] = parameter;
-        worker_regs[13] = stack_top - 16;
-        worker_regs[14] = exit_va;
-        worker_regs[15] = entry;
-        worker_regs[16] = ctx.cpu.read_reg(ArmReg::Cpsr)?;
-        thread.worker_regs = worker_regs;
-        thread.worker_saved = true;
-        ctx.kernel.threads.push(thread);
-        return Ok(DispatchOutcome::ReturnedR0(handle));
-    }
-    thread.started = true;
+    // Park every new thread at its entry point and let the creator run
+    // on, whether or not `CREATE_SUSPENDED` was asked for.
+    //
+    // `CREATE_SUSPENDED` is not a detail we can skip -- a game that asks
+    // for it finishes wiring the thread's state up *after* `CreateThread`
+    // returns (Asphalt 2's mixer thread waits on an event that
+    // `CreateEvent` has not produced yet) -- but the same is true without
+    // the flag. On the device `CreateThread` returns to the creator,
+    // which keeps its timeslice and finishes initialising the object the
+    // new thread is about to read. Entering the entry point immediately
+    // instead makes the thread observe a half-built object: Toy Golf's
+    // audio thread dereferences the mixer its creator has not stored yet
+    // and faults on a NULL `[r5,#0x38]`.
+    //
+    // The difference between the two is only *when* the thread becomes
+    // eligible to run: a suspended one waits for `ResumeThread` to set
+    // `started`, a normal one is eligible right away. `resume_worker`
+    // hands it the CPU at the creator's next blocking call -- `Sleep`,
+    // `WaitForSingleObject`, `WaitForMultipleObjects` or the message
+    // pump -- which is exactly where a cooperative scheduler can switch.
+    let mut worker_regs = [0u32; 17];
+    worker_regs[0] = parameter;
+    worker_regs[13] = stack_top - 16;
+    worker_regs[14] = exit_va;
+    worker_regs[15] = entry;
+    worker_regs[16] = ctx.cpu.read_reg(ArmReg::Cpsr)?;
+    thread.worker_regs = worker_regs;
+    thread.worker_saved = true;
+    thread.started = !suspended;
     ctx.kernel.threads.push(thread);
-    ctx.kernel.current_thread = thread_index + 1;
-    ctx.cpu.write_reg(ArmReg::R0, parameter)?;
-    ctx.cpu.write_reg(ArmReg::Sp, stack_top - 16)?;
-    ctx.cpu.write_reg(ArmReg::Lr, exit_va)?;
-    Ok(DispatchOutcome::JumpTo(entry))
+    Ok(DispatchOutcome::ReturnedR0(handle))
 }
 
 fn get_current_thread_id(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -11954,7 +12057,19 @@ fn retire_wave_buffer(ctx: &mut CallCtx<'_>, hdr: u32) -> Result<(), KernelError
         WaveCallbackKind::Function => {
             ctx.kernel.wave_out.function_done.push_back(hdr);
         }
-        WaveCallbackKind::Event | WaveCallbackKind::None => {}
+        WaveCallbackKind::Event => {
+            // `CALLBACK_EVENT` means the driver sets this event every
+            // time a buffer drains, and that is the only back-pressure
+            // the guest's mixer thread has. Toy Golf's thread waits on
+            // it and refills whatever is done; leaving the event alone
+            // makes the wait fall through, so the thread refills as
+            // fast as the CPU allows, never yields, and the main thread
+            // never draws another frame.
+            if let Some(event) = ctx.kernel.events.get_mut(&target) {
+                event.signalled = true;
+            }
+        }
+        WaveCallbackKind::None => {}
     }
     Ok(())
 }
@@ -12928,6 +13043,7 @@ mod tests {
             audio: AudioEngine::new(),
             wave_out_format: GuestFormat::default(),
             wave_out: Default::default(),
+            hss: Default::default(),
             posted_messages: Default::default(),
             msg_queues: std::collections::HashMap::new(),
             next_msg_queue_handle: 0xDEAD_E500,
@@ -13954,5 +14070,265 @@ mod tests {
         let hi = u16::from_le_bytes(cpu.read_mem(a + 2, 2).unwrap().try_into().unwrap());
         assert_eq!(lo, 300);
         assert_eq!(hi, 0xbeef, "%hd must not write past two bytes");
+    }
+
+    /// A `CallCtx` over a stub CPU with one mapped scratch page, a
+    /// distinct thunk per call site, and the argument registers set.
+    ///
+    /// `resolve_handler` memoizes by `thunk_va` including negative
+    /// results, so every thunk a test builds needs its own address.
+    fn thunk_at(va: u32) -> Thunk {
+        let mut t = dummy_thunk();
+        t.thunk_va = va;
+        t
+    }
+
+    /// `CreateThread` without `CREATE_SUSPENDED` must still return to
+    /// the creator rather than entering the new thread's entry point.
+    ///
+    /// On the device the creator keeps its timeslice and finishes
+    /// initialising the object the new thread is about to read. Toy
+    /// Golf's audio thread dereferences the mixer its creator has not
+    /// stored yet, so entering immediately faulted on a NULL
+    /// `[r5,#0x38]`. Reverting the park-always path fails this.
+    #[test]
+    fn create_thread_returns_to_its_creator_instead_of_entering_the_thread() {
+        const ENTRY: u32 = 0x0009_d000;
+        const PARAM: u32 = 0xFEED_0001;
+        const CALLER: u32 = 0x0006_1234;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.write_reg(ArmReg::R0, 0).unwrap();
+        cpu.write_reg(ArmReg::R1, 0x4000).unwrap();
+        cpu.write_reg(ArmReg::R2, ENTRY).unwrap();
+        cpu.write_reg(ArmReg::R3, PARAM).unwrap();
+        cpu.write_reg(ArmReg::Lr, CALLER).unwrap();
+        // Argument 4 (the creation flags) is passed on the stack.
+        cpu.map_region(0x6000_0000 - 0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let sp = 0x6000_0000u32 - 0x100;
+        cpu.write_reg(ArmReg::Sp, sp).unwrap();
+        cpu.write_mem(sp, &0u32.to_le_bytes()).unwrap();
+
+        let t = thunk_at(0x7000_0100);
+        let outcome = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            create_thread(&mut c).unwrap()
+        };
+
+        // The creator gets a handle back and keeps running: no JumpTo
+        // into the thread body.
+        let handle = match outcome {
+            DispatchOutcome::ReturnedR0(h) => h,
+            other => panic!("CreateThread must return to its creator, got {other:?}"),
+        };
+        assert_ne!(handle, 0, "a valid entry point must produce a handle");
+
+        let thread = kernel
+            .threads
+            .last()
+            .expect("the thread object has to exist");
+        assert_eq!(thread.handle, handle);
+        // Parked at its entry point with the parameter in R0, eligible
+        // to run at the creator's next blocking call.
+        assert!(thread.worker_saved, "the thread must be parked, not live");
+        assert!(thread.started, "a non-suspended thread is runnable");
+        assert_eq!(thread.worker_regs[15], ENTRY);
+        assert_eq!(thread.worker_regs[0], PARAM);
+        assert_eq!(kernel.current_thread, 0, "the creator still owns the CPU");
+    }
+
+    /// `CREATE_SUSPENDED` differs only in whether the parked thread is
+    /// eligible to run before `ResumeThread`.
+    #[test]
+    fn a_suspended_thread_is_parked_but_not_yet_runnable() {
+        const ENTRY: u32 = 0x0009_e000;
+        const CREATE_SUSPENDED: u32 = 0x4;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.write_reg(ArmReg::R2, ENTRY).unwrap();
+        cpu.write_reg(ArmReg::R4, CREATE_SUSPENDED).unwrap();
+        // Argument 4 is the creation flags; the stub reads it off the
+        // stack, so place it there too.
+        cpu.map_region(0x6000_0000 - 0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        let sp = 0x6000_0000u32 - 0x100;
+        cpu.write_reg(ArmReg::Sp, sp).unwrap();
+        cpu.write_mem(sp, &CREATE_SUSPENDED.to_le_bytes()).unwrap();
+
+        let t = thunk_at(0x7000_0120);
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        create_thread(&mut c).unwrap();
+
+        let thread = kernel.threads.last().unwrap();
+        assert!(thread.worker_saved);
+        assert_eq!(thread.worker_regs[15], ENTRY);
+        assert!(
+            !thread.started,
+            "CREATE_SUSPENDED must wait for ResumeThread"
+        );
+    }
+
+    /// `CALLBACK_EVENT` means the driver sets an event every time a
+    /// buffer drains, and that event is the only back-pressure the
+    /// guest's mixer thread has.
+    ///
+    /// Toy Golf's thread waits on it and refills whatever is done.
+    /// Treating the callback as a no-op made the wait fall through, so
+    /// the thread refilled as fast as the CPU allowed, never yielded,
+    /// and the main thread never drew another frame.
+    #[test]
+    fn a_drained_buffer_signals_its_callback_event() {
+        const HDR: u32 = 0x1000;
+        const EVENT: u32 = 0xDEAD_E001;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        cpu.map_region(0x1000, 0x1000, Prot::READ | Prot::WRITE)
+            .unwrap();
+        cpu.write_mem(HDR + 16, &WHDR_INQUEUE.to_le_bytes())
+            .unwrap();
+        kernel.events.insert(
+            EVENT,
+            pocket_kernel::EventObject {
+                manual_reset: false,
+                signalled: false,
+            },
+        );
+        kernel.wave_out.callback_kind = WaveCallbackKind::Event;
+        kernel.wave_out.callback_target = EVENT;
+
+        let t = thunk_at(0x7000_0140);
+        {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            retire_wave_buffer(&mut c, HDR).unwrap();
+        }
+
+        assert!(
+            kernel.events[&EVENT].signalled,
+            "retiring a buffer must set the CALLBACK_EVENT event"
+        );
+        // The header still has to be marked done and dequeued.
+        let flags = u32::from_le_bytes(cpu.read_mem(HDR + 16, 4).unwrap().try_into().unwrap());
+        assert_eq!(flags & WHDR_DONE, WHDR_DONE);
+        assert_eq!(flags & WHDR_INQUEUE, 0);
+    }
+
+    /// `WaitForSingleObject(handle, INFINITE)` from a worker is a
+    /// scheduling point, and the retried call must see its arguments
+    /// intact.
+    ///
+    /// This HLE runs one guest thread at a time, so whoever would
+    /// signal the object needs the CPU first. Answering `WAIT_OBJECT_0`
+    /// is what kept Toy Golf's mixer thread spinning; answering
+    /// `WAIT_TIMEOUT` is a lie for `INFINITE`. Rewriting R0 on the way
+    /// out would make the retried call wait on handle 0.
+    #[test]
+    fn an_infinite_wait_from_a_worker_yields_and_keeps_its_handle() {
+        const EVENT: u32 = 0xDEAD_E001;
+        const MAIN_RESUME: u32 = 0x0006_5000;
+        const INFINITE: u32 = 0xFFFF_FFFF;
+
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        kernel.events.insert(
+            EVENT,
+            pocket_kernel::EventObject {
+                manual_reset: false,
+                signalled: false,
+            },
+        );
+
+        // One worker, currently on the CPU, with the main thread's
+        // context saved in it.
+        let mut saved = [0u32; 17];
+        saved[15] = MAIN_RESUME;
+        let mut thread = GuestThread::new(
+            0x0009_d000,
+            0,
+            0x6200_0000,
+            0x1000,
+            THREAD_EXIT_TRAMPOLINE_BASE,
+            MAIN_RESUME,
+            0xDEAD_7C00,
+            saved,
+        );
+        thread.started = true;
+        kernel.threads.push(thread);
+        kernel.current_thread = 1;
+
+        cpu.write_reg(ArmReg::R0, EVENT).unwrap();
+        cpu.write_reg(ArmReg::R1, INFINITE).unwrap();
+        cpu.write_reg(ArmReg::Lr, 0x0009_d100).unwrap();
+
+        let t = thunk_at(0x7000_0160);
+        let outcome = {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            wait_for_single_object(&mut c).unwrap()
+        };
+
+        // Control goes back to the main thread, not on to the worker's LR.
+        assert_eq!(outcome, DispatchOutcome::JumpTo(MAIN_RESUME));
+        assert_eq!(kernel.current_thread, 0);
+        let worker = &kernel.threads[0];
+        assert!(worker.worker_saved, "the worker has to be parked");
+        // Re-runs the same thunk, with the handle it was waiting on.
+        assert_eq!(worker.worker_regs[15], t.thunk_va);
+        assert_eq!(
+            worker.worker_regs[0], EVENT,
+            "an infinite wait must keep its handle argument"
+        );
+    }
+
+    /// `InvalidateRect` asks for a *future* `WM_PAINT`; it changes no
+    /// pixels, so it must not advance `frame_counter`.
+    ///
+    /// The hosts treat a counter change as "a new frame is ready".
+    /// Toy Golf invalidates from its idle loop — ~100 000 calls in a
+    /// couple of million slices — so the CLI's dump hook spent its
+    /// whole `--max-frames` budget on identical black frames captured
+    /// before the game had drawn anything, and stopped the run while
+    /// the framebuffer went on to receive a full 320x240 image.
+    #[test]
+    fn invalidate_rect_does_not_count_as_a_rendered_frame() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let before = kernel.framebuffer.frame_counter;
+
+        let t = thunk_at(0x7000_0180);
+        for _ in 0..1000 {
+            let mut c = CallCtx {
+                cpu: &mut cpu,
+                thunk: &t,
+                kernel: &mut kernel,
+            };
+            assert_eq!(
+                invalidate_rect(&mut c).unwrap(),
+                DispatchOutcome::ReturnedR0(1)
+            );
+        }
+
+        assert_eq!(
+            kernel.framebuffer.frame_counter, before,
+            "invalidating a region must not fabricate frames"
+        );
     }
 }
