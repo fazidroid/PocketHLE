@@ -13279,7 +13279,10 @@ mod tests {
             thunk: &t,
             kernel: &mut kernel,
         };
-        assert_eq!(crt_fcloseall(&mut c).unwrap(), DispatchOutcome::ReturnedR0(2));
+        assert_eq!(
+            crt_fcloseall(&mut c).unwrap(),
+            DispatchOutcome::ReturnedR0(2)
+        );
         assert!(!kernel.vfs.is_open(a));
         assert!(!kernel.vfs.is_open(b));
     }
