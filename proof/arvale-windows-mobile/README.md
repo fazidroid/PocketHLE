@@ -43,12 +43,12 @@ It exited cleanly with `frame_counter=18`; its concise output is in `ai-tap-sequ
 
 ## Captures
 
-- `arvale-st-startup.ppm` — first captured frame
-- `arvale-st-gameplay.ppm` — last non-black diagnostic frame from the run
-- `arvale-st-frame.ppm` — final framebuffer snapshot
-- `arvale-2-frame.ppm` — Arvale II final framebuffer snapshot
+- `arvale-st-startup.jpg` — first captured frame
+- `arvale-st-gameplay.jpg` — last non-black diagnostic frame from the run
+- `arvale-st-frame.jpg` — final framebuffer snapshot
+- `arvale-2-frame.jpg` — Arvale II final framebuffer snapshot
 - `arvale-st-test-result.log` — concise Short Tales run output
 - `ai-tap-sequence-final.log` — concise AI tap-sequence output
 - `arvale-st-api-trace.jsonl` — API trace
 
-The captures are raw PPM files so they remain lossless and inspectable without adding a binary image dependency to the project.
+The screenshots are provided as JPG files for convenient viewing. The original PPM captures are retained as lossless source evidence.
