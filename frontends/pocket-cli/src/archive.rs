@@ -204,6 +204,8 @@ fn prepare_cab(path: &Path) -> Result<Launcher> {
     // same temp dir so a single mount answers both shapes.
     let setup = parse_setup_script(&files);
     materialise_long_names(tmp.path(), &files, &setup);
+    extract_payload_archives(tmp.path())
+        .with_context(|| format!("extracting nested game archives from {}", path.display()))?;
 
     // A `.000` header that parsed as a real MSCE file names every
     // payload exactly, so the reconstruct-by-guesswork paths below only
@@ -437,6 +439,52 @@ fn materialise_long_names(
             log::debug!("materialised {} as {}", short, dest.display());
         }
     }
+}
+
+fn extract_payload_archives(root: &Path) -> Result<()> {
+    let archives: Vec<PathBuf> = std::fs::read_dir(root)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        })
+        .collect();
+
+    for archive_path in archives {
+        let file = File::open(&archive_path)?;
+        let mut archive = zip::ZipArchive::new(file)
+            .with_context(|| format!("reading nested archive {}", archive_path.display()))?;
+        let mut extracted = 0usize;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index)?;
+            let Some(relative) = entry.enclosed_name().map(Path::to_path_buf) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            let destination = root.join(relative);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&destination)?;
+                continue;
+            }
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut output = File::create(&destination)?;
+            std::io::copy(&mut entry, &mut output)?;
+            extracted += 1;
+        }
+        log::debug!(
+            "extracted {} files from nested payload {}",
+            extracted,
+            archive_path.display()
+        );
+    }
+    Ok(())
 }
 
 fn materialise_legacy_install_files(
@@ -720,6 +768,8 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
     let mut archive =
         zip::ZipArchive::new(f).with_context(|| format!("parsing zip {}", path.display()))?;
     let mut written: Vec<PathBuf> = Vec::with_capacity(archive.len());
+    let mut nested_archives = Vec::new();
+
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let Some(rel) = entry.enclosed_name().map(Path::to_path_buf) else {
@@ -739,6 +789,14 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
         let mut out = File::create(&dest)?;
         std::io::copy(&mut entry, &mut out)?;
         written.push(dest);
+        if written
+            .last()
+            .and_then(|path| path.extension())
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        {
+            nested_archives.push(written.last().unwrap().clone());
+        }
     }
     if written.is_empty() {
         return Err(anyhow!("{} contains no files", path.display()));
@@ -764,6 +822,10 @@ fn prepare_zip(path: &Path) -> Result<Launcher> {
         // origin and making the outer tmpdir the new owner.
         inner._tempdir = Some(merge_tempdirs(tmp, inner._tempdir));
         return Ok(inner);
+    }
+
+    for nested in nested_archives {
+        extract_payload_archives(nested.parent().unwrap_or(tmp.path()))?;
     }
 
     let exe_path = pick_entrypoint_pe(written.iter().map(PathBuf::as_path)).with_context(|| {

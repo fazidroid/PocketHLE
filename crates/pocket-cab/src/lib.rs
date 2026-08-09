@@ -1180,7 +1180,7 @@ fn parm_value(line: &str, key: &str) -> Option<String> {
     let val_pos = after.find("value=\"")?;
     let after_val = &after[val_pos + "value=\"".len()..];
     let end = after_val.find('"')?;
-    Some(after_val[..end].to_string())
+    Some(decode_xml_entities(&after_val[..end]))
 }
 
 /// Match `type="<val>"` and return `val`.
@@ -1188,7 +1188,16 @@ fn type_attribute(line: &str) -> Option<String> {
     let pos = line.find("type=\"")?;
     let after = &line[pos + "type=\"".len()..];
     let end = after.find('"')?;
-    Some(after[..end].to_string())
+    Some(decode_xml_entities(&after[..end]))
+}
+
+fn decode_xml_entities(value: &str) -> String {
+    value
+        .replace("&apos;", "'")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }
 
 /// `HKLM\SOFTWARE\Apps\Foo` / `HKEY_LOCAL_MACHINE\...` -> canonical
