@@ -437,6 +437,22 @@ impl Vfs {
         self.handles.remove(&handle).is_some()
     }
 
+    /// Flush and close every open handle, returning how many were closed.
+    ///
+    /// This backs the CRT's `_fcloseall`. The handle table does not
+    /// separate CRT streams from Win32 `CreateFile` handles, so this
+    /// closes both — which is what the process teardown this runs as part
+    /// of would do anyway: CeGCC's `crt3.c` calls `_fcloseall` on its way
+    /// into `ExitProcess`, and nothing reads a handle after that.
+    pub fn close_all(&mut self) -> usize {
+        for of in self.handles.values_mut() {
+            let _ = of.file.flush();
+        }
+        let n = self.handles.len();
+        self.handles.clear();
+        n
+    }
+
     pub fn is_open(&self, handle: u32) -> bool {
         self.handles.contains_key(&handle)
     }

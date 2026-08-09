@@ -289,6 +289,10 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "fsetpos", crt_fsetpos);
     d.register_handler(dll, "feof", crt_feof);
     d.register_handler(dll, "fflush", crt_fflush);
+    d.register_handler(dll, "_fcloseall", crt_fcloseall);
+    // CeGCC's C runtime startup (`crt3.c`) calls `_fpreset` before it
+    // reaches `main`; MSVC-built images never do.
+    d.register_handler(dll, "_fpreset", crt_fpreset);
     d.register_handler(dll, "fgetc", crt_fgetc);
     d.register_handler(dll, "fputc", crt_fputc);
     d.register_handler(dll, "fgets", crt_fgets);
@@ -4653,6 +4657,32 @@ fn crt_fclose(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         u32::MAX
     };
     Ok(DispatchOutcome::ReturnedR0(result))
+}
+
+/// `_fcloseall` — flush and close every open stream, returning the count.
+///
+/// CeGCC's `crt3.c` calls this during teardown, right before
+/// `ExitProcess`. MSVC-built games reach `ExitProcess` without it, which
+/// is why it only showed up once a mingw32ce binary was loaded.
+fn crt_fcloseall(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let closed = ctx.kernel.vfs.close_all() as u32;
+    log::debug!("_fcloseall() -> {closed}");
+    Ok(DispatchOutcome::ReturnedR0(closed))
+}
+
+/// `_fpreset` — reset the floating-point unit to its default state.
+///
+/// On the device this clears the pending FP exception flags and restores
+/// the default rounding mode and precision. We never raise guest FP
+/// exceptions and never change the rounding mode away from the default,
+/// so the state it would reset to is the state we are always in and there
+/// is nothing to do. `void` return, so r0 does not matter.
+///
+/// CeGCC's startup calls this unconditionally before `main`, so leaving it
+/// unimplemented put a warning on the very first dispatched call of every
+/// mingw32ce binary.
+fn crt_fpreset(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn crt_fflush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -13220,6 +13250,54 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    /// CeGCC's `crt3.c` calls `_fcloseall` on its way into `ExitProcess`.
+    /// It has to flush and drop every open stream and answer with how many
+    /// it closed.
+    #[test]
+    fn fcloseall_closes_every_open_handle() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        kernel.vfs.mount("\\App\\", dir.path());
+        let a = kernel
+            .vfs
+            .open("\\App\\a.txt", Access::Read, false)
+            .unwrap();
+        let b = kernel
+            .vfs
+            .open("\\App\\b.txt", Access::Read, false)
+            .unwrap();
+        assert!(kernel.vfs.is_open(a) && kernel.vfs.is_open(b));
+
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(crt_fcloseall(&mut c).unwrap(), DispatchOutcome::ReturnedR0(2));
+        assert!(!kernel.vfs.is_open(a));
+        assert!(!kernel.vfs.is_open(b));
+    }
+
+    /// `_fpreset` is `void` and has nothing to reset in our FPU model, but
+    /// it must be *registered*: it is the first call CeGCC startup makes,
+    /// and an unimplemented stub there warns on every mingw32ce binary.
+    #[test]
+    fn fpreset_is_a_no_op_that_returns_cleanly() {
+        let mut cpu = StubCpu::new();
+        let mut kernel = fresh_kernel();
+        let t = dummy_thunk();
+        let mut c = CallCtx {
+            cpu: &mut cpu,
+            thunk: &t,
+            kernel: &mut kernel,
+        };
+        assert_eq!(crt_fpreset(&mut c).unwrap(), DispatchOutcome::ReturnedR0(0));
     }
 
     #[test]
