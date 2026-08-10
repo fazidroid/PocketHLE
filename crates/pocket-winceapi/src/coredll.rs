@@ -90,6 +90,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     // ---- Process / module / library ----
     d.register_handler(dll, "GetTickCount", get_tick_count);
     d.register_handler(dll, "Sleep", sleep);
+    d.register_handler(dll, "SuspendThread", suspend_thread);
     d.register_handler(dll, "ResumeThread", resume_thread);
     d.register_handler(dll, "ExitProcess", exit_process);
     d.register_handler(dll, "TerminateProcess", exit_process);
@@ -994,6 +995,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "log10", m_log10);
     d.register_handler(dll, "sqrt", m_sqrt);
     d.register_handler(dll, "floor", m_floor);
+    d.register_handler(dll, "floorf", m_floorf);
     d.register_handler(dll, "ceil", m_ceil);
     d.register_handler(dll, "fabs", m_fabs);
     d.register_handler(dll, "atan2", m_atan2);
@@ -1739,6 +1741,35 @@ fn sleep(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         return Ok(outcome);
     }
     Ok(DispatchOutcome::ReturnedR0(0))
+}
+
+/// `SuspendThread(HANDLE)` is used by Avalanche's cooperative worker
+/// control loop to pause a helper before it changes display state.
+///
+/// PocketHLE already serializes guest threads at API boundaries, so the
+/// operation is represented by marking the synthetic thread as not ready;
+/// the current worker yields immediately and the main thread continues.
+fn suspend_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let handle = ctx.arg_u32(0)?;
+    if handle == FAKE_CURRENT_THREAD_HANDLE {
+        if let Some(outcome) = park_worker(ctx, 0)? {
+            return Ok(outcome);
+        }
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    if let Some(index) = ctx
+        .kernel
+        .threads
+        .iter()
+        .position(|thread| thread.handle == handle && !thread.finished)
+    {
+        ctx.kernel.threads[index].started = false;
+        if let Some(outcome) = park_worker(ctx, 0)? {
+            return Ok(outcome);
+        }
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    Ok(DispatchOutcome::ReturnedR0(0xffff_ffff))
 }
 
 fn resume_thread(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -10558,6 +10589,10 @@ fn m_sqrt(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 fn m_floor(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     libm_unary_d(c, f64::floor)
+}
+
+fn m_floorf(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(ret_f32(read_f32(c, 0)?.floor()))
 }
 fn m_ceil(c: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     libm_unary_d(c, f64::ceil)
