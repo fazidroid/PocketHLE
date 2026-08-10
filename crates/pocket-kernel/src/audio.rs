@@ -70,6 +70,33 @@ struct AudioVoice {
     position_q16: u64,
     looped: bool,
     volume: f32,
+    group: u32,
+}
+
+/// How a voice submitted through [`AudioEngine::play_voice_with`]
+/// should behave.
+///
+/// `group` exists so a caller can silence one class of sound without
+/// touching the rest: `hss.dll`'s `stopMusics` must stop the music
+/// without cutting off the sound effects that are still playing.
+#[derive(Debug, Clone, Copy)]
+pub struct VoiceParams {
+    pub looped: bool,
+    /// Tag for [`AudioEngine::stop_voice_group`]. Voices submitted
+    /// through [`AudioEngine::play_voice`] land in group 0.
+    pub group: u32,
+    /// Linear gain. 1.0 plays the samples as submitted.
+    pub volume: f32,
+}
+
+impl Default for VoiceParams {
+    fn default() -> Self {
+        Self {
+            looped: false,
+            group: 0,
+            volume: 1.0,
+        }
+    }
 }
 
 /// Inner state shared between the emulator thread (which calls
@@ -229,7 +256,12 @@ impl Shared {
     }
 
     #[cfg(feature = "audio-cpal")]
-    fn add_voice(&mut self, samples: Vec<i16>, format: GuestFormat, looped: bool) {
+    fn stop_voice_group(&mut self, group: u32) {
+        self.voices.retain(|v| v.group != group);
+    }
+
+    #[cfg(feature = "audio-cpal")]
+    fn add_voice(&mut self, samples: Vec<i16>, format: GuestFormat, params: VoiceParams) {
         if samples.is_empty() {
             return;
         }
@@ -240,8 +272,9 @@ impl Shared {
             samples,
             format,
             position_q16: 0,
-            looped,
-            volume: 1.0,
+            looped: params.looped,
+            volume: params.volume,
+            group: params.group,
         });
     }
 
@@ -475,10 +508,28 @@ impl AudioEngine {
     }
 
     pub fn play_voice(&self, samples: &[i16], format: GuestFormat, looped: bool) -> usize {
+        self.play_voice_with(
+            samples,
+            format,
+            VoiceParams {
+                looped,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Submit a voice with an explicit group and gain — see
+    /// [`VoiceParams`].
+    pub fn play_voice_with(
+        &self,
+        samples: &[i16],
+        format: GuestFormat,
+        params: VoiceParams,
+    ) -> usize {
         #[cfg(feature = "audio-cpal")]
         {
             if let Ok(mut s) = self.shared.lock() {
-                s.add_voice(samples.to_vec(), format, looped);
+                s.add_voice(samples.to_vec(), format, params);
                 samples.len()
             } else {
                 0
@@ -486,7 +537,7 @@ impl AudioEngine {
         }
         #[cfg(not(feature = "audio-cpal"))]
         {
-            let _ = (format, looped);
+            let _ = (format, params);
             self.push_samples(samples)
         }
     }
@@ -496,6 +547,18 @@ impl AudioEngine {
         if let Ok(mut s) = self.shared.lock() {
             s.stop_voices();
         }
+    }
+
+    /// Stop only the voices tagged with `group`, leaving every other
+    /// voice playing. Without the `audio-cpal` feature there are no
+    /// voices to stop and this does nothing.
+    pub fn stop_voice_group(&self, group: u32) {
+        #[cfg(feature = "audio-cpal")]
+        if let Ok(mut s) = self.shared.lock() {
+            s.stop_voice_group(group);
+        }
+        #[cfg(not(feature = "audio-cpal"))]
+        let _ = group;
     }
 
     /// Convenience for unsigned 8-bit PCM (the format `PlaySound` and
@@ -600,16 +663,26 @@ impl AudioEngine {
         let shared = Arc::clone(&self.shared);
         let shutdown = Arc::clone(&self.shutdown);
         shutdown.store(false, std::sync::atomic::Ordering::SeqCst);
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("pockethle-audio".to_string())
             .spawn(move || run_audio_worker(shared, shutdown))
-            .ok();
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                log::warn!("AudioEngine: could not spawn audio thread — running silently: {e}");
+                None
+            }
+        };
         self.worker = handle;
     }
 
     #[cfg(not(feature = "audio-cpal"))]
     fn start_impl(&mut self) {
-        log::info!("AudioEngine: built without audio-cpal feature, running silently");
+        // A build with the feature off can never make a sound, and the
+        // guest cannot tell — so this is a warning, not a note. It is
+        // the first thing to rule out when a packaged binary is silent
+        // but a local one is not.
+        log::warn!("AudioEngine: built without the audio-cpal feature — running silently");
     }
 
     /// Stop the host stream and clear any pending samples. The
@@ -728,14 +801,24 @@ fn run_audio_worker(shared: Arc<Mutex<Shared>>, shutdown: Arc<std::sync::atomic:
     let device = match host.default_output_device() {
         Some(d) => d,
         None => {
-            log::info!("AudioEngine: no default output device — running silently");
+            // Every early return in this function means the run is
+            // silent. That is a user-visible failure, not a detail, so
+            // these log at `warn`: the desktop GUI is built with
+            // `windows_subsystem = "windows"` and has no console, so an
+            // `info` line reaches nobody and "no sound" arrives with no
+            // explanation attached.
+            log::warn!("AudioEngine: no default output device — running silently");
             return;
         }
     };
+    let device_name = device.name().unwrap_or_else(|_| "<unnamed>".to_string());
     let config = match device.default_output_config() {
         Ok(c) => c,
         Err(e) => {
-            log::info!("AudioEngine: device.default_output_config() failed: {e}");
+            log::warn!(
+                "AudioEngine: default_output_config() failed on {device_name:?} \
+                 — running silently: {e}"
+            );
             return;
         }
     };
@@ -781,23 +864,31 @@ fn run_audio_worker(shared: Arc<Mutex<Shared>>, shutdown: Arc<std::sync::atomic:
             )
         }
         other => {
-            log::info!("AudioEngine: unsupported host sample format {other:?}");
+            log::warn!(
+                "AudioEngine: host device {device_name:?} wants sample format \
+                 {other:?}, which is not supported — running silently"
+            );
             return;
         }
     };
     let stream = match stream {
         Ok(s) => s,
         Err(e) => {
-            log::info!("AudioEngine: build_output_stream failed: {e}");
+            log::warn!(
+                "AudioEngine: build_output_stream failed on {device_name:?} \
+                 ({host_rate} Hz / {host_channels} ch / {sample_format:?}) \
+                 — running silently: {e}"
+            );
             return;
         }
     };
     if let Err(e) = stream.play() {
-        log::info!("AudioEngine: stream.play() failed: {e}");
+        log::warn!("AudioEngine: stream.play() failed on {device_name:?} — running silently: {e}");
         return;
     }
     log::info!(
-        "AudioEngine: opened {} Hz / {} ch ({:?})",
+        "AudioEngine: opened {:?} at {} Hz / {} ch ({:?})",
+        device_name,
         host_rate,
         host_channels,
         sample_format
