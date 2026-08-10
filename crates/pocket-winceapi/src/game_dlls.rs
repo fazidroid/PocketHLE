@@ -7,6 +7,40 @@ use crate::{CallCtx, WinCeDispatcher};
 pub fn register(d: &mut WinCeDispatcher) {
     register_game_x(d);
     register_sound_x(d);
+    d.register_handler("note_prj.dll", "ord:7", find_first_flash_card);
+    d.register_handler("note_prj.dll", "#7", find_first_flash_card);
+    d.register_handler("note_prj.dll", "ord:8", find_next_flash_card);
+    d.register_handler("note_prj.dll", "#8", find_next_flash_card);
+}
+
+const FLASH_CARD_HANDLE: u32 = 0xDEAD_F100;
+const FIND_DATA_NAME_OFFSET: usize = 40;
+const FIND_DATA_SIZE: usize = FIND_DATA_NAME_OFFSET + 260 * 2;
+
+fn write_flash_card_find_data(ctx: &mut CallCtx<'_>, out: u32) -> Result<(), KernelError> {
+    if out == 0 {
+        return Ok(());
+    }
+    let mut data = vec![0u8; FIND_DATA_SIZE];
+    data[0..4].copy_from_slice(&0x10u32.to_le_bytes());
+    for (index, unit) in "Storage Card".encode_utf16().enumerate() {
+        let offset = FIND_DATA_NAME_OFFSET + index * 2;
+        data[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    ctx.cpu.write_mem(out, &data)?;
+    Ok(())
+}
+
+fn find_first_flash_card(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let out = ctx.arg_u32(0)?;
+    write_flash_card_find_data(ctx, out)?;
+    Ok(DispatchOutcome::ReturnedR0(FLASH_CARD_HANDLE))
+}
+
+fn find_next_flash_card(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _handle = ctx.arg_u32(0)?;
+    let _out = ctx.arg_u32(1)?;
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 fn register_game_x(d: &mut WinCeDispatcher) {

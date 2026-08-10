@@ -460,6 +460,7 @@ pub fn register(d: &mut WinCeDispatcher) {
         request_power_notifications,
     );
     d.register_handler(dll, "StopPowerNotifications", stop_power_notifications);
+    d.register_handler(dll, "GetSystemPowerState", get_system_power_state);
     d.register_handler(
         dll,
         "MsgWaitForMultipleObjectsEx",
@@ -502,6 +503,8 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_constant(dll, "ValidateRect", 1, one_returning);
     d.register_handler(dll, "GetSystemMetrics", get_system_metrics);
     d.register_handler(dll, "GetClientRect", get_client_rect);
+    d.register_handler(dll, "WindowFromPoint", window_from_point);
+    d.register_handler(dll, "ChildWindowFromPoint", window_from_point);
     d.register_handler(dll, "GetWindowRect", get_window_rect);
     d.register_handler(dll, "GetCursorPos", get_cursor_pos);
     d.register_handler(dll, "SetCursor", set_cursor);
@@ -5864,6 +5867,26 @@ fn stop_power_notifications(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, K
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
+/// `DWORD GetSystemPowerState(LPVOID pSystemPowerState, DWORD dwLen,
+///                             LPDWORD pdwFlags, DWORD dwFlags)`.
+///
+/// Diamond Twister polls this before every iteration of its window loop.
+/// The desktop HLE has no suspend/resume power manager, so report the
+/// active state and clear the optional flag output instead of returning
+/// zero without touching the caller's buffers.
+fn get_system_power_state(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let state = ctx.arg_u32(0)?;
+    let state_len = ctx.arg_u32(1)?;
+    let flags_out = ctx.arg_u32(2)?;
+    if state != 0 && state_len >= 4 {
+        ctx.cpu.write_mem(state, &0u32.to_le_bytes())?;
+    }
+    if flags_out != 0 {
+        ctx.cpu.write_mem(flags_out, &0u32.to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(0))
+}
+
 fn get_msg_queue_info(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let handle = ctx.arg_u32(0)?;
     let info = ctx.arg_u32(1)?;
@@ -8792,6 +8815,11 @@ fn read_u32(ctx: &mut CallCtx<'_>, addr: u32) -> Result<u32, KernelError> {
 
 fn screen_dims(ctx: &CallCtx<'_>) -> (u32, u32) {
     (ctx.kernel.framebuffer.width, ctx.kernel.framebuffer.height)
+}
+
+fn window_from_point(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let _point = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
 }
 
 fn get_client_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
