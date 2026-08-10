@@ -243,6 +243,11 @@ pub fn register(d: &mut WinCeDispatcher) {
     // nothing into the buffer and both fields came out blank.
     d.register_handler(dll, "StringCbPrintfW", string_cb_printf_w);
     d.register_handler(dll, "StringCchPrintfW", string_cch_printf_w);
+    d.register_handler(dll, "StringCbCopyW", string_cb_copy_w);
+    d.register_handler(dll, "StringCbLengthW", string_cb_length_w);
+    d.register_handler(dll, "StringCbCatW", string_cb_cat_w);
+    d.register_handler(dll, "StringCbCopyNW", string_cb_copy_nw);
+    d.register_handler(dll, "_wcslwr", wcslwr);
     d.register_handler(dll, "StringCbVPrintfW", string_cb_vprintf_w);
     d.register_handler(dll, "StringCchVPrintfW", string_cch_vprintf_w);
     // `NKDbgPrintfW` is the kernel debug printer. It has no observable
@@ -3976,6 +3981,71 @@ fn write_wide_bounded(
     })
 }
 
+fn copy_wide_bounded(
+    ctx: &mut CallCtx<'_>,
+    dst: u32,
+    cb_dest: u32,
+    src: u32,
+    max_chars: usize,
+) -> Result<u32, KernelError> {
+    let chars = read_wstr(ctx, src, max_chars as u32)?;
+    let text = String::from_utf16_lossy(&chars);
+    write_wide_bounded(ctx, dst, cb_dest / 2, &text)
+}
+
+/// `HRESULT StringCbCatW(LPWSTR dst, size_t cbDest, LPCWSTR src)`.
+fn string_cb_cat_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cb_dest = ctx.arg_u32(1)?;
+    let src = ctx.arg_u32(2)?;
+    let mut text = String::from_utf16_lossy(&read_wstr(ctx, dst, 0x10000)?);
+    text.push_str(&String::from_utf16_lossy(&read_wstr(ctx, src, 0x10000)?));
+    let hr = write_wide_bounded(ctx, dst, cb_dest / 2, &text)?;
+    Ok(DispatchOutcome::ReturnedR0(hr))
+}
+
+/// `HRESULT StringCbCopyNW(LPWSTR dst, size_t cbDest, LPCWSTR src, size_t cbToCopy)`.
+fn string_cb_copy_nw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cb_dest = ctx.arg_u32(1)?;
+    let src = ctx.arg_u32(2)?;
+    let cb_to_copy = ctx.arg_u32(3)?;
+    let hr = copy_wide_bounded(ctx, dst, cb_dest, src, (cb_to_copy / 2) as usize)?;
+    Ok(DispatchOutcome::ReturnedR0(hr))
+}
+
+/// `_wcslwr` lowercases a NUL-terminated wide string in place.
+fn wcslwr(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    char_lower_w(ctx)
+}
+
+/// `HRESULT StringCbCopyW(LPWSTR dst, size_t cbDest, LPCWSTR src)`.
+fn string_cb_copy_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let dst = ctx.arg_u32(0)?;
+    let cb = ctx.arg_u32(1)?;
+    let src = ctx.arg_u32(2)?;
+    let text = String::from_utf16_lossy(&read_wstr(ctx, src, 0x10000)?);
+    let hr = write_wide_bounded(ctx, dst, cb / 2, &text)?;
+    Ok(DispatchOutcome::ReturnedR0(hr))
+}
+
+/// `HRESULT StringCbLengthW(LPCWSTR src, size_t cbMax, size_t *pcb)`.
+fn string_cb_length_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let src = ctx.arg_u32(0)?;
+    let cb_max = ctx.arg_u32(1)?;
+    let out_bytes = ctx.arg_u32(2)?;
+    let max_chars = (cb_max / 2) as usize;
+    let chars = read_wstr(ctx, src, max_chars as u32)?;
+    if out_bytes != 0 {
+        ctx.cpu
+            .write_mem(out_bytes, &((chars.len() * 2) as u32).to_le_bytes())?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(if chars.len() < max_chars {
+        S_OK
+    } else {
+        STRSAFE_E_INSUFFICIENT_BUFFER
+    }))
+}
 /// `HRESULT StringCchPrintfW(LPWSTR dst, size_t cchDest, LPCWSTR fmt, ...)`
 /// — capacity counted in *characters*.
 fn string_cch_printf_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -8530,8 +8600,8 @@ fn parse_pcm_wave(bytes: &[u8]) -> Option<(pocket_kernel::audio::GuestFormat, &[
 const OSVERSIONINFOW_BYTES: u32 = 4 + 4 * 4 + 128 * 2;
 
 /// `BOOL GetVersionExW(LPOSVERSIONINFOW lpVersionInformation)`.
-/// Reports Windows CE 4.20 (Pocket PC 2003 / PPC2003), which is
-/// what every Pocket PC 2002–2003 game we target was built for.
+/// Reports Windows CE 5.2 / Windows Mobile 6.1, the platform family
+/// required by newer native Windows Mobile games such as Zenonia.
 fn get_version_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let p = ctx.arg_u32(0)?;
     if p == 0 {
@@ -8552,18 +8622,17 @@ fn get_version_ex_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelErro
     };
     let mut buf = vec![0u8; want as usize];
     buf[0..4].copy_from_slice(&want.to_le_bytes());
-    buf[4..8].copy_from_slice(&4u32.to_le_bytes());
-    buf[8..12].copy_from_slice(&20u32.to_le_bytes());
-    buf[12..16].copy_from_slice(&1081u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&5u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&2u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&19208u32.to_le_bytes());
     buf[16..20].copy_from_slice(&3u32.to_le_bytes());
     ctx.cpu.write_mem(p, &buf)?;
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 
-/// `DWORD GetVersion()` — packed legacy form. Hi word = major.minor
-/// (0x0414 == 4.20), low word = build (1081).
+/// `DWORD GetVersion()` — packed legacy Windows CE form.
 fn get_version(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(0x0439_1404))
+    Ok(DispatchOutcome::ReturnedR0(0x4B08_0205))
 }
 
 fn invalidate_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
