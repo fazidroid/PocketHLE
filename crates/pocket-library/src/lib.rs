@@ -571,6 +571,12 @@ impl Library {
         fs::create_dir_all(&extracted_dir)?;
 
         let (files, header) = pocket_cab::extract_with_header(cab_path, &extracted_dir)?;
+        for (index, companion) in find_resource_companion_cabs(cab_path)
+            .into_iter()
+            .enumerate()
+        {
+            import_resource_companion_cab(&game_dir, &extracted_dir, index, &companion);
+        }
         // A cabinet stores its payload under generated 8.3 names and keeps
         // the real destination names in `_setup.xml`. The game only ever
         // opens the long ones -- Asphalt 2 3D wants `light.bar` next to
@@ -866,32 +872,44 @@ impl Library {
         // ZIPs that are really just installer wrappers around a CAB —
         // recurse so we get the proper PocketPC display metadata
         // instead of a stem-derived placeholder.
-        if let Some(nested_cab) = written
+        let nested_cabs: Vec<PathBuf> = written
             .iter()
-            .find(|p| {
+            .filter(|p| {
                 p.extension()
                     .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("cab"))
-                    .unwrap_or(false)
+                    .is_some_and(|e| e.eq_ignore_ascii_case("cab"))
             })
             .cloned()
-        {
+            .collect();
+        if !nested_cabs.is_empty() {
+            let main_cab = nested_cabs
+                .iter()
+                .find(|path| {
+                    let stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    !stem.contains("res") && !stem.contains("resource")
+                })
+                .cloned()
+                .unwrap_or_else(|| nested_cabs[0].clone());
             log::info!(
-                "zip {} contains nested cab {}, recursing",
+                "zip {} contains nested cabinets; importing {} with its companion cabinets",
                 zip_path.display(),
-                nested_cab.display(),
+                main_cab.display(),
             );
-            // Wipe the partial extraction so the CAB import starts
-            // from a clean directory layout — the nested cab content
-            // is what we actually want as the per-game tree.
-            let nested_cab_temp = self.root.join("games").join(format!(".{id}-nested.cab"));
-            if let Some(parent) = nested_cab_temp.parent() {
-                fs::create_dir_all(parent)?;
+            let nested_dir = self.root.join("games").join(format!(".{id}-nested-cabs"));
+            fs::create_dir_all(&nested_dir)?;
+            let staged_main =
+                nested_dir.join(main_cab.file_name().ok_or(LibraryError::NoExecutable)?);
+            for cab in &nested_cabs {
+                let name = cab.file_name().ok_or(LibraryError::NoExecutable)?;
+                fs::copy(cab, nested_dir.join(name))?;
             }
-            fs::copy(&nested_cab, &nested_cab_temp)?;
             fs::remove_dir_all(&game_dir)?;
-            let result = self.import_cab(&nested_cab_temp);
-            let _ = fs::remove_file(&nested_cab_temp);
+            let result = self.import_cab(&staged_main);
+            let _ = fs::remove_dir_all(&nested_dir);
             return result;
         }
 
@@ -1104,6 +1122,85 @@ fn record_extracted_libraries(extracted_dir: &Path, game_dir: &Path) -> Vec<Path
         .collect();
     found.sort();
     found
+}
+
+fn import_resource_companion_cab(
+    game_dir: &Path,
+    extracted_dir: &Path,
+    index: usize,
+    companion: &Path,
+) {
+    let staging = game_dir.join(format!(".resource-cab-{index}"));
+    if fs::create_dir_all(&staging).is_err() {
+        return;
+    }
+    match pocket_cab::extract_with_header(companion, &staging) {
+        Ok((companion_files, companion_header)) => {
+            if let Some(header) = companion_header.as_ref().filter(|h| h.structured) {
+                pocket_cab::materialise_install_header_names(
+                    extracted_dir,
+                    &companion_files,
+                    header,
+                );
+            } else {
+                materialise_legacy_assets(
+                    extracted_dir,
+                    &companion_files,
+                    companion_header
+                        .as_ref()
+                        .and_then(|h| h.app_name.as_deref()),
+                );
+            }
+            log::info!(
+                "imported companion resource cabinet {}",
+                companion.display()
+            );
+        }
+        Err(error) => {
+            log::warn!(
+                "could not import companion resource cabinet {}: {error}",
+                companion.display()
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(staging);
+}
+
+fn find_resource_companion_cabs(source: &Path) -> Vec<PathBuf> {
+    let Some(parent) = source.parent() else {
+        return Vec::new();
+    };
+    let source_stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let family = source_stem.split(['-', '_']).next().unwrap_or(&source_stem);
+    let mut matches: Vec<PathBuf> = fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path != source)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cab"))
+        })
+        .filter(|path| {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            stem.split(['-', '_'])
+                .next()
+                .is_some_and(|candidate| candidate == family)
+                && (stem.contains("res") || stem.contains("resource"))
+        })
+        .collect();
+    matches.sort();
+    matches
 }
 
 fn materialise_legacy_assets(root: &Path, files: &[pocket_cab::CabFile], app_name: Option<&str>) {
@@ -1905,6 +2002,17 @@ mod tests {
         fs::write(&stub, b"MZ").unwrap();
         assert!(!is_guest_exe(&stub));
         assert!(!is_guest_dll(&stub));
+    }
+
+    #[test]
+    fn resource_companion_cabs_are_selected_by_game_family() {
+        let root = tmpdir("resource_companion_selection");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["wwp.CAB", "wwp-res.CAB", "wwp-2003.CAB", "other-res.CAB"] {
+            fs::write(root.join(name), []).unwrap();
+        }
+        let found = find_resource_companion_cabs(&root.join("wwp.CAB"));
+        assert_eq!(found, vec![root.join("wwp-res.CAB")]);
     }
 
     #[test]
