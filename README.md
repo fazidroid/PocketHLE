@@ -35,7 +35,7 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
 
 ## Info
 
-PocketHLE is an early-stage high-level emulator for Pocket PC 2002/2003 and Windows Mobile 5/6 games. Instead of emulating a complete Windows CE device, it loads the original game executable, runs its ARM code through a CPU backend, and provides clean-room host-side implementations of the Windows CE APIs the game expects.
+PocketHLE is an early-stage high-level emulator for Pocket PC 2002/2003 and Windows Mobile 5/6 games. Instead of emulating a complete Windows CE device, it loads the original game executable, runs its ARM code through a CPU backend, and provides clean-room host-side implementations of the  jsWindows CE APIs the game expects.
 
 The project is inspired by [touchHLE](https://github.com/touchHLE/touchHLE) and [EKA2L1](https://github.com/EKA2L1/EKA2L1), with a launcher and library workflow influenced by [j2me-loader](https://github.com/nikita36078/j2me-loader).
 
