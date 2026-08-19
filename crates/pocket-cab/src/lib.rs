@@ -1106,6 +1106,17 @@ fn substitute_install_dir(value: &str, install_dir: &str) -> String {
     while out.contains("\\\\") {
         out = out.replace("\\\\", "\\");
     }
+    // `install_dir` is already dot-segment-clean (`canonicalise_install_dir`
+    // resolves it), but the literal suffix spliced on after `%InstallDir%`
+    // — the `\Gameloft\Asphalt4` in this CAB's case — is copied verbatim
+    // from the manifest and hasn't been through that pass. Belt-and-braces:
+    // resolve here too so a `..` anywhere in that suffix can't reintroduce
+    // the same mount/module-path mismatch this function exists to prevent.
+    let had_trailing_sep = out.ends_with('\\');
+    out = resolve_dot_segments(&out);
+    if had_trailing_sep && !out.ends_with('\\') {
+        out.push('\\');
+    }
     out
 }
 
@@ -1117,6 +1128,39 @@ fn canonicalise_shortcut_target(raw: &str) -> String {
         None => return raw.to_string(),
     };
     format!("{}{}", canonicalise_install_dir(&dir), file)
+}
+
+/// Lexically collapse `.` and `..` segments in a backslash-separated
+/// absolute WinCE path, the way a real device's installer service (and
+/// `GetFullPathNameW`) would before an app ever sees the result.
+///
+/// Gameloft's Asphalt 4 "Samsung Omnia" CAB declares
+/// `InstallDir="%CE1%\Asphalt 4\.."` — the storefront listing needs a
+/// human-readable folder name, but the payload should land straight
+/// under `%CE1%`. Left unresolved, that literal `..` becomes part of
+/// both the VFS mount prefix and the `GetModuleFileNameW` string
+/// PocketHLE reports, which a real handset would never have shown the
+/// game: on real hardware the install service resolves `InstallDir`
+/// before writing a single file or starting the process. If the
+/// game's own engine normalises the module directory it was handed
+/// before rebuilding asset paths from it — a common portability
+/// pattern — every `fopen` for a path built that way misses the mount
+/// (see `vfs::Vfs` for the matching `..`-rejection on the guest side)
+/// and the game exits before drawing a frame. A leading `..` past the
+/// root is dropped rather than erroring, matching how Windows treats
+/// `C:\..`.
+fn resolve_dot_segments(path: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in path.split('\\') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            _ => stack.push(seg),
+        }
+    }
+    format!("\\{}", stack.join("\\"))
 }
 
 /// `\Program Files\Astraware\Zuma` -> `\Program Files\Astraware\Zuma\`.
@@ -1163,9 +1207,9 @@ fn canonicalise_install_dir(raw: &str) -> String {
             None => break,
         }
     }
-    if !s.starts_with('\\') {
-        s.insert(0, '\\');
-    }
+    // Collapse `..`/`.` now that macro expansion is done. Also ensures
+    // a leading `\`, replacing the old bare `starts_with` check.
+    s = resolve_dot_segments(&s);
     if !s.ends_with('\\') {
         s.push('\\');
     }
@@ -1820,6 +1864,65 @@ mod tests {
         assert_eq!(
             script.registry[0].string.as_deref(),
             Some(r"\Program Files\Astraware\Cubis")
+        );
+    }
+
+    #[test]
+    fn install_dir_trailing_dotdot_is_resolved() {
+        // Gameloft's Asphalt 4 "Samsung Omnia" CAB declares
+        // `InstallDir="%CE1%\Asphalt 4\.."` — CabWiz's storefront entry
+        // needed a human-readable folder name, but the payload was
+        // always meant to land straight under `%CE1%`. Left
+        // unresolved, that literal `..` survives macro expansion and
+        // ends up in both the VFS mount prefix and the
+        // `GetModuleFileNameW` string PocketHLE reports — a path no
+        // real handset would ever have shown the game, since the
+        // install service resolves `InstallDir` before writing a
+        // single file. If the game's own engine then normalises the
+        // module directory it was handed before rebuilding asset
+        // paths from it (a common portability pattern), every asset
+        // open misses the mount and the game exits before drawing a
+        // frame.
+        let script = WinCeSetupScript::parse_bytes(
+            br#"<characteristic type="Install">
+<parm name="InstallDir" value="%CE1%\Asphalt 4\.." />
+</characteristic>
+<characteristic type="FileOperation">
+<characteristic type="%InstallDir%\Gameloft\Asphalt4">
+<characteristic type="MakeDir" />
+<characteristic type="main.bar">
+<characteristic type="Extract">
+<parm name="Source" value="0000MAIN.003" />
+</characteristic>
+</characteristic>
+<characteristic type="Asphalt4.exe">
+<characteristic type="Extract">
+<parm name="Source" value="ASPHALT4.020" />
+</characteristic>
+</characteristic>
+</characteristic>
+</characteristic>"#,
+        );
+        assert_eq!(script.install_dir.as_deref(), Some(r"\Program Files\"));
+        assert_eq!(
+            script.install_dirs,
+            vec![r"\Program Files\Gameloft\Asphalt4\".to_string()]
+        );
+        assert!(
+            script.renames.iter().all(|(_, long)| !long.contains("..")),
+            "a rename still carries an unresolved '..': {:?}",
+            script.renames
+        );
+        assert_eq!(
+            script.install_root().as_deref(),
+            Some(r"\Program Files\Gameloft\Asphalt4")
+        );
+        assert_eq!(
+            script.relative_destination(
+                &script.renames.iter().find(|(s, _)| s == "0000MAIN.003").unwrap().1,
+                script.install_root().as_deref()
+            ),
+            Some("main.bar")
         );
     }
 }
