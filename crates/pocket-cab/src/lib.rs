@@ -1919,7 +1919,12 @@ mod tests {
         );
         assert_eq!(
             script.relative_destination(
-                &script.renames.iter().find(|(s, _)| s == "0000MAIN.003").unwrap().1,
+                &script
+                    .renames
+                    .iter()
+                    .find(|(s, _)| s == "0000MAIN.003")
+                    .unwrap()
+                    .1,
                 script.install_root().as_deref()
             ),
             Some("main.bar")
