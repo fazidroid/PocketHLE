@@ -1709,6 +1709,7 @@ impl Process {
             "libgles_cm.dll",
             "libgles_cl.dll",
             "hss.dll",
+            "ws2.dll",
         ] {
             dynamic_exports_to_add.extend(
                 dispatcher
