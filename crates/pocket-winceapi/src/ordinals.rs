@@ -63,6 +63,21 @@ pub fn lookup(dll: &str, ordinal: u16) -> Option<String> {
     if pocket_gles::ordinals::is_gles_dll(&key) {
         return pocket_gles::ordinals::lookup(&key, ordinal);
     }
+    // `bthutil.dll` has no leaked SDK ordinal table anywhere this
+    // fork's sources were built from, and only two ordinals have ever
+    // turned up in a game's import table (Asphalt 4's Samsung Omnia
+    // build, which otherwise ignores Bluetooth entirely outside its
+    // multiplayer host/join menus). Named descriptively rather than
+    // guessed at, since — unlike the coredll cluster above, which had
+    // a real WM6 export dump to confirm identities against — there is
+    // no equivalent source to check these against.
+    if key == "bthutil.dll" {
+        return match ordinal {
+            1 => Some("bthutil_ord_1_unidentified".to_string()),
+            2 => Some("bthutil_ord_2_unidentified".to_string()),
+            _ => None,
+        };
+    }
     ORDINAL_TABLES
         .get(&key)
         .and_then(|m| m.get(&ordinal).cloned())
