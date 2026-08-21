@@ -212,6 +212,22 @@ impl WinCeDispatcher {
         hss::register(&mut d);
         ole32::register(&mut d);
         ws2::register(&mut d);
+        // bthutil.dll: see the identity note in ordinals.rs. Answered
+        // the same way as an absent/disabled Bluetooth radio would be
+        // — a plain `FALSE`/no-handle `0` — since nothing here can
+        // confirm what these two ordinals actually do.
+        d.register_constant(
+            "bthutil.dll",
+            "bthutil_ord_1_unidentified",
+            0,
+            coredll::zero_returning,
+        );
+        d.register_constant(
+            "bthutil.dll",
+            "bthutil_ord_2_unidentified",
+            0,
+            coredll::zero_returning,
+        );
         for ordinal in 0..=4095u16 {
             if let Some(name) = ordinals::lookup("coredll.dll", ordinal) {
                 let source = ("coredll.dll".to_string(), name);
