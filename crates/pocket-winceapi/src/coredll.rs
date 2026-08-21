@@ -373,6 +373,61 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "??_U@YAPAXI@Z", operator_new);
     d.register_handler(dll, "??_V@YAXPAX@Z", free);
 
+    // ---- C++ exception handling / RTTI runtime support ----
+    //
+    // Asphalt 4's Samsung Omnia build (unlike the other Gameloft
+    // titles this fork has brought up so far) statically imports the
+    // MSVC C++ EH runtime's coredll exports directly by ordinal —
+    // confirmed against a real WM6-era coredll.dll export dump, since
+    // this exact ordinal range (~1568-1580) is Windows Mobile 5/6
+    // specific and absent from the Pocket PC 2003 base table this
+    // fork's ordinal JSON was originally built from (see the "WM5/6
+    // uses a different numbering" note in ordinals.rs's doc comment).
+    //
+    // PocketHLE cannot correctly unwind a C++ stack — there is no
+    // real unwind-table interpreter here. Rather than let a throw
+    // "return" into code that assumes it never will (undefined
+    // behaviour, likely a wild jump into whatever ARM Thumb happens
+    // to follow) or silently no-op it (letting the game proceed with
+    // state it thinks is exceptional-case-handled but isn't),
+    // anything that represents "a C++ exception is propagating and
+    // nothing here can catch it" halts the guest cleanly and loudly,
+    // the same way `ExitProcess` does. A real device would eventually
+    // reach `abort()`/process termination too if truly unhandled;
+    // this just gets there without the undefined-behaviour detour.
+    d.register_handler(dll, "?terminate@std@@YAXXZ", std_terminate);
+    d.register_handler(dll, "_purecall", purecall);
+    d.register_handler(dll, "RaiseException", raise_exception);
+    d.register_handler(dll, "__CxxThrowException", cxx_throw_exception);
+    // SEH filter/handler plumbing. Only reachable while unwinding
+    // toward a `RaiseException` call, which already halts above, so
+    // in practice these are dead code — stubbed defensively in case
+    // some path reaches them first, with the standard "keep
+    // searching outward, we're not the handler" answers.
+    d.register_constant(dll, "_XcptFilter", 0, zero_returning); // EXCEPTION_CONTINUE_SEARCH
+    d.register_handler(dll, "__C_specific_handler", c_specific_handler);
+    // `std::exception`'s constructors/destructor. Safe to implement
+    // for real: give the object a vtable pointer that resolves to
+    // harmless stubs (`what()` returns a static string, the virtual
+    // destructor no-ops) rather than leaving it zeroed, so that *if*
+    // guest code does end up calling through it, that's a controlled
+    // stub call rather than a jump through a null/garbage pointer.
+    d.register_handler(dll, "??0exception@std@@QAA@XZ", exception_ctor_default);
+    d.register_handler(dll, "??0exception@std@@QAA@PBD@Z", exception_ctor_msg);
+    d.register_handler(dll, "??0exception@std@@QAA@ABV01@@Z", exception_ctor_copy);
+    d.register_handler(dll, "??1exception@std@@UAA@XZ", zero_returning);
+    // Unconfirmed identity (see ordinals.rs data file comment) but
+    // seated directly between the `exception` destructor and the
+    // already-covered WM5 EH-vector helpers, so almost certainly
+    // another member of this same cluster. `what()`-shaped response
+    // is the safest guess: every plausible neighbour (`what()`,
+    // `type_info::name()`) is a `const char*` getter.
+    d.register_handler(
+        dll,
+        "coredll_ord_1575_unidentified_eh_rtti_neighbour",
+        exception_what,
+    );
+
     // ---- Resources ----
     d.register_handler(dll, "FindResourceW", find_resource_w);
     d.register_handler(dll, "LoadResource", load_resource);
@@ -791,6 +846,30 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "RegDeleteValueW", reg_delete_value_w);
     d.register_handler(dll, "RegCloseKey", reg_close_key);
     d.register_handler(dll, "RegFlushKey", reg_flush_key);
+    // No enumeration state is tracked (there's nothing behind these
+    // keys to enumerate beyond what RegQueryValueExW already answers
+    // directly), so every call honestly reports "nothing more to
+    // enumerate" rather than the generic unimplemented-call stub's
+    // `0`, which happens to be `ERROR_SUCCESS` here — actively
+    // misleading for an enumeration API, since it would tell the
+    // caller a value was returned when the output buffers were never
+    // touched.
+    d.register_constant(dll, "RegEnumValueW", 259, reg_enum_value_w_stub); // ERROR_NO_MORE_ITEMS
+                                                                           // Neither depends on there being a real device behind them, and
+                                                                           // both are safe to just answer honestly: we don't forward IOCTLs
+                                                                           // to anything, and "power requirement" bookkeeping is a no-op
+                                                                           // that a real caller only ever expects a handle back from.
+    d.register_constant(dll, "DeviceIoControl", 0, zero_returning);
+    d.register_constant(dll, "SetPowerRequirement", 1, one_returning);
+    // Variadic CRT stdio. Genuinely parsing a format string against
+    // the ARM varargs convention is real complexity for something
+    // that (per the strings in this exact binary) is far more likely
+    // used for incidental debug/log output than a load-bearing parse
+    // of game data — `fscanf` reporting zero fields matched, and
+    // `wprintf` reporting zero characters written, are both truthful,
+    // safe answers that leave every caller-owned buffer untouched.
+    d.register_constant(dll, "fscanf", 0, zero_returning);
+    d.register_constant(dll, "wprintf", 0, zero_returning);
 
     /// `ERROR_FILE_NOT_FOUND` — what a real device returns for a key or
     /// value that was never written.
@@ -982,6 +1061,15 @@ pub fn register(d: &mut WinCeDispatcher) {
         let key = ctx.arg_u32(0)?;
         log::debug!("RegFlushKey(key=0x{key:08x}) -> ERROR_SUCCESS");
         Ok(DispatchOutcome::ReturnedR0(0))
+    }
+
+    /// `LONG RegEnumValueW(HKEY, DWORD dwIndex, ...)`. See the
+    /// registration comment: always "no more values", truthfully.
+    fn reg_enum_value_w_stub(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+        let key = ctx.arg_u32(0)?;
+        let index = ctx.arg_u32(1)?;
+        log::debug!("RegEnumValueW(key=0x{key:08x}, index={index}) -> ERROR_NO_MORE_ITEMS");
+        Ok(DispatchOutcome::ReturnedR0(259))
     }
 
     // ---- libm (soft-float, double-precision) ----    // ---- libm (soft-float, double-precision) ----
@@ -1806,6 +1894,132 @@ fn exit_process(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> 
     Ok(DispatchOutcome::Halt)
 }
 
+/// Shared by every "a C++ exception is propagating and nothing here
+/// can catch it" path below. PocketHLE has no real stack-unwind
+/// interpreter, so letting one of these calls "return" into code that
+/// assumes it never will is undefined behaviour waiting to happen —
+/// a clean, loud halt is the closest safe equivalent to where a real
+/// device ends up anyway (`abort()` / process termination) when nothing
+/// upstream actually catches the exception.
+fn fatal_cpp_runtime(reason: &str) -> Result<DispatchOutcome, KernelError> {
+    log::warn!("{reason} — PocketHLE cannot unwind a C++ exception, halting guest");
+    Ok(DispatchOutcome::Halt)
+}
+
+fn std_terminate(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    fatal_cpp_runtime("std::terminate() called")
+}
+
+fn purecall(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    fatal_cpp_runtime("_purecall (pure virtual function called)")
+}
+
+/// `void RaiseException(DWORD dwExceptionCode, DWORD dwExceptionFlags,
+/// DWORD nNumberOfArguments, const ULONG_PTR* lpArguments)`.
+fn raise_exception(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let code = ctx.arg_u32(0)?;
+    let flags = ctx.arg_u32(1)?;
+    fatal_cpp_runtime(&format!(
+        "RaiseException(code=0x{code:08x}, flags=0x{flags:08x})"
+    ))
+}
+
+/// `void __CxxThrowException(void* pExceptionObject, _ThrowInfo*
+/// pThrowInfo)` — the actual `throw` mechanism MSVC compiles a `throw
+/// expr;` statement down to.
+fn cxx_throw_exception(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let obj = ctx.arg_u32(0)?;
+    let throw_info = ctx.arg_u32(1)?;
+    fatal_cpp_runtime(&format!(
+        "__CxxThrowException(object=0x{obj:08x}, throwInfo=0x{throw_info:08x})"
+    ))
+}
+
+/// `EXCEPTION_DISPOSITION __C_specific_handler(...)`. Only reachable
+/// mid-unwind, which `RaiseException` above already halts before
+/// this would run — kept as a defensive fallback in case some path
+/// reaches it first anyway. `1` is `ExceptionContinueSearch`: correct
+/// regardless of caller, since this crate never has a handler to
+/// offer.
+fn c_specific_handler(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    log::debug!("__C_specific_handler -> ExceptionContinueSearch");
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// Guest address of the stub `std::exception` vtable PocketHLE hands
+/// out. `0` (rather than a real allocated address) is deliberate:
+/// every constructor below writes this into the object's vtable slot,
+/// and a null vtable pointer makes an accidental virtual call fail
+/// as a clean, loggable "dereferenced null" instead of jumping into
+/// unrelated guest code that happens to occupy some fixed address we
+/// picked. There is currently no code path that installs real stub
+/// functions for `what()`/the virtual destructor to be dispatched
+/// through, so a safe, obvious failure mode beats a quiet wrong one.
+const STUB_EXCEPTION_VTABLE: u32 = 0;
+
+fn write_exception_object(
+    ctx: &mut CallCtx<'_>,
+    this: u32,
+    message_ptr: u32,
+) -> Result<(), KernelError> {
+    if this == 0 {
+        return Ok(());
+    }
+    ctx.cpu
+        .write_mem(this, &STUB_EXCEPTION_VTABLE.to_le_bytes())?;
+    ctx.cpu.write_mem(this + 4, &message_ptr.to_le_bytes())?;
+    Ok(())
+}
+
+/// `exception::exception()`.
+fn exception_ctor_default(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let this = ctx.arg_u32(0)?;
+    write_exception_object(ctx, this, 0)?;
+    Ok(DispatchOutcome::ReturnedR0(this))
+}
+
+/// `exception::exception(const char* message)`. Stores the incoming
+/// pointer directly rather than copying (real MSVC copies it) — safe
+/// as long as the caller's string outlives the exception object,
+/// which holds for the ordinary "construct, throw or inspect
+/// immediately, destroy" lifetime this exists to make non-crashing.
+fn exception_ctor_msg(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let this = ctx.arg_u32(0)?;
+    let message = ctx.arg_u32(1)?;
+    write_exception_object(ctx, this, message)?;
+    Ok(DispatchOutcome::ReturnedR0(this))
+}
+
+/// `exception::exception(const exception& other)`.
+fn exception_ctor_copy(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let this = ctx.arg_u32(0)?;
+    let other = ctx.arg_u32(1)?;
+    let message = if other == 0 {
+        0
+    } else {
+        let bytes = ctx.cpu.read_mem(other + 4, 4)?;
+        u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]))
+    };
+    write_exception_object(ctx, this, message)?;
+    Ok(DispatchOutcome::ReturnedR0(this))
+}
+
+/// Unconfirmed identity (ordinal 1575 — see the ordinals data file
+/// comment); implemented as a `const char*` getter since every
+/// plausible neighbour in this cluster (`exception::what()`,
+/// `type_info::name()`) has that shape. Returns the message pointer
+/// stored at construction, or a static fallback string if none was
+/// given.
+fn exception_what(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let this = ctx.arg_u32(0)?;
+    if this == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(this + 4, 4)?;
+    let message = u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]));
+    Ok(DispatchOutcome::ReturnedR0(message))
+}
+
 fn create_process_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let application = ctx.arg_u32(0)?;
     let command_line = ctx.arg_u32(1)?;
@@ -2038,7 +2252,7 @@ fn load_resource_module(ctx: &mut CallCtx<'_>, request: &str) -> Result<Option<u
     let base = ctx.kernel.next_module_base;
     if base
         .checked_add(MODULE_REGION_STRIDE)
-        .is_none_or(|end| end > MODULE_REGION_END)
+        .map_or(true, |end| end > MODULE_REGION_END)
     {
         log::warn!("LoadLibraryW({request:?}): module region exhausted");
         return Ok(None);
